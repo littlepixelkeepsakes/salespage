@@ -299,6 +299,11 @@ export default function AdminPage({ onBackToShop, onOpenOrderPayment }: AdminPag
         }
       );
       const data = await res.json();
+      if (res.status === 401) {
+        setAuthToken(null);
+        setAuthError('Session expired. Please sign in again.');
+        return;
+      }
       if (res.ok && data.success && data.order) {
         setOrders(prev => prev.map(o => (o.reference === reference ? data.order : o)));
         setConfirmingRef(null);

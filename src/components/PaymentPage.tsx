@@ -48,18 +48,24 @@ export default function PaymentPage({
   onRefreshOrder,
   onReturnHome
 }: PaymentPageProps) {
-  // Evaluate each payment option independently
+  // Evaluate each payment option independently — only show options that are enabled and configured
   const availableMethods = useMemo<PaymentMethodKey[]>(() => {
     const methods: PaymentMethodKey[] = [];
     if (merchantConfig?.tng?.configured) methods.push('tng');
     if (merchantConfig?.duitnow?.configured) methods.push('duitnow');
-    methods.push('card');
+    if (merchantConfig?.stripe?.configured) methods.push('card');
     return methods;
   }, [merchantConfig]);
 
-  const [activeMethod, setActiveMethod] = useState<PaymentMethodKey>(
-    returnNotice === 'cancelled' || returnNotice === 'failed' ? 'card' : 'tng'
-  );
+  const [activeMethod, setActiveMethod] = useState<PaymentMethodKey | null>(() => {
+    if (
+      (returnNotice === 'cancelled' || returnNotice === 'failed') &&
+      availableMethods.includes('card')
+    ) {
+      return 'card';
+    }
+    return availableMethods[0] ?? null;
+  });
   const methodInitializedRef = React.useRef(false);
   const [copiedField, setCopiedField] = useState<'ref' | 'amount' | null>(null);
 
@@ -87,15 +93,18 @@ export default function PaymentPage({
     if (merchantConfigLoading) return;
     if (!methodInitializedRef.current) {
       methodInitializedRef.current = true;
-      if (returnNotice === 'cancelled' || returnNotice === 'failed') {
+      if (
+        (returnNotice === 'cancelled' || returnNotice === 'failed') &&
+        availableMethods.includes('card')
+      ) {
         setActiveMethod('card');
         return;
       }
-      setActiveMethod(availableMethods[0] || 'card');
+      setActiveMethod(availableMethods[0] ?? null);
       return;
     }
-    if (!availableMethods.includes(activeMethod)) {
-      setActiveMethod(availableMethods[0] || 'card');
+    if (!activeMethod || !availableMethods.includes(activeMethod)) {
+      setActiveMethod(availableMethods[0] ?? null);
     }
   }, [merchantConfigLoading, availableMethods, activeMethod, returnNotice]);
 
@@ -129,6 +138,8 @@ export default function PaymentPage({
   };
 
   const handleSaveQrImage = async (methodKey: 'tng' | 'duitnow', imageUrl: string) => {
+    const isSafeUrl = imageUrl.startsWith('/') || imageUrl.startsWith('https://');
+    if (!isSafeUrl) return;
     setSavingQr(true);
     const filenamePrefix =
       methodKey === 'tng'
@@ -643,6 +654,18 @@ export default function PaymentPage({
 
                 {merchantConfigLoading ? (
                   <div className="py-6 text-xs text-[#14233C]/60">Loading available payment methods…</div>
+                ) : availableMethods.length === 0 ? (
+                  <div
+                    role="alert"
+                    className="flex items-start gap-2.5 p-4 rounded-xl bg-[#FAF6EE] border border-[#14233C]/15 text-xs text-[#14233C]/80 leading-relaxed"
+                  >
+                    <AlertCircle className="w-4 h-4 text-[#E05A40] shrink-0 mt-0.5" />
+                    <p>
+                      No payment methods are currently enabled for checkout. Your order{' '}
+                      <span className="font-mono font-bold text-[#14233C]">{order.reference}</span>{' '}
+                      is saved — please contact the shop to complete payment.
+                    </p>
+                  </div>
                 ) : (
                   <div
                     role="tablist"
@@ -663,15 +686,16 @@ export default function PaymentPage({
                         onClick={() => {
                           setActiveMethod('tng');
                           setReceiptError(null);
+                          setCardError(null);
                         }}
-                        className={`px-4 py-3.5 rounded-xl border text-left transition-colors flex items-center gap-2.5 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#14233C] ${
+                        className={`px-3.5 py-3 rounded-xl border text-left transition-colors flex items-center gap-2.5 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#14233C] ${
                           activeMethod === 'tng'
                             ? 'bg-[#14233C] text-white border-[#14233C]'
                             : 'bg-[#FAF6EE]/60 text-[#14233C] border-[#14233C]/15 hover:border-[#14233C]/40'
                         }`}
                       >
                         <QrCode className="w-4 h-4 shrink-0" />
-                        <span className="text-xs font-bold whitespace-nowrap truncate">
+                        <span className="text-xs font-bold leading-snug">
                           Touch ’n Go eWallet QR
                         </span>
                       </button>
@@ -685,50 +709,54 @@ export default function PaymentPage({
                         onClick={() => {
                           setActiveMethod('duitnow');
                           setReceiptError(null);
+                          setCardError(null);
                         }}
-                        className={`px-4 py-3.5 rounded-xl border text-left transition-colors flex items-center gap-2.5 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#14233C] ${
+                        className={`px-3.5 py-3 rounded-xl border text-left transition-colors flex items-center gap-2.5 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#14233C] ${
                           activeMethod === 'duitnow'
                             ? 'bg-[#14233C] text-white border-[#14233C]'
                             : 'bg-[#FAF6EE]/60 text-[#14233C] border-[#14233C]/15 hover:border-[#14233C]/40'
                         }`}
                       >
                         <QrCode className="w-4 h-4 shrink-0" />
-                        <span className="text-xs font-bold whitespace-nowrap truncate">
+                        <span className="text-xs font-bold leading-snug">
                           Public Bank QR Pay
                         </span>
                       </button>
                     )}
 
-                    <button
-                      type="button"
-                      role="tab"
-                      aria-selected={activeMethod === 'card'}
-                      onClick={() => {
-                        setActiveMethod('card');
-                        setCardError(null);
-                      }}
-                      className={`px-4 py-3.5 rounded-xl border text-left transition-colors flex items-center gap-2.5 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#14233C] ${
-                        activeMethod === 'card'
-                          ? 'bg-[#14233C] text-white border-[#14233C]'
-                          : 'bg-[#FAF6EE]/60 text-[#14233C] border-[#14233C]/15 hover:border-[#14233C]/40'
-                      }`}
-                    >
-                      <CreditCard className="w-4 h-4 shrink-0" />
-                      <span className="text-xs font-bold whitespace-nowrap truncate">
-                        Credit or Debit Card
-                      </span>
-                    </button>
+                    {merchantConfig?.stripe?.configured && (
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={activeMethod === 'card'}
+                        onClick={() => {
+                          setActiveMethod('card');
+                          setReceiptError(null);
+                          setCardError(null);
+                        }}
+                        className={`px-3.5 py-3 rounded-xl border text-left transition-colors flex items-center gap-2.5 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#14233C] ${
+                          activeMethod === 'card'
+                            ? 'bg-[#14233C] text-white border-[#14233C]'
+                            : 'bg-[#FAF6EE]/60 text-[#14233C] border-[#14233C]/15 hover:border-[#14233C]/40'
+                        }`}
+                      >
+                        <CreditCard className="w-4 h-4 shrink-0" />
+                        <span className="text-xs font-bold leading-snug">
+                          Credit or Debit Card
+                        </span>
+                      </button>
+                    )}
                   </div>
                 )}
               </div>
 
               {/* MANUAL QR PANEL — Shows ONLY the currently selected QR option */}
               {(activeMethod === 'tng' || activeMethod === 'duitnow') && activeQrConfig && (
-                <div key={activeMethod} className="pt-5 border-t border-[#14233C]/10 space-y-6">
+                <div key={activeMethod} role="tabpanel" className="pt-5 border-t border-[#14233C]/10 space-y-6">
                   {/* QR + Merchant Transfer Details */}
                   <div className="grid grid-cols-1 md:grid-cols-12 gap-6 items-start">
                     <div className="md:col-span-5 flex flex-col items-center gap-3">
-                      <div className="w-full max-w-[240px] aspect-[3/4] rounded-xl border border-[#14233C]/15 bg-[#FAF6EE] p-2 flex items-center justify-center overflow-hidden">
+                      <div className="w-full max-w-[260px] aspect-[3/4] rounded-xl border border-[#14233C]/15 bg-white p-2 flex items-center justify-center overflow-hidden">
                         {!qrImageFailed[activeMethod] ? (
                           <img
                             key={activeQrConfig.qrImage}
@@ -909,14 +937,14 @@ export default function PaymentPage({
               )}
 
               {/* CARD PAYMENT PANEL (Stripe Checkout) */}
-              {activeMethod === 'card' && (
-                <div className="pt-5 border-t border-[#14233C]/10 space-y-5">
+              {activeMethod === 'card' && merchantConfig?.stripe?.configured && (
+                <div role="tabpanel" className="pt-5 border-t border-[#14233C]/10 space-y-5">
                   <div className="space-y-1.5">
                     <div className="flex items-center justify-between gap-3">
                       <h3 className="text-base font-extrabold text-[#14233C]">
                         Credit or Debit Card — Stripe Checkout
                       </h3>
-                      {merchantConfig?.stripe.mode === 'test' && (
+                      {merchantConfig.stripe.mode === 'test' && (
                         <span className="text-xs font-semibold text-[#14233C]/65">
                           Stripe Test Mode
                         </span>
@@ -931,20 +959,6 @@ export default function PaymentPage({
                       verifies the payment.
                     </p>
                   </div>
-
-                  {merchantConfig && !merchantConfig.stripe.configured && (
-                    <div className="flex items-start gap-2.5 p-4 rounded-xl bg-[#FAF6EE] border border-[#14233C]/15 text-xs text-[#14233C]/80 leading-relaxed">
-                      <AlertCircle className="w-4 h-4 text-[#E05A40] shrink-0 mt-0.5" />
-                      <div>
-                        <p className="font-bold text-[#14233C]">Stripe Checkout awaits server test keys</p>
-                        <p className="mt-0.5">
-                          Configure <code className="font-mono">STRIPE_SECRET_KEY</code> (test key) and{' '}
-                          <code className="font-mono">STRIPE_WEBHOOK_SECRET</code> on the server to
-                          enable card checkout, or pay now with an enabled QR option above.
-                        </p>
-                      </div>
-                    </div>
-                  )}
 
                   {cardError && (
                     <div

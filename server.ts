@@ -242,7 +242,7 @@ function toPublicOrder(order: OrderRecord) {
 }
 
 // Validate that a QR image path is an existing local asset (/payments/, /assets/, /src/assets/) or an https:// URL
-function validateQrImageSource(qrImage: string): { valid: boolean; reason?: string } {
+function validateQrImageSource(qrImage: string): { valid: boolean; normalizedUrl?: string; reason?: string } {
   const trimmed = qrImage.trim();
   if (!trimmed) {
     return { valid: false, reason: 'QR image path is empty.' };
@@ -251,44 +251,63 @@ function validateQrImageSource(qrImage: string): { valid: boolean; reason?: stri
     try {
       const parsed = new URL(trimmed);
       if (parsed.protocol === 'https:') {
-        return { valid: true };
+        return { valid: true, normalizedUrl: trimmed };
       }
       return { valid: false, reason: 'QR image URL must use https://.' };
     } catch {
       return { valid: false, reason: 'QR image URL is not a valid URL.' };
     }
   }
-  if (trimmed.startsWith('/payments/')) {
-    const resolved = path.resolve(__dirname, 'public', trimmed.slice(1));
-    if (!resolved.startsWith(publicPaymentsDir + path.sep)) {
-      return { valid: false, reason: 'QR image path escapes /public/payments.' };
-    }
-    if (!fs.existsSync(resolved)) {
-      return { valid: false, reason: `QR image file not found at public${trimmed}.` };
-    }
-    return { valid: true };
+
+  // Normalize common local public/ prefixes (e.g. "payments/..." or "/public/payments/...")
+  let normalized = trimmed;
+  if (normalized.startsWith('/public/payments/')) {
+    normalized = normalized.slice('/public'.length);
+  } else if (normalized.startsWith('public/payments/')) {
+    normalized = '/' + normalized.slice('public/'.length);
+  } else if (normalized.startsWith('payments/')) {
+    normalized = '/' + normalized;
+  } else if (normalized.startsWith('/public/assets/')) {
+    normalized = normalized.slice('/public'.length);
+  } else if (normalized.startsWith('public/assets/')) {
+    normalized = '/' + normalized.slice('public/'.length);
+  } else if (normalized.startsWith('assets/')) {
+    normalized = '/' + normalized;
+  } else if (normalized.startsWith('src/assets/')) {
+    normalized = '/' + normalized;
   }
-  if (trimmed.startsWith('/assets/')) {
-    const resolved = path.resolve(__dirname, 'public', trimmed.slice(1));
+
+  if (normalized.startsWith('/payments/')) {
+    const resolved = path.resolve(__dirname, 'public', normalized.slice(1));
+    if (!resolved.startsWith(publicPaymentsDir + path.sep)) {
+      return { valid: false, reason: 'QR image path escapes /payments/.' };
+    }
+    if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
+      return { valid: false, reason: `QR image file not found at ${normalized}.` };
+    }
+    return { valid: true, normalizedUrl: normalized };
+  }
+  if (normalized.startsWith('/assets/')) {
+    const resolved = path.resolve(__dirname, 'public', normalized.slice(1));
     const allowedDir = path.resolve(__dirname, 'public/assets');
     if (!resolved.startsWith(allowedDir + path.sep)) {
-      return { valid: false, reason: 'QR image path escapes /public/assets.' };
+      return { valid: false, reason: 'QR image path escapes /assets/.' };
     }
-    if (!fs.existsSync(resolved)) {
-      return { valid: false, reason: `QR image file not found at public${trimmed}.` };
+    if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
+      return { valid: false, reason: `QR image file not found at ${normalized}.` };
     }
-    return { valid: true };
+    return { valid: true, normalizedUrl: normalized };
   }
-  if (trimmed.startsWith('/src/assets/')) {
-    const resolved = path.resolve(__dirname, trimmed.slice(1));
+  if (normalized.startsWith('/src/assets/')) {
+    const resolved = path.resolve(__dirname, normalized.slice(1));
     const allowedDir = path.resolve(__dirname, 'src/assets');
     if (!resolved.startsWith(allowedDir + path.sep)) {
-      return { valid: false, reason: 'QR image path escapes /src/assets.' };
+      return { valid: false, reason: 'QR image path escapes /src/assets/.' };
     }
-    if (!fs.existsSync(resolved)) {
-      return { valid: false, reason: `QR image file not found at ${trimmed}.` };
+    if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
+      return { valid: false, reason: `QR image file not found at ${normalized}.` };
     }
-    return { valid: true };
+    return { valid: true, normalizedUrl: normalized };
   }
   return {
     valid: false,
@@ -328,34 +347,37 @@ function evaluateQrMethod(opts: {
   enabledEnv?: string;
   recipientEnv?: string;
   imageEnv?: string;
-  defaultRecipient: string;
-  defaultImage: string;
 }): QrMethodEvaluation {
   const issues: string[] = [];
 
-  const rawEnabled = opts.enabledEnv !== undefined ? opts.enabledEnv.trim().toLowerCase() : 'true';
-  let enabled = true;
-  if (rawEnabled === 'false' || rawEnabled === '0' || rawEnabled === 'no') {
-    enabled = false;
-    issues.push(`${opts.enabledVarName} is disabled (${opts.enabledEnv}).`);
-  } else if (rawEnabled !== 'true' && rawEnabled !== '1' && rawEnabled !== 'yes' && rawEnabled !== '') {
-    enabled = false;
-    issues.push(`${opts.enabledVarName} has invalid boolean value "${opts.enabledEnv}". Use true or false.`);
+  const rawEnabled = (opts.enabledEnv ?? '').trim().toLowerCase();
+  let enabled = false;
+  if (!rawEnabled) {
+    issues.push(`${opts.enabledVarName} is missing or empty. Set to true to enable.`);
+  } else if (rawEnabled === 'true' || rawEnabled === '1' || rawEnabled === 'yes') {
+    enabled = true;
+  } else if (rawEnabled === 'false' || rawEnabled === '0' || rawEnabled === 'no') {
+    issues.push(`${opts.enabledVarName} is disabled (${opts.enabledEnv?.trim()}).`);
+  } else {
+    issues.push(`${opts.enabledVarName} has invalid boolean value "${opts.enabledEnv?.trim()}". Use true or false.`);
   }
 
-  const recipientName = (opts.recipientEnv !== undefined ? opts.recipientEnv : opts.defaultRecipient).trim();
-  const qrImage = (opts.imageEnv !== undefined ? opts.imageEnv : opts.defaultImage).trim();
+  const recipientName = (opts.recipientEnv ?? '').trim();
+  const rawQrImage = (opts.imageEnv ?? '').trim();
+  let resolvedQrImage = rawQrImage;
 
   if (!recipientName) {
     issues.push(`${opts.recipientVarName} is missing or empty.`);
   }
 
-  if (!qrImage) {
+  if (!rawQrImage) {
     issues.push(`${opts.imageVarName} is missing or empty.`);
   } else {
-    const imgCheck = validateQrImageSource(qrImage);
+    const imgCheck = validateQrImageSource(rawQrImage);
     if (!imgCheck.valid) {
       issues.push(`${opts.imageVarName} is invalid: ${imgCheck.reason}`);
+    } else if (imgCheck.normalizedUrl) {
+      resolvedQrImage = imgCheck.normalizedUrl;
     }
   }
 
@@ -369,7 +391,7 @@ function evaluateQrMethod(opts: {
           label: opts.label,
           shortAccountName: opts.shortAccountName,
           recipientName,
-          qrImage
+          qrImage: resolvedQrImage
         }
       : null,
     diagnostic: {
@@ -379,7 +401,7 @@ function evaluateQrMethod(opts: {
       enabled,
       issues,
       recipientName: recipientName || null,
-      qrImage: qrImage || null
+      qrImage: resolvedQrImage || null
     }
   };
 }
@@ -422,7 +444,7 @@ function getStripeConfig(): { client: Stripe | null; mode: 'test' | 'live' | 'un
 }
 
 function evaluateAllPaymentMethods() {
-  // 1. Touch 'n Go eWallet QR — evaluated independently
+  // 1. Touch 'n Go eWallet QR — evaluated independently from TNG_* environment variables
   const tngEval = evaluateQrMethod({
     key: 'tng',
     label: 'Touch ’n Go eWallet QR',
@@ -432,12 +454,10 @@ function evaluateAllPaymentMethods() {
     imageVarName: 'TNG_QR_IMAGE',
     enabledEnv: process.env.TNG_ENABLED,
     recipientEnv: process.env.TNG_RECIPIENT_NAME,
-    imageEnv: process.env.TNG_QR_IMAGE,
-    defaultRecipient: 'KRISTINA LEONG SIEW YIN',
-    defaultImage: '/payments/duitnow-qr.png'
+    imageEnv: process.env.TNG_QR_IMAGE
   });
 
-  // 2. Public Bank QR Pay — evaluated independently
+  // 2. Public Bank QR Pay — evaluated independently from DUITNOW_* environment variables
   const duitnowEval = evaluateQrMethod({
     key: 'duitnow',
     label: 'Public Bank QR Pay',
@@ -447,9 +467,7 @@ function evaluateAllPaymentMethods() {
     imageVarName: 'DUITNOW_QR_IMAGE',
     enabledEnv: process.env.DUITNOW_ENABLED,
     recipientEnv: process.env.DUITNOW_RECIPIENT_NAME,
-    imageEnv: process.env.DUITNOW_QR_IMAGE,
-    defaultRecipient: 'KRISTINA LEONG SIEW YIN',
-    defaultImage: '/payments/duitnow-qrpbb.png'
+    imageEnv: process.env.DUITNOW_QR_IMAGE
   });
 
   // 3. Credit or Debit Card (Stripe) — evaluated independently
@@ -820,8 +838,15 @@ async function startServer() {
 
   // Get Merchant Payment Configuration Endpoint (evaluates TNG, Public Bank QR Pay, and Stripe independently)
   app.get('/api/merchant-config', (_req, res) => {
-    const { merchantConfig } = evaluateAllPaymentMethods();
-    return res.json({ success: true, merchantConfig });
+    const { merchantConfig, diagnostics } = evaluateAllPaymentMethods();
+    return res.json({
+      success: true,
+      merchantConfig,
+      configIssues: {
+        tng: diagnostics.tng.issues,
+        duitnow: diagnostics.duitnow.issues
+      }
+    });
   });
 
   // Upload Payment Receipt Endpoint (Manual QR — stores receipt PRIVATELY outside public/)
@@ -1137,9 +1162,13 @@ async function startServer() {
     if (order.paymentStatus === 'Paid') {
       return res.status(409).json({ error: 'Order is already marked as Paid.' });
     }
-    if (order.paymentStatus !== 'Pending verification' || !order.privateReceipt) {
+    if (
+      order.paymentStatus !== 'Pending verification' ||
+      !order.privateReceipt ||
+      (order.paymentMethod !== 'tng' && order.paymentMethod !== 'duitnow')
+    ) {
       return res.status(400).json({
-        error: 'Only orders with a submitted QR receipt pending verification can be marked paid by staff.'
+        error: 'Only orders with a submitted TNG or Public Bank QR receipt pending verification can be marked paid by staff.'
       });
     }
 
@@ -1173,7 +1202,20 @@ async function startServer() {
         ? req.body.reason.trim().slice(0, 240)
         : 'We could not match your uploaded receipt. Please verify the recipient name and exact amount, then upload a clear receipt.';
 
+    // Remove rejected receipt file from private storage
+    if (order.privateReceipt?.storageFileName) {
+      const oldPath = path.resolve(privateReceiptsDir, path.basename(order.privateReceipt.storageFileName));
+      if (oldPath.startsWith(privateReceiptsDir + path.sep) && fs.existsSync(oldPath)) {
+        try {
+          fs.unlinkSync(oldPath);
+        } catch {
+          // Best-effort cleanup
+        }
+      }
+    }
+
     order.paymentStatus = 'Awaiting payment';
+    order.paymentMethod = null;
     order.lastCardAttemptMessage = reason;
     order.privateReceipt = undefined;
     order.transactionReference = undefined;
