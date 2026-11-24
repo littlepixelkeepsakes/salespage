@@ -3,31 +3,22 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from 'react';
-import { 
-  Sparkles, 
-  Heart, 
-  Package, 
-  Truck, 
-  ShieldCheck, 
-  ChevronDown, 
-  ChevronUp, 
-  ArrowRight, 
-  Check, 
-  Camera, 
-  Info,
+import React, { useState, useEffect, useCallback } from 'react';
+import {
+  Sparkles,
+  Heart,
+  Package,
+  ShieldCheck,
+  ArrowRight,
+  Check,
+  Camera,
   Gift,
-  Upload,
-  RefreshCw,
-  AlertCircle,
   ArrowLeft,
-  CheckCircle2,
-  Clock,
-  CreditCard,
-  QrCode,
-  Download,
-  Lock
+  AlertCircle
 } from 'lucide-react';
+import PaymentPage from './components/PaymentPage';
+import AdminPage from './components/AdminPage';
+import type { MerchantPaymentConfig, OrderPublic } from './types/order';
 
 interface ProductOption {
   id: string;
@@ -129,8 +120,8 @@ export default function App() {
   const [selectedBundleId, setSelectedBundleId] = useState<string>('bundle_kc_magnet');
   const [openFaq, setOpenFaq] = useState<number | null>(0);
 
-  // Flow State: 'sales' | 'upload' | 'details' | 'review' | 'payment' | 'success'
-  const [orderStep, setOrderStep] = useState<'sales' | 'upload' | 'details' | 'review' | 'payment' | 'success'>('sales');
+  // Flow State: 'sales' | 'upload' | 'details' | 'review' | 'payment' | 'admin'
+  const [orderStep, setOrderStep] = useState<'sales' | 'upload' | 'details' | 'review' | 'payment' | 'admin'>('sales');
 
   // Photo Upload State
   const [photoFile, setPhotoFile] = useState<File | null>(null);
@@ -154,53 +145,74 @@ export default function App() {
   const [deliveryError, setDeliveryError] = useState<string | null>(null);
   const [calculatingDelivery, setCalculatingDelivery] = useState<boolean>(false);
 
-  // Order & Payment State
+  // Saved Order & Payment Page State
   const [submittingOrder, setSubmittingOrder] = useState<boolean>(false);
-  const [currentOrder, setCurrentOrder] = useState<any | null>(null);
+  const [currentOrder, setCurrentOrder] = useState<OrderPublic | null>(null);
   const [orderError, setOrderError] = useState<string | null>(null);
+  const [loadingOrderRef, setLoadingOrderRef] = useState<boolean>(false);
+  const [orderLookupError, setOrderLookupError] = useState<string | null>(null);
+  const [paymentReturnNotice, setPaymentReturnNotice] = useState<'success_pending' | 'cancelled' | 'failed' | null>(null);
 
-  // Payment Page State
-  const [merchantConfig, setMerchantConfig] = useState<any | null>(null);
-  const [activePaymentMethod, setActivePaymentMethod] = useState<'tng' | 'duitnow' | 'card'>('tng');
-  const [transactionRef, setTransactionRef] = useState<string>('');
-  const [receiptFile, setReceiptFile] = useState<File | null>(null);
-  const [receiptUploading, setReceiptUploading] = useState<boolean>(false);
-  const [receiptError, setReceiptError] = useState<string | null>(null);
-  const [stripeLoading, setStripeLoading] = useState<boolean>(false);
+  const [merchantConfig, setMerchantConfig] = useState<MerchantPaymentConfig | null>(null);
+  const [merchantConfigLoading, setMerchantConfigLoading] = useState<boolean>(true);
 
-  // Check URL params on load for payment return states (?payment=success&ref=... or ?payment=cancelled&ref=...)
+  const fetchOrderByReference = useCallback(async (ref: string): Promise<OrderPublic | null> => {
+    try {
+      const res = await fetch(`/api/orders/${encodeURIComponent(ref)}`);
+      const data = await res.json();
+      if (res.ok && data.success && data.order) {
+        setCurrentOrder(data.order);
+        return data.order as OrderPublic;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }, []);
+
+  // Load saved order (?order=LPK-... or ?ref=LPK-...) or staff admin (?view=admin) & fetch merchant config
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
+    const viewParam = params.get('view');
     const paymentStatusParam = params.get('payment');
-    const refParam = params.get('ref');
+    const refParam = params.get('order') || params.get('ref');
 
-    if (refParam) {
-      // Fetch order details
-      fetch(`/api/orders/${refParam}`)
-        .then(res => res.json())
-        .then(data => {
-          if (data.success && data.order) {
-            setCurrentOrder(data.order);
-            if (paymentStatusParam === 'success' || data.order.paymentStatus === 'Paid') {
-              setOrderStep('success');
+    if (viewParam === 'admin') {
+      setOrderStep('admin');
+    } else if (refParam) {
+      setLoadingOrderRef(true);
+      setOrderLookupError(null);
+      fetchOrderByReference(refParam)
+        .then(order => {
+          if (order) {
+            if (paymentStatusParam === 'cancelled') {
+              setPaymentReturnNotice('cancelled');
+            } else if (paymentStatusParam === 'failed') {
+              setPaymentReturnNotice('failed');
+            } else if (paymentStatusParam === 'success' && order.paymentStatus === 'Awaiting payment') {
+              setPaymentReturnNotice('success_pending');
             } else {
-              setOrderStep('payment');
+              setPaymentReturnNotice(null);
             }
+            setOrderStep('payment');
+          } else {
+            setOrderLookupError(`We couldn’t find saved order "${refParam}". It may have expired or the reference may be incorrect.`);
           }
         })
-        .catch(err => console.error('Failed to load order from ref:', err));
+        .finally(() => setLoadingOrderRef(false));
     }
 
-    // Fetch merchant QR config
+    // Fetch server-configured merchant payment options (unconfigured QR methods are omitted)
     fetch('/api/merchant-config')
       .then(res => res.json())
       .then(data => {
-        if (data.success) {
+        if (data.success && data.merchantConfig) {
           setMerchantConfig(data.merchantConfig);
         }
       })
-      .catch(err => console.error('Failed to load merchant config:', err));
-  }, []);
+      .catch(err => console.error('Failed to load merchant config:', err))
+      .finally(() => setMerchantConfigLoading(false));
+  }, [fetchOrderByReference]);
 
   // Products config
   const products: ProductOption[] = [
@@ -337,98 +349,57 @@ export default function App() {
       });
       const data = await res.json();
 
-      if (data.success) {
+      if (data.success && data.order) {
         setCurrentOrder(data.order);
+        setPaymentReturnNotice(null);
         setSubmittingOrder(false);
         setOrderStep('payment');
+        window.history.replaceState({}, '', `/?order=${encodeURIComponent(data.order.reference)}`);
         window.scrollTo({ top: 0, behavior: 'smooth' });
       } else {
         setOrderError(data.error || 'Failed to create order.');
         setSubmittingOrder(false);
       }
-    } catch (err) {
+    } catch {
       setOrderError('Server error while saving order.');
       setSubmittingOrder(false);
     }
   };
 
-  // Handle Manual QR Receipt Upload
-  const handleReceiptUpload = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!receiptFile || !transactionRef) {
-      setReceiptError('Please enter transaction reference and attach receipt file.');
-      return;
-    }
+  const handleRefreshCurrentOrder = useCallback(async () => {
+    if (!currentOrder?.reference) return null;
+    return fetchOrderByReference(currentOrder.reference);
+  }, [currentOrder?.reference, fetchOrderByReference]);
 
-    setReceiptUploading(true);
-    setReceiptError(null);
-
-    const reader = new FileReader();
-    reader.onload = async () => {
-      try {
-        const base64Data = reader.result as string;
-        const res = await fetch('/api/upload-receipt', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            reference: currentOrder.reference,
-            paymentMethod: activePaymentMethod,
-            transactionReference: transactionRef,
-            receiptBase64: base64Data,
-            filename: receiptFile.name
-          })
-        });
-        const data = await res.json();
-        if (data.success) {
-          setCurrentOrder(data.order);
-          setReceiptUploading(false);
-          setOrderStep('success');
-          window.scrollTo({ top: 0, behavior: 'smooth' });
-        } else {
-          setReceiptError(data.error || 'Failed to upload receipt.');
-          setReceiptUploading(false);
-        }
-      } catch (err) {
-        setReceiptError('Server connection error.');
-        setReceiptUploading(false);
-      }
-    };
-    reader.readAsDataURL(receiptFile);
+  const handleReturnHome = () => {
+    setOrderStep('sales');
+    setCurrentOrder(null);
+    setPaymentReturnNotice(null);
+    setOrderLookupError(null);
+    window.history.replaceState({}, '', '/');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
-  // Handle Stripe Checkout Payment
-  const handleStripeCheckout = async () => {
-    setStripeLoading(true);
-    try {
-      const res = await fetch('/api/create-stripe-session', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          reference: currentOrder.reference,
-          appUrl: window.location.origin
-        })
-      });
-      const data = await res.json();
-      if (data.success && data.url) {
-        if (data.simulated) {
-          // Simulated test fallback
-          setCurrentOrder((prev: any) => ({ ...prev, paymentStatus: 'Paid' }));
-          setOrderStep('success');
-        } else {
-          window.location.href = data.url;
-        }
-      } else {
-        alert(data.error || 'Failed to start Stripe session.');
-        setStripeLoading(false);
-      }
-    } catch (err) {
-      alert('Network error connecting to payment gateway.');
-      setStripeLoading(false);
+  const handleOpenAdmin = () => {
+    setOrderStep('admin');
+    window.history.replaceState({}, '', '/?view=admin');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const handleOpenOrderPaymentFromAdmin = async (reference: string) => {
+    setLoadingOrderRef(true);
+    const order = await fetchOrderByReference(reference);
+    setLoadingOrderRef(false);
+    if (order) {
+      setPaymentReturnNotice(null);
+      setOrderStep('payment');
+      window.history.replaceState({}, '', `/?order=${encodeURIComponent(order.reference)}`);
+      window.scrollTo({ top: 0, behavior: 'smooth' });
     }
   };
 
   return (
-    <div className="min-h-screen bg-[#FAF6EE] text-[#14233C] font-sans antialiased selection:bg-[#FF8D76]/30">
+    <div className="min-h-screen flex flex-col bg-[#FAF6EE] text-[#14233C] font-sans antialiased selection:bg-[#FF8D76]/30">
       {/* Top Notification Bar */}
       <div className="bg-[#14233C] text-[#FAF6EE] py-2 px-4 text-xs font-medium text-center flex items-center justify-center gap-2">
         <Sparkles className="w-3.5 h-3.5 text-[#FF8D76]" />
@@ -438,7 +409,7 @@ export default function App() {
       {/* Header */}
       <header className="sticky top-0 z-40 bg-[#FAF6EE]/90 backdrop-blur-md border-b border-[#14233C]/10 px-4 sm:px-8 py-3.5 transition-all">
         <div className="max-w-6xl mx-auto flex items-center justify-between gap-4">
-          <div className="flex items-center gap-3 cursor-pointer" onClick={() => { if (orderStep === 'sales') setOrderStep('sales'); }}>
+          <div className="flex items-center gap-3 cursor-pointer" onClick={handleReturnHome}>
             <img 
               src="/assets/aistudio/Beaded_heart_keepsakes_logo_4fef68e3.png" 
               alt="Logo" 
@@ -449,11 +420,47 @@ export default function App() {
             </span>
           </div>
 
-          <div className="text-xs font-bold text-[#E05A40] bg-[#FF8D76]/15 px-3 py-1.5 rounded-full">
-            {orderStep === 'sales' ? 'Handmade Beaded Art' : `Checkout — Reference: ${currentOrder?.reference || 'Active'}`}
+          <div className="text-xs font-semibold text-[#14233C]/75">
+            {orderStep === 'sales'
+              ? 'Handmade Beaded Art'
+              : orderStep === 'admin'
+                ? 'Protected Staff Admin'
+                : currentOrder?.reference
+                  ? `Order ${currentOrder.reference} · ${currentOrder.paymentStatus}`
+                  : 'Checkout'}
           </div>
         </div>
       </header>
+
+      {/* Saved Order Lookup Loading / Error */}
+      {loadingOrderRef && (
+        <div className="max-w-3xl mx-auto px-4 sm:px-8 pt-10">
+          <div className="bg-white rounded-2xl border border-[#14233C]/12 p-8 text-center text-sm font-medium text-[#14233C]/75">
+            Loading your saved order…
+          </div>
+        </div>
+      )}
+
+      {orderLookupError && !loadingOrderRef && (
+        <div className="max-w-3xl mx-auto px-4 sm:px-8 pt-6">
+          <div
+            role="alert"
+            className="flex items-center justify-between gap-4 p-4 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-950"
+          >
+            <div className="flex items-center gap-2.5">
+              <AlertCircle className="w-4 h-4 text-amber-700 shrink-0" />
+              <span>{orderLookupError}</span>
+            </div>
+            <button
+              type="button"
+              onClick={handleReturnHome}
+              className="font-bold underline whitespace-nowrap shrink-0"
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* SALES PAGE */}
       {orderStep === 'sales' && (
@@ -796,231 +803,49 @@ export default function App() {
         </div>
       )}
 
-      {/* PAYMENT PAGE */}
+      {/* PAYMENT PAGE (LINKED TO SAVED ORDER) */}
       {orderStep === 'payment' && currentOrder && (
-        <div className="py-12 px-4 sm:px-8 max-w-3xl mx-auto space-y-8 animate-fadeIn">
-          <div className="bg-white rounded-3xl p-6 sm:p-10 shadow-2xl border border-[#14233C]/10 space-y-8">
-            <div className="text-center space-y-2 border-b pb-6">
-              <span className="text-xs font-bold text-[#FF8D76] uppercase tracking-wider">Secure Checkout</span>
-              <h2 className="text-3xl font-black text-[#14233C]">Complete Your Payment</h2>
-              <p className="text-sm font-bold text-[#E05A40]">Order Reference: {currentOrder.reference}</p>
-            </div>
-
-            {/* Order Cost Breakdown Box */}
-            <div className="bg-[#FAF6EE] p-6 rounded-2xl space-y-3">
-              <div className="flex justify-between text-sm font-semibold">
-                <span>{currentOrder.productName} (Qty: {currentOrder.itemQuantity})</span>
-                <span>{formatRM(currentOrder.subtotalSen)}</span>
-              </div>
-              {currentOrder.savingsSen && (
-                <div className="flex justify-between text-xs font-bold text-emerald-700">
-                  <span>Bundle Savings Applied</span>
-                  <span>- {formatRM(currentOrder.savingsSen)}</span>
-                </div>
-              )}
-              <div className="flex justify-between text-xs text-[#14233C]/70">
-                <span>Delivery Fee ({currentOrder.customer.state})</span>
-                <span>{formatRM(currentOrder.deliveryFeeSen)}</span>
-              </div>
-              <div className="flex justify-between pt-3 border-t text-xl font-black text-[#14233C]">
-                <span>Exact Amount Due</span>
-                <span className="text-[#E05A40]">{formatRM(currentOrder.totalSen)}</span>
-              </div>
-            </div>
-
-            {/* If order is pending verification */}
-            {currentOrder.paymentStatus === 'Pending verification' ? (
-              <div className="bg-amber-50 border-2 border-amber-300 p-6 rounded-2xl text-center space-y-3">
-                <Clock className="w-10 h-10 text-amber-600 mx-auto" />
-                <h3 className="font-bold text-lg text-amber-900">Receipt Pending Verification</h3>
-                <p className="text-sm text-amber-800">We’ve received your receipt. We’ll confirm your order once we verify your payment.</p>
-                <div className="text-xs text-amber-700">Reference: {currentOrder.transactionReference}</div>
-              </div>
-            ) : (
-              <div className="space-y-6">
-                {/* Payment Method Selector Tabs */}
-                <div className="grid grid-cols-3 gap-3">
-                  {merchantConfig?.tng?.enabled && (
-                    <button 
-                      onClick={() => setActivePaymentMethod('tng')}
-                      className={`p-4 rounded-2xl border-2 font-bold text-xs sm:text-sm flex flex-col items-center gap-2 transition-all ${activePaymentMethod === 'tng' ? 'bg-[#14233C] text-white border-[#14233C]' : 'bg-white text-[#14233C] border-gray-200'}`}
-                    >
-                      <QrCode className="w-5 h-5" />
-                      <span>Touch 'n Go eWallet</span>
-                    </button>
-                  )}
-                  {merchantConfig?.duitnow?.enabled && (
-                    <button 
-                      onClick={() => setActivePaymentMethod('duitnow')}
-                      className={`p-4 rounded-2xl border-2 font-bold text-xs sm:text-sm flex flex-col items-center gap-2 transition-all ${activePaymentMethod === 'duitnow' ? 'bg-[#14233C] text-white border-[#14233C]' : 'bg-white text-[#14233C] border-gray-200'}`}
-                    >
-                      <QrCode className="w-5 h-5" />
-                      <span>DuitNow QR</span>
-                    </button>
-                  )}
-                  <button 
-                    onClick={() => setActivePaymentMethod('card')}
-                    className={`p-4 rounded-2xl border-2 font-bold text-xs sm:text-sm flex flex-col items-center gap-2 transition-all ${activePaymentMethod === 'card' ? 'bg-[#14233C] text-white border-[#14233C]' : 'bg-white text-[#14233C] border-gray-200'}`}
-                  >
-                    <CreditCard className="w-5 h-5" />
-                    <span>Card (Stripe)</span>
-                  </button>
-                </div>
-
-                {/* Manual QR Payment View (TnG or DuitNow) */}
-                {(activePaymentMethod === 'tng' || activePaymentMethod === 'duitnow') && merchantConfig?.[activePaymentMethod]?.enabled && (
-                  <div className="bg-white p-6 rounded-2xl border-2 border-gray-200 space-y-6 animate-fadeIn">
-                    <div className="text-center space-y-1">
-                      <h3 className="font-extrabold text-lg text-[#14233C]">
-                        {activePaymentMethod === 'tng' ? "Touch 'n Go eWallet QR" : "DuitNow QR"}
-                      </h3>
-                      <p className="text-xs text-[#14233C]/70">Scan QR using your mobile banking or eWallet app, check recipient name, and transfer exact amount.</p>
-                    </div>
-
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-6 items-center">
-                      <div className="flex flex-col items-center space-y-3">
-                        <div className="w-48 h-48 bg-gray-100 rounded-2xl p-2 border-2 border-gray-300 shadow-sm">
-                          <img 
-                            src={merchantConfig[activePaymentMethod].qrImage} 
-                            alt="Merchant QR" 
-                            className="w-full h-full object-contain rounded-xl"
-                          />
-                        </div>
-                        <a 
-                          href={merchantConfig[activePaymentMethod].qrImage} 
-                          download={`${activePaymentMethod}_merchant_qr.jpg`}
-                          className="text-xs font-bold text-[#0284C7] hover:underline flex items-center gap-1.5"
-                        >
-                          <Download className="w-3.5 h-3.5" />
-                          <span>Save QR Image</span>
-                        </a>
-                      </div>
-
-                      <div className="space-y-4 text-xs sm:text-sm">
-                        <div className="bg-gray-50 p-4 rounded-xl space-y-2 border">
-                          <div className="flex justify-between">
-                            <span className="text-gray-500">Recipient Name:</span>
-                            <span className="font-bold text-[#14233C]">{merchantConfig[activePaymentMethod].merchantName}</span>
-                          </div>
-                          <div className="flex justify-between">
-                            <span className="text-gray-500">Account ID:</span>
-                            <span className="font-bold text-[#14233C]">{merchantConfig[activePaymentMethod].merchantAccount}</span>
-                          </div>
-                          <div className="flex justify-between pt-2 border-t">
-                            <span className="text-gray-500 font-bold">Exact Amount Due:</span>
-                            <span className="font-black text-[#E05A40] text-base">{formatRM(currentOrder.totalSen)}</span>
-                          </div>
-                        </div>
-
-                        <form onSubmit={handleReceiptUpload} className="space-y-3">
-                          <div>
-                            <label className="text-xs font-bold text-[#14233C]">Transaction Reference / Approval ID</label>
-                            <input 
-                              type="text" 
-                              required 
-                              placeholder="e.g. TXN123456789"
-                              value={transactionRef}
-                              onChange={e => setTransactionRef(e.target.value)}
-                              className="w-full px-3 py-2.5 rounded-xl border text-xs bg-[#FAF6EE]"
-                            />
-                          </div>
-
-                          <div>
-                            <label className="text-xs font-bold text-[#14233C]">Upload Payment Receipt (JPG, PNG, PDF)</label>
-                            <input 
-                              type="file" 
-                              required 
-                              accept="image/jpeg,image/png,application/pdf"
-                              onChange={e => setReceiptFile(e.target.files?.[0] || null)}
-                              className="w-full text-xs file:mr-4 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-xs file:font-semibold file:bg-[#14233C] file:text-white hover:file:bg-[#14233C]/90 mt-1"
-                            />
-                          </div>
-
-                          {receiptError && <p className="text-xs font-bold text-red-600">{receiptError}</p>}
-
-                          <button 
-                            type="submit" 
-                            disabled={receiptUploading}
-                            className="w-full bg-[#14233C] text-white font-bold py-3 rounded-xl text-xs hover:bg-[#14233C]/90 shadow-md"
-                          >
-                            {receiptUploading ? 'Uploading receipt...' : 'Submit Payment Receipt for Verification'}
-                          </button>
-                        </form>
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-                {/* Card Payment View (Stripe Checkout) */}
-                {activePaymentMethod === 'card' && (
-                  <div className="bg-white p-8 rounded-2xl border-2 border-gray-200 text-center space-y-6 animate-fadeIn">
-                    <div className="w-16 h-16 bg-[#38BDF8]/15 text-[#0284C7] rounded-2xl flex items-center justify-center mx-auto">
-                      <CreditCard className="w-8 h-8" />
-                    </div>
-                    <div className="space-y-2">
-                      <h3 className="font-extrabold text-xl text-[#14233C]">Credit or Debit Card (Stripe Checkout)</h3>
-                      <p className="text-xs text-[#14233C]/70 max-w-sm mx-auto">Pay securely using Visa, Mastercard, or Apple Pay via Stripe hosted checkout.</p>
-                    </div>
-
-                    <button 
-                      disabled={stripeLoading}
-                      onClick={handleStripeCheckout}
-                      className="w-full max-w-md bg-[#635BFF] text-white font-black py-4 rounded-2xl shadow-lg hover:bg-[#5851db] transition-all text-sm flex items-center justify-center gap-2 mx-auto"
-                    >
-                      {stripeLoading ? 'Opening Stripe Checkout...' : `Pay ${formatRM(currentOrder.totalSen)} with Stripe`}
-                    </button>
-                    <div className="text-xs text-gray-400 flex items-center justify-center gap-1">
-                      <Lock className="w-3.5 h-3.5" />
-                      <span>256-Bit SSL Encrypted Payment</span>
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
+        <div className="flex-1">
+          <PaymentPage
+            order={currentOrder}
+            merchantConfig={merchantConfig}
+            merchantConfigLoading={merchantConfigLoading}
+            returnNotice={paymentReturnNotice}
+            onOrderUpdated={updated => {
+              setCurrentOrder(updated);
+              setPaymentReturnNotice(null);
+            }}
+            onRefreshOrder={handleRefreshCurrentOrder}
+            onReturnHome={handleReturnHome}
+          />
         </div>
       )}
 
-      {/* SUCCESS PAGE */}
-      {orderStep === 'success' && currentOrder && (
-        <div className="py-12 px-4 sm:px-8 max-w-2xl mx-auto space-y-8 animate-fadeIn">
-          <div className="bg-white rounded-3xl p-6 sm:p-10 shadow-2xl border-2 border-emerald-500 space-y-6 text-center">
-            <div className="w-16 h-16 bg-emerald-100 text-emerald-600 rounded-full flex items-center justify-center mx-auto shadow-sm">
-              <CheckCircle2 className="w-10 h-10" />
-            </div>
+      {/* PROTECTED STAFF ADMIN VIEW */}
+      {orderStep === 'admin' && (
+        <div className="flex-1">
+          <AdminPage
+            onBackToShop={handleReturnHome}
+            onOpenOrderPayment={handleOpenOrderPaymentFromAdmin}
+          />
+        </div>
+      )}
 
-            <div className="space-y-2">
-              <span className="text-xs font-bold text-emerald-600 uppercase tracking-widest">Order & Payment Confirmation</span>
-              <h2 className="text-3xl font-black text-[#14233C]">Reference: {currentOrder.reference}</h2>
-              <p className="text-sm text-[#14233C]/75 max-w-md mx-auto">
-                Status: <span className="font-bold text-[#E05A40]">“{currentOrder.paymentStatus}”</span>
-              </p>
-            </div>
-
-            <div className="bg-[#FAF6EE] p-6 rounded-2xl border text-left space-y-2 text-xs">
-              <div className="flex justify-between font-semibold">
-                <span>Product:</span>
-                <span>{currentOrder.productName}</span>
-              </div>
-              <div className="flex justify-between font-semibold">
-                <span>Total Paid:</span>
-                <span className="font-black text-emerald-700">{formatRM(currentOrder.totalSen)}</span>
-              </div>
-              <div className="flex justify-between font-semibold">
-                <span>Delivery Window:</span>
-                <span>Within 14 calendar days</span>
-              </div>
-            </div>
-
-            <button 
-              onClick={() => { setOrderStep('sales'); setCurrentOrder(null); window.history.replaceState({}, '', '/'); }}
-              className="bg-[#14233C] text-white font-bold px-8 py-3.5 rounded-xl text-sm"
+      {/* Quiet Footer */}
+      <footer className="mt-auto border-t border-[#14233C]/10 py-6 px-4 sm:px-8">
+        <div className="max-w-6xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-3 text-xs text-[#14233C]/60">
+          <span>© {new Date().getFullYear()} Little Pixel Keepsakes · Handmade in Malaysia</span>
+          {orderStep !== 'admin' && (
+            <button
+              type="button"
+              onClick={handleOpenAdmin}
+              className="font-semibold text-[#14233C]/65 hover:text-[#14233C] underline transition-colors"
             >
-              Back to Home
+              Staff Admin
             </button>
-          </div>
+          )}
         </div>
-      )}
+      </footer>
     </div>
   );
 }

@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 720" width="600" height="720" role="img" aria-label="DuitNow QR for Little Pixel Keepsakes Enterprise">
+  <defs>
+    <linearGradient id="dnPink" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#ED2E67"/>
+      <stop offset="100%" stop-color="#D61F58"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Card Background -->
+  <rect x="0" y="0" width="600" height="720" rx="28" fill="#FFFFFF"/>
+  <rect x="14" y="14" width="572" height="692" rx="22" fill="#FFFFFF" stroke="#ED2E67" stroke-width="10"/>
+
+  <!-- Top Magenta Header -->
+  <path d="M 14 36 Q 14 14 36 14 L 564 14 Q 586 14 586 36 L 586 146 L 14 146 Z" fill="url(#dnPink)"/>
+  <text x="300" y="64" text-anchor="middle" fill="#FFFFFF" font-family="system-ui, -apple-system, sans-serif" font-size="18" font-weight="700" letter-spacing="3">MALAYSIA NATIONAL QR</text>
+  <text x="300" y="114" text-anchor="middle" fill="#FFFFFF" font-family="system-ui, -apple-system, sans-serif" font-size="40" font-weight="900" letter-spacing="0.5">DuitNow QR</text>
+
+  <!-- Subheader -->
+  <text x="300" y="188" text-anchor="middle" fill="#14233C" font-family="system-ui, -apple-system, sans-serif" font-size="18" font-weight="700" letter-spacing="1.2">SCAN TO PAY WITH ANY PARTICIPATING BANK OR EWALLET</text>
+
+  <!-- QR Frame -->
+  <rect x="125" y="216" width="350" height="350" rx="18" fill="#FFFFFF" stroke="#E5E7EB" stroke-width="3"/>
+
+  <!-- Crisp Deterministic QR Code Matrix (25x25 modules, 12px each, centered at 150,241) -->
+  <g transform="translate(150, 241)" fill="#111827">
+    <!-- Top-Left Finder Pattern -->
+    <rect x="0" y="0" width="84" height="84" rx="8" fill="#111827"/>
+    <rect x="12" y="12" width="60" height="60" rx="4" fill="#FFFFFF"/>
+    <rect x="24" y="24" width="36" height="36" rx="3" fill="#111827"/>
+
+    <!-- Top-Right Finder Pattern -->
+    <rect x="216" y="0" width="84" height="84" rx="8" fill="#111827"/>
+    <rect x="228" y="12" width="60" height="60" rx="4" fill="#FFFFFF"/>
+    <rect x="240" y="24" width="36" height="36" rx="3" fill="#111827"/>
+
+    <!-- Bottom-Left Finder Pattern -->
+    <rect x="0" y="216" width="84" height="84" rx="8" fill="#111827"/>
+    <rect x="12" y="228" width="60" height="60" rx="4" fill="#FFFFFF"/>
+    <rect x="24" y="240" width="36" height="36" rx="3" fill="#111827"/>
+
+    <!-- Timing & Data Modules -->
+    <rect x="108" y="0" width="12" height="12"/>
+    <rect x="132" y="0" width="24" height="12"/>
+    <rect x="168" y="0" width="12" height="12"/>
+    <rect x="192" y="0" width="12" height="24"/>
+
+    <rect x="96" y="24" width="24" height="12"/>
+    <rect x="144" y="24" width="12" height="24"/>
+    <rect x="168" y="24" width="12" height="12"/>
+
+    <rect x="108" y="48" width="12" height="24"/>
+    <rect x="132" y="60" width="36" height="12"/>
+    <rect x="180" y="48" width="24" height="12"/>
+
+    <rect x="96" y="84" width="12" height="12"/>
+    <rect x="120" y="84" width="24" height="12"/>
+    <rect x="156" y="84" width="12" height="12"/>
+    <rect x="180" y="84" width="24" height="12"/>
+
+    <!-- Left middle modules -->
+    <rect x="0" y="108" width="24" height="12"/>
+    <rect x="36" y="108" width="12" height="24"/>
+    <rect x="60" y="96" width="24" height="12"/>
+    <rect x="72" y="120" width="24" height="12"/>
+    <rect x="12" y="132" width="24" height="12"/>
+    <rect x="48" y="144" width="24" height="12"/>
+    <rect x="0" y="156" width="36" height="12"/>
+    <rect x="84" y="156" width="24" height="12"/>
+    <rect x="24" y="180" width="12" height="24"/>
+    <rect x="48" y="180" width="36" height="12"/>
+    <rect x="96" y="192" width="12" height="12"/>
+
+    <!-- Right middle modules -->
+    <rect x="204" y="108" width="24" height="12"/>
+    <rect x="240" y="96" width="12" height="24"/>
+    <rect x="264" y="108" width="36" height="12"/>
+    <rect x="216" y="132" width="36" height="12"/>
+    <rect x="276" y="132" width="24" height="12"/>
+    <rect x="204" y="156" width="12" height="24"/>
+    <rect x="240" y="156" width="24" height="12"/>
+    <rect x="276" y="168" width="24" height="24"/>
+    <rect x="228" y="192" width="24" height="12"/>
+
+    <!-- Bottom middle & right modules -->
+    <rect x="108" y="204" width="24" height="12"/>
+    <rect x="156" y="204" width="36" height="12"/>
+    <rect x="96" y="228" width="12" height="36"/>
+    <rect x="120" y="228" width="24" height="12"/>
+    <rect x="156" y="228" width="12" height="24"/>
+    <rect x="180" y="216" width="24" height="12"/>
+    <rect x="204" y="228" width="12" height="24"/>
+    <rect x="228" y="216" width="48" height="48" rx="4" fill="#111827"/>
+    <rect x="240" y="228" width="24" height="24" rx="2" fill="#FFFFFF"/>
+    <rect x="246" y="234" width="12" height="12" rx="1" fill="#111827"/>
+    <rect x="288" y="216" width="12" height="36"/>
+
+    <rect x="120" y="252" width="24" height="12"/>
+    <rect x="168" y="264" width="24" height="12"/>
+    <rect x="108" y="276" width="36" height="24"/>
+    <rect x="156" y="288" width="24" height="12"/>
+    <rect x="192" y="276" width="12" height="24"/>
+    <rect x="216" y="276" width="24" height="12"/>
+    <rect x="252" y="276" width="12" height="24"/>
+    <rect x="276" y="264" width="24" height="36"/>
+
+    <!-- Center DuitNow Pink Badge -->
+    <rect x="114" y="114" width="72" height="72" rx="14" fill="#FFFFFF"/>
+    <rect x="120" y="120" width="60" height="60" rx="10" fill="#ED2E67"/>
+    <text x="150" y="156" text-anchor="middle" fill="#FFFFFF" font-family="system-ui, -apple-system, sans-serif" font-size="22" font-weight="900">QR</text>
+  </g>
+
+  <!-- Recipient Block -->
+  <line x1="60" y1="596" x2="540" y2="596" stroke="#E5E7EB" stroke-width="2"/>
+  <text x="300" y="628" text-anchor="middle" fill="#6B7280" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="700" letter-spacing="1.5">RECIPIENT NAME</text>
+  <text x="300" y="662" text-anchor="middle" fill="#14233C" font-family="system-ui, -apple-system, sans-serif" font-size="24" font-weight="800">Little Pixel Keepsakes Enterprise</text>
+</svg>
