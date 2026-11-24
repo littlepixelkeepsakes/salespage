@@ -1,0 +1,6 @@
+{
+  "name": "Little Pixel Keepsakes",
+  "description": "Handmade Perler bead keychains and fridge magnets from your favourite photos in Malaysia.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
