@@ -149,10 +149,11 @@ export default function App() {
   // Flow State: 'sales' | 'upload' | 'details' | 'review' | 'payment' | 'admin'
   const [orderStep, setOrderStep] = useState<'sales' | 'upload' | 'details' | 'review' | 'payment' | 'admin'>('sales');
 
-  // Photo Upload State
+  // Photo Upload State (stored in private Supabase customer-photos bucket via secure upload session)
   const [photoFile, setPhotoFile] = useState<File | null>(null);
   const [photoPreview, setPhotoPreview] = useState<string | null>(null);
-  const [uploadedPhotoUrl, setUploadedPhotoUrl] = useState<string | null>(null);
+  const [uploadSessionToken, setUploadSessionToken] = useState<string | null>(null);
+  const [uploadedPhotoStoragePath, setUploadedPhotoStoragePath] = useState<string | null>(null);
   const [uploading, setUploading] = useState<boolean>(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
 
@@ -182,6 +183,8 @@ export default function App() {
   const [storefront, setStorefront] = useState<PublicStorefrontConfig>(DEFAULT_STOREFRONT);
   const [merchantConfig, setMerchantConfig] = useState<MerchantPaymentConfig | null>(null);
   const [merchantConfigLoading, setMerchantConfigLoading] = useState<boolean>(true);
+  const [supabaseReady, setSupabaseReady] = useState<boolean>(true);
+  const [supabaseError, setSupabaseError] = useState<string | null>(null);
 
   const fetchOrderByReference = useCallback(
     async (
@@ -255,11 +258,15 @@ export default function App() {
       }
     }
 
-    // Fetch editable storefront settings & independently evaluated merchant payment options
+    // Fetch editable storefront settings, Supabase readiness & merchant payment options
     fetch('/api/store-config')
       .then(res => res.json())
       .then(data => {
         if (data.success) {
+          if (typeof data.supabaseReady === 'boolean') {
+            setSupabaseReady(data.supabaseReady);
+          }
+          setSupabaseError(data.supabaseError || null);
           if (data.storefront) {
             setStorefront(data.storefront);
             setDeliveryFeeSen(data.storefront.deliveryRatesSen.peninsular);
@@ -320,13 +327,28 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
-  // Handle Photo File Upload
+  const ensureUploadSession = async (forceNew = false): Promise<string | null> => {
+    if (!forceNew && uploadSessionToken) return uploadSessionToken;
+    const res = await fetch('/api/photo-upload-session', { method: 'POST' });
+    const data = await res.json();
+    if (res.ok && data.success && data.uploadSessionToken) {
+      setUploadSessionToken(data.uploadSessionToken);
+      return data.uploadSessionToken as string;
+    }
+    throw new Error(data.error || 'Could not start a secure photo upload session.');
+  };
+
+  // Handle Photo File Upload into private Supabase customer-photos bucket
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
     if (!['image/jpeg', 'image/png'].includes(file.type)) {
       setUploadError('Please upload a clear JPG or PNG image.');
+      return;
+    }
+    if (file.size > 10 * 1024 * 1024) {
+      setUploadError('Photo must be smaller than 10 MB.');
       return;
     }
 
@@ -340,24 +362,47 @@ export default function App() {
 
     setUploading(true);
     const reader = new FileReader();
+    reader.onerror = () => {
+      setUploadError('Unable to read the selected photo. Please try again.');
+      setUploading(false);
+    };
     reader.onload = async () => {
       try {
         const base64Data = reader.result as string;
-        const res = await fetch('/api/upload-photo', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ imageBase64: base64Data })
-        });
+        let sessionTok = await ensureUploadSession(false);
+
+        const postUpload = async (tok: string) =>
+          fetch('/api/upload-photo', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-upload-session': tok
+            },
+            body: JSON.stringify({
+              uploadSessionToken: tok,
+              imageBase64: base64Data,
+              filename: file.name
+            })
+          });
+
+        let res = await postUpload(sessionTok!);
+        if (res.status === 401) {
+          sessionTok = await ensureUploadSession(true);
+          res = await postUpload(sessionTok!);
+        }
+
         const data = await res.json();
-        if (data.success) {
-          setUploadedPhotoUrl(data.photoUrl);
+        if (res.ok && data.success && data.photoStoragePath) {
+          setUploadedPhotoStoragePath(data.photoStoragePath);
           setUploading(false);
         } else {
-          setUploadError(data.error || 'Upload failed');
+          setUploadedPhotoStoragePath(null);
+          setUploadError(data.error || 'Upload failed.');
           setUploading(false);
         }
-      } catch (err) {
-        setUploadError('Server connection failed during upload.');
+      } catch (err: any) {
+        setUploadedPhotoStoragePath(null);
+        setUploadError(err?.message || 'Server connection failed during upload.');
         setUploading(false);
       }
     };
@@ -405,15 +450,18 @@ export default function App() {
         body: JSON.stringify({
           productId: selectedProductId,
           bundleId: selectedProductId === 'bundle' ? selectedBundleId : undefined,
-          photoUrl: uploadedPhotoUrl,
+          uploadSessionToken,
+          photoStoragePath: uploadedPhotoStoragePath,
           customer
         })
       });
       const data = await res.json();
 
-      if (data.success && data.order) {
+      if (res.ok && data.success && data.order) {
         setCurrentOrder(data.order);
         setPaymentReturnNotice(null);
+        setUploadSessionToken(null);
+        setUploadedPhotoStoragePath(null);
         setSubmittingOrder(false);
         setOrderStep('payment');
         window.history.replaceState(
@@ -502,6 +550,22 @@ export default function App() {
           </div>
         </div>
       </header>
+
+      {/* Supabase Configuration / Unavailability Notice */}
+      {!supabaseReady && supabaseError && orderStep !== 'admin' && (
+        <div className="max-w-5xl mx-auto px-4 sm:px-8 pt-6">
+          <div
+            role="alert"
+            className="flex items-start gap-3 p-4 rounded-2xl bg-red-50 border border-red-200 text-xs text-red-950 leading-relaxed"
+          >
+            <AlertCircle className="w-4 h-4 text-red-700 shrink-0 mt-0.5" />
+            <div className="space-y-1">
+              <p className="font-bold">Store storage configuration required</p>
+              <p>{supabaseError}</p>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Saved Order Lookup Loading / Error */}
       {loadingOrderRef && (
@@ -832,7 +896,7 @@ export default function App() {
                       }
                       setPhotoFile(null);
                       setPhotoPreview(null);
-                      setUploadedPhotoUrl(null);
+                      setUploadedPhotoStoragePath(null);
                     }}
                     className="px-4 py-2 bg-gray-100 rounded-xl text-xs font-bold text-[#14233C]/75 hover:text-[#14233C]"
                   >
@@ -847,9 +911,9 @@ export default function App() {
             <p className="text-xs text-[#14233C]/65">{DELIVERY_PROMISE_TEXT}</p>
 
             <button 
-              disabled={!uploadedPhotoUrl || uploading}
+              disabled={!uploadedPhotoStoragePath || uploading}
               onClick={() => setOrderStep('details')}
-              className={`w-full py-4 rounded-2xl font-bold text-sm ${uploadedPhotoUrl && !uploading ? 'bg-[#14233C] text-white' : 'bg-gray-200 text-gray-400 cursor-not-allowed'}`}
+              className={`w-full py-4 rounded-2xl font-bold text-sm ${uploadedPhotoStoragePath && !uploading ? 'bg-[#14233C] text-white' : 'bg-gray-200 text-gray-400 cursor-not-allowed'}`}
             >
               {uploading ? 'Uploading photo…' : 'Continue to Delivery Details'}
             </button>

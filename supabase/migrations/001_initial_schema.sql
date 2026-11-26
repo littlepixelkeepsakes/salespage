@@ -174,7 +174,7 @@ CREATE TABLE IF NOT EXISTS public.email_notifications (
   order_reference TEXT NOT NULL REFERENCES public.orders(reference) ON DELETE CASCADE,
   notification_type TEXT NOT NULL DEFAULT 'order_confirmation'
     CHECK (notification_type IN ('order_confirmation')),
-  provider TEXT NOT NULL DEFAULT 'resend' CHECK (provider IN ('resend', 'smtp', 'none')),
+  provider TEXT NOT NULL DEFAULT 'resend' CHECK (provider IN ('resend', 'none')),
   recipient_email TEXT NOT NULL,
   sender_email TEXT,
   subject TEXT NOT NULL,

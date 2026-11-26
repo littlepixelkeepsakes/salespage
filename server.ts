@@ -6,7 +6,43 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import Stripe from 'stripe';
-import nodemailer from 'nodemailer';
+import type {
+  EditableStoreSettings,
+  PaymentMethodKey,
+  StoreGalleryImage,
+  SupabaseHealthDiagnostic
+} from './src/types/order';
+import {
+  checkSupabaseHealth,
+  clearSupabaseHealthCache,
+  createBootstrapStaffAccount,
+  createShortLivedSignedUrl,
+  downloadPrivateFile,
+  fetchHydratedOrderByReference,
+  fetchOrderByReference,
+  fetchOrderConfirmationEmail,
+  fetchPaymentByStripeSessionId,
+  fetchPaymentsForOrder,
+  fetchStoreSettingsRow,
+  getSupabaseEnvConfig,
+  hasProcessedStripeEvent,
+  insertOrderRow,
+  insertPaymentRow,
+  listActiveStaffAccounts,
+  listHydratedOrders,
+  movePrivateFile,
+  removePrivateFile,
+  sanitizeSupabaseError,
+  touchStaffLastLogin,
+  updateOrderByReference,
+  updatePaymentById,
+  uploadPrivateFile,
+  upsertOrderConfirmationEmail,
+  upsertStoreSettingsRow,
+  type HydratedOrder,
+  type OrderRow,
+  type StoreSettingsRow
+} from './src/server/supabase';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -15,77 +51,19 @@ const DELIVERY_PROMISE_TEXT =
   'Your order will be delivered within 14 days after your payment is confirmed and we receive a usable photo.';
 const PAID_CONFIRMATION_HEADING = 'Thank you! Your order is confirmed.';
 
-// Public & private directories (private storage must remain strictly outside public/ and dist/)
+// Public storefront static directories (NEVER used for customer photos or payment receipts)
 const publicDir = path.resolve(__dirname, 'public');
 const distDir = path.resolve(__dirname, 'dist');
-const publicUploadsDir = path.resolve(publicDir, 'uploads');
 const publicPaymentsDir = path.resolve(publicDir, 'payments');
+const publicStorefrontAssetsDir = path.resolve(publicDir, 'assets', 'storefront');
 
-const configuredPrivateDir = (process.env.PRIVATE_STORAGE_DIR || '').trim();
-const privateStorageDir = configuredPrivateDir
-  ? path.resolve(__dirname, configuredPrivateDir)
-  : path.resolve(__dirname, 'private_storage');
-const privateReceiptsDir = path.resolve(privateStorageDir, 'receipts');
-const storeFilePath = path.resolve(privateStorageDir, 'store.json');
-
-function isStrictlyOutsidePublicDirs(targetPath: string): boolean {
-  const normalized = path.resolve(targetPath);
-  const insidePublic = normalized === publicDir || normalized.startsWith(publicDir + path.sep);
-  const insideDist = normalized === distDir || normalized.startsWith(distDir + path.sep);
-  return !insidePublic && !insideDist;
-}
-
-for (const dir of [publicUploadsDir, publicPaymentsDir]) {
+for (const dir of [publicPaymentsDir, publicStorefrontAssetsDir]) {
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
 }
 
-if (isStrictlyOutsidePublicDirs(privateStorageDir)) {
-  for (const dir of [privateStorageDir, privateReceiptsDir]) {
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-  }
-}
-
-function checkPrivateStorageHealth(): {
-  configured: boolean;
-  outsidePublic: boolean;
-  writable: boolean;
-  issue?: string;
-} {
-  const outsidePublic =
-    isStrictlyOutsidePublicDirs(privateStorageDir) && isStrictlyOutsidePublicDirs(privateReceiptsDir);
-  if (!outsidePublic) {
-    return {
-      configured: false,
-      outsidePublic: false,
-      writable: false,
-      issue: 'PRIVATE_STORAGE_DIR must point outside public/ and dist/ so receipts stay private.'
-    };
-  }
-  try {
-    if (!fs.existsSync(privateStorageDir)) {
-      fs.mkdirSync(privateStorageDir, { recursive: true });
-    }
-    if (!fs.existsSync(privateReceiptsDir)) {
-      fs.mkdirSync(privateReceiptsDir, { recursive: true });
-    }
-    fs.accessSync(privateStorageDir, fs.constants.R_OK | fs.constants.W_OK);
-    fs.accessSync(privateReceiptsDir, fs.constants.R_OK | fs.constants.W_OK);
-    return { configured: true, outsidePublic: true, writable: true };
-  } catch {
-    return {
-      configured: false,
-      outsidePublic: true,
-      writable: false,
-      issue: 'Private storage directory is not writable on the server.'
-    };
-  }
-}
-
-// Shared product & bundle pricing configuration in integer sen
+// Shared product & bundle pricing configuration in integer sen (RM)
 const PRODUCT_CONFIG: Record<string, { name: string; priceSen: number; regularSen?: number }> = {
   keychain: { name: 'Keychain', priceSen: 2990 },
   magnet: { name: 'Fridge Magnet', priceSen: 3190 },
@@ -118,43 +96,8 @@ const MAX_UPLOAD_BYTES = 10 * 1024 * 1024; // 10 MB
 const ADMIN_SESSION_TTL_MS = 8 * 60 * 60 * 1000; // 8 hours
 const LOGIN_WINDOW_MS = 15 * 60 * 1000; // 15 min
 const MAX_LOGIN_ATTEMPTS = 10;
-
-interface StoreGalleryImage {
-  id: string;
-  category: string;
-  title: string;
-  description: string;
-  image: string;
-  tag: string;
-}
-
-interface EditableStoreSettings {
-  logoUrl: string;
-  heroImageUrl: string;
-  productImages: {
-    keychain: string;
-    magnet: string;
-    bundle: string;
-  };
-  galleryItems: StoreGalleryImage[];
-  deliveryRatesSen: {
-    peninsular: number;
-    eastMalaysia: number;
-  };
-  whatsappSupportNumber: string;
-  qrOverrides: {
-    tng: {
-      enabled: boolean | null;
-      recipientName: string;
-      qrImage: string;
-    };
-    duitnow: {
-      enabled: boolean | null;
-      recipientName: string;
-      qrImage: string;
-    };
-  };
-}
+const PHOTO_UPLOAD_SESSION_TTL_MS = 30 * 60 * 1000; // 30 min
+const MAX_UPLOAD_SESSIONS_PER_WINDOW = 30;
 
 function getDefaultStoreSettings(): EditableStoreSettings {
   return {
@@ -203,112 +146,20 @@ function getDefaultStoreSettings(): EditableStoreSettings {
   };
 }
 
-interface PrivateReceiptRecord {
-  id: string;
-  storageFileName: string;
-  originalFilename: string;
-  mimeType: 'image/jpeg' | 'image/png' | 'application/pdf';
-  sizeBytes: number;
-  uploadedAt: string;
-}
-
-type PaymentStatus =
-  | 'Awaiting payment'
-  | 'Pending verification'
-  | 'Receipt correction needed'
-  | 'Paid';
-
-interface OrderRecord {
-  reference: string;
-  accessToken: string;
-  productId: string;
-  bundleId?: string;
-  productName: string;
-  itemQuantity: number;
-  subtotalSen: number;
-  regularSubtotalSen?: number;
-  savingsSen?: number;
-  deliveryFeeSen: number;
-  totalSen: number;
-  photoUrl: string;
-  customer: {
-    fullName: string;
-    email: string;
-    mobile: string;
-    address: string;
-    postcode: string;
-    city: string;
-    state: string;
-  };
-  paymentStatus: PaymentStatus;
-  paymentMethod?: 'tng' | 'duitnow' | 'card' | null;
-  transactionReference?: string;
-  privateReceipt?: PrivateReceiptRecord;
-  stripeSessionId?: string;
-  stripeSessionIds?: string[];
-  stripePaymentIntentId?: string;
-  paidAt?: string;
-  verifiedByStaff?: boolean;
-  verificationNote?: string;
-  correctionReason?: string;
-  lastCardAttemptMessage?: string;
-  confirmationEmailStatus?: 'sent' | 'not_configured' | 'failed' | null;
-  confirmationEmailSentAt?: string;
-  confirmationEmailId?: string;
-  confirmationEmailError?: string;
-  confirmationEmailLastAttemptAt?: string;
-  createdAt: string;
-}
-
-interface AdminCredentialHash {
-  salt: string;
-  hash: string;
-  claimedAt: string;
-}
-
-interface PersistedStoreData {
-  orders: Record<string, OrderRecord>;
-  processedStripeEvents: string[];
-  adminCredential?: AdminCredentialHash;
-  storeSettings?: EditableStoreSettings;
-}
-
-const ordersStore: Map<string, OrderRecord> = new Map();
-const processedStripeEvents: Set<string> = new Set();
-const inFlightConfirmationEmails: Set<string> = new Set();
-let claimedAdminCredential: AdminCredentialHash | null = null;
-let storeSettings: EditableStoreSettings = getDefaultStoreSettings();
-
-// In-memory admin sessions & login rate-limiting
-const adminSessions: Map<string, { expiresAt: number }> = new Map();
-const failedLoginTracker: Map<string, { count: number; resetAt: number }> = new Map();
-
-function mergeStoreSettings(saved?: Partial<EditableStoreSettings>): EditableStoreSettings {
+function mapStoreSettingsRow(row?: StoreSettingsRow | null): EditableStoreSettings {
   const defaults = getDefaultStoreSettings();
-  if (!saved || typeof saved !== 'object') return defaults;
+  if (!row) return defaults;
   return {
-    logoUrl: typeof saved.logoUrl === 'string' && saved.logoUrl.trim() ? saved.logoUrl.trim() : defaults.logoUrl,
-    heroImageUrl:
-      typeof saved.heroImageUrl === 'string' && saved.heroImageUrl.trim()
-        ? saved.heroImageUrl.trim()
-        : defaults.heroImageUrl,
+    logoUrl: row.logo_url?.trim() || defaults.logoUrl,
+    heroImageUrl: row.hero_image_url?.trim() || defaults.heroImageUrl,
     productImages: {
-      keychain:
-        typeof saved.productImages?.keychain === 'string' && saved.productImages.keychain.trim()
-          ? saved.productImages.keychain.trim()
-          : defaults.productImages.keychain,
-      magnet:
-        typeof saved.productImages?.magnet === 'string' && saved.productImages.magnet.trim()
-          ? saved.productImages.magnet.trim()
-          : defaults.productImages.magnet,
-      bundle:
-        typeof saved.productImages?.bundle === 'string' && saved.productImages.bundle.trim()
-          ? saved.productImages.bundle.trim()
-          : defaults.productImages.bundle
+      keychain: row.product_images?.keychain?.trim() || defaults.productImages.keychain,
+      magnet: row.product_images?.magnet?.trim() || defaults.productImages.magnet,
+      bundle: row.product_images?.bundle?.trim() || defaults.productImages.bundle
     },
     galleryItems:
-      Array.isArray(saved.galleryItems) && saved.galleryItems.length > 0
-        ? saved.galleryItems.slice(0, 6).map((item, idx) => {
+      Array.isArray(row.gallery_items) && row.gallery_items.length > 0
+        ? row.gallery_items.slice(0, 6).map((item, idx) => {
             const fallback = defaults.galleryItems[idx] || defaults.galleryItems[0];
             return {
               id: typeof item?.id === 'string' && item.id.trim() ? item.id.trim() : fallback.id,
@@ -337,110 +188,67 @@ function mergeStoreSettings(saved?: Partial<EditableStoreSettings>): EditableSto
         : defaults.galleryItems,
     deliveryRatesSen: {
       peninsular:
-        typeof saved.deliveryRatesSen?.peninsular === 'number' &&
-        Number.isInteger(saved.deliveryRatesSen.peninsular) &&
-        saved.deliveryRatesSen.peninsular >= 0
-          ? saved.deliveryRatesSen.peninsular
+        Number.isInteger(row.delivery_rate_peninsular_sen) && row.delivery_rate_peninsular_sen >= 0
+          ? row.delivery_rate_peninsular_sen
           : defaults.deliveryRatesSen.peninsular,
       eastMalaysia:
-        typeof saved.deliveryRatesSen?.eastMalaysia === 'number' &&
-        Number.isInteger(saved.deliveryRatesSen.eastMalaysia) &&
-        saved.deliveryRatesSen.eastMalaysia >= 0
-          ? saved.deliveryRatesSen.eastMalaysia
+        Number.isInteger(row.delivery_rate_east_malaysia_sen) && row.delivery_rate_east_malaysia_sen >= 0
+          ? row.delivery_rate_east_malaysia_sen
           : defaults.deliveryRatesSen.eastMalaysia
     },
-    whatsappSupportNumber:
-      typeof saved.whatsappSupportNumber === 'string'
-        ? saved.whatsappSupportNumber.replace(/\D/g, '').slice(0, 20)
-        : defaults.whatsappSupportNumber,
+    whatsappSupportNumber: (row.whatsapp_support_number || '').replace(/\D/g, '').slice(0, 20),
     qrOverrides: {
       tng: {
-        enabled:
-          typeof saved.qrOverrides?.tng?.enabled === 'boolean' ? saved.qrOverrides.tng.enabled : null,
-        recipientName:
-          typeof saved.qrOverrides?.tng?.recipientName === 'string'
-            ? saved.qrOverrides.tng.recipientName.trim().slice(0, 140)
-            : '',
-        qrImage:
-          typeof saved.qrOverrides?.tng?.qrImage === 'string'
-            ? saved.qrOverrides.tng.qrImage.trim()
-            : ''
+        enabled: typeof row.tng_override_enabled === 'boolean' ? row.tng_override_enabled : null,
+        recipientName: (row.tng_override_recipient_name || '').trim().slice(0, 140),
+        qrImage: (row.tng_override_qr_image || '').trim()
       },
       duitnow: {
-        enabled:
-          typeof saved.qrOverrides?.duitnow?.enabled === 'boolean'
-            ? saved.qrOverrides.duitnow.enabled
-            : null,
-        recipientName:
-          typeof saved.qrOverrides?.duitnow?.recipientName === 'string'
-            ? saved.qrOverrides.duitnow.recipientName.trim().slice(0, 140)
-            : '',
-        qrImage:
-          typeof saved.qrOverrides?.duitnow?.qrImage === 'string'
-            ? saved.qrOverrides.duitnow.qrImage.trim()
-            : ''
+        enabled: typeof row.duitnow_override_enabled === 'boolean' ? row.duitnow_override_enabled : null,
+        recipientName: (row.duitnow_override_recipient_name || '').trim().slice(0, 140),
+        qrImage: (row.duitnow_override_qr_image || '').trim()
       }
     }
   };
 }
 
-function loadStoreFromDisk(): void {
-  try {
-    if (!fs.existsSync(storeFilePath)) return;
-    const raw = fs.readFileSync(storeFilePath, 'utf-8');
-    const parsed = JSON.parse(raw) as Partial<PersistedStoreData>;
-    let migrated = false;
-    if (parsed.orders && typeof parsed.orders === 'object') {
-      for (const [ref, record] of Object.entries(parsed.orders)) {
-        if (record && typeof record.reference === 'string') {
-          if (!record.accessToken || typeof record.accessToken !== 'string') {
-            record.accessToken = crypto.randomBytes(24).toString('base64url');
-            migrated = true;
-          }
-          ordersStore.set(ref, record);
+// Transient in-memory locks & short-lived session caches (all persistent records live in Supabase)
+const inFlightConfirmationEmails: Set<string> = new Set();
+
+interface AdminSessionRecord {
+  staffId: string | null;
+  username: string;
+  expiresAt: number;
+}
+const adminSessions: Map<string, AdminSessionRecord> = new Map();
+const failedLoginTracker: Map<string, { count: number; resetAt: number }> = new Map();
+
+interface PhotoUploadSessionRecord {
+  sessionId: string;
+  token: string;
+  expiresAt: number;
+  photoStoragePath: string | null;
+  photoOriginalFilename: string | null;
+  photoMimeType: 'image/jpeg' | 'image/png' | null;
+  photoSizeBytes: number | null;
+}
+const photoUploadSessions: Map<string, PhotoUploadSessionRecord> = new Map();
+const uploadSessionRateTracker: Map<string, { count: number; resetAt: number }> = new Map();
+
+function pruneExpiredUploadSessions(): void {
+  const now = Date.now();
+  for (const [token, session] of photoUploadSessions.entries()) {
+    if (session.expiresAt < now) {
+      photoUploadSessions.delete(token);
+      if (session.photoStoragePath) {
+        const cfg = getSupabaseEnvConfig();
+        if (cfg.valid) {
+          void removePrivateFile(cfg.photosBucket, session.photoStoragePath);
         }
       }
     }
-    if (Array.isArray(parsed.processedStripeEvents)) {
-      for (const id of parsed.processedStripeEvents) {
-        if (typeof id === 'string') processedStripeEvents.add(id);
-      }
-    }
-    if (
-      parsed.adminCredential &&
-      typeof parsed.adminCredential.salt === 'string' &&
-      typeof parsed.adminCredential.hash === 'string'
-    ) {
-      claimedAdminCredential = parsed.adminCredential;
-    }
-    if (parsed.storeSettings) {
-      storeSettings = mergeStoreSettings(parsed.storeSettings);
-    }
-    if (migrated) {
-      saveStoreToDisk();
-    }
-  } catch (err) {
-    console.error('Failed to load persisted store from disk:', err);
   }
 }
-
-function saveStoreToDisk(): void {
-  const storageHealth = checkPrivateStorageHealth();
-  if (!storageHealth.configured) {
-    throw new Error(storageHealth.issue || 'Private storage is not writable.');
-  }
-  const payload: PersistedStoreData = {
-    orders: Object.fromEntries(ordersStore.entries()),
-    processedStripeEvents: Array.from(processedStripeEvents.values()),
-    adminCredential: claimedAdminCredential ?? undefined,
-    storeSettings
-  };
-  const tempPath = `${storeFilePath}.${crypto.randomBytes(6).toString('hex')}.tmp`;
-  fs.writeFileSync(tempPath, JSON.stringify(payload, null, 2), 'utf-8');
-  fs.renameSync(tempPath, storeFilePath);
-}
-
-loadStoreFromDisk();
 
 function hashPasscode(passcode: string, saltHex?: string): { salt: string; hash: string } {
   const salt = saltHex || crypto.randomBytes(16).toString('hex');
@@ -468,91 +276,105 @@ function formatRM(sen: number): string {
   return `RM ${(sen / 100).toFixed(2)}`;
 }
 
-function getDeliveryConfigForState(state: string): { zone: string; rateSen: number } | null {
+function getDeliveryConfigForState(
+  state: string,
+  settings: EditableStoreSettings
+): { zone: string; rateSen: number } | null {
   const normalized = state.trim().toLowerCase();
   if (PENINSULAR_STATES.has(normalized)) {
-    return { zone: 'Peninsular Malaysia', rateSen: storeSettings.deliveryRatesSen.peninsular };
+    return { zone: 'Peninsular Malaysia', rateSen: settings.deliveryRatesSen.peninsular };
   }
   if (EAST_MALAYSIA_STATES.has(normalized)) {
-    return { zone: 'Sabah & Sarawak', rateSen: storeSettings.deliveryRatesSen.eastMalaysia };
+    return { zone: 'Sabah & Sarawak', rateSen: settings.deliveryRatesSen.eastMalaysia };
   }
   return null;
 }
 
-function getAdminAuthMode(): 'env' | 'claimed' | 'bootstrap_required' {
-  const envPasscode = (process.env.ADMIN_PASSCODE || '').trim();
-  if (envPasscode.length > 0) return 'env';
-  if (claimedAdminCredential) return 'claimed';
-  return 'bootstrap_required';
-}
-
-function verifyAdminPasscode(inputPasscode: string): boolean {
-  const envPasscode = (process.env.ADMIN_PASSCODE || '').trim();
-  if (envPasscode.length > 0) {
-    return safeEqualStrings(inputPasscode, envPasscode);
-  }
-  if (claimedAdminCredential) {
-    const candidate = hashPasscode(inputPasscode, claimedAdminCredential.salt);
-    return safeEqualStrings(candidate.hash, claimedAdminCredential.hash);
-  }
-  return false;
-}
-
-function createAdminSession(): string {
+function createAdminSession(staffId: string | null, username: string): string {
   const token = crypto.randomBytes(32).toString('hex');
-  adminSessions.set(token, { expiresAt: Date.now() + ADMIN_SESSION_TTL_MS });
+  adminSessions.set(token, {
+    staffId,
+    username,
+    expiresAt: Date.now() + ADMIN_SESSION_TTL_MS
+  });
   return token;
 }
 
-function getPaymentMethodDisplayLabel(method?: 'tng' | 'duitnow' | 'card' | null): string | null {
+function getPaymentMethodDisplayLabel(method?: PaymentMethodKey | null): string | null {
   if (method === 'tng') return 'Touch ’n Go eWallet QR';
   if (method === 'duitnow') return 'Public Bank QR Pay';
   if (method === 'card') return 'Credit or Debit Card (Stripe)';
   return null;
 }
 
-// Sanitize order for public client response (never expose private filesystem paths or secret IDs)
-function toPublicOrder(order: OrderRecord) {
+function toPublicOrder(hydrated: HydratedOrder, photoUrl: string) {
+  const { order, latestPayment, latestReceiptPayment, confirmationEmail } = hydrated;
+  const activeManualPayment = latestReceiptPayment || latestPayment;
   return {
     reference: order.reference,
-    accessToken: order.accessToken,
-    productId: order.productId,
-    bundleId: order.bundleId,
-    productName: order.productName,
-    itemQuantity: order.itemQuantity,
-    subtotalSen: order.subtotalSen,
-    regularSubtotalSen: order.regularSubtotalSen,
-    savingsSen: order.savingsSen,
-    deliveryFeeSen: order.deliveryFeeSen,
-    totalSen: order.totalSen,
-    photoUrl: order.photoUrl,
-    customer: order.customer,
-    paymentStatus: order.paymentStatus,
-    paymentMethod: order.paymentMethod ?? null,
-    paymentMethodLabel: getPaymentMethodDisplayLabel(order.paymentMethod),
-    transactionReference: order.transactionReference,
-    receiptSubmitted: Boolean(order.privateReceipt),
-    receiptFileName: order.privateReceipt?.originalFilename,
-    receiptMimeType: order.privateReceipt?.mimeType,
-    receiptUploadedAt: order.privateReceipt?.uploadedAt,
-    paidAt: order.paidAt,
-    verifiedByStaff: Boolean(order.verifiedByStaff),
-    verificationNote: order.verificationNote,
-    correctionReason: order.correctionReason,
-    lastCardAttemptMessage: order.lastCardAttemptMessage,
-    confirmationEmailStatus: order.confirmationEmailStatus ?? null,
-    confirmationEmailSentAt: order.confirmationEmailSentAt,
-    createdAt: order.createdAt
+    accessToken: order.access_token,
+    productId: order.product_id,
+    bundleId: order.bundle_id ?? undefined,
+    productName: order.product_name,
+    itemQuantity: order.item_quantity,
+    subtotalSen: order.subtotal_sen,
+    regularSubtotalSen: order.regular_subtotal_sen ?? undefined,
+    savingsSen: order.savings_sen ?? undefined,
+    deliveryFeeSen: order.delivery_fee_sen,
+    totalSen: order.total_sen,
+    photoUrl,
+    photoFileName: order.photo_original_filename ?? undefined,
+    customer: {
+      fullName: order.customer_full_name,
+      email: order.customer_email,
+      mobile: order.customer_mobile,
+      address: order.customer_address,
+      postcode: order.customer_postcode,
+      city: order.customer_city,
+      state: order.customer_state
+    },
+    paymentStatus: order.payment_status,
+    paymentMethod: order.payment_method ?? null,
+    paymentMethodLabel: getPaymentMethodDisplayLabel(order.payment_method),
+    transactionReference: activeManualPayment?.transaction_reference ?? undefined,
+    receiptSubmitted: Boolean(latestReceiptPayment?.receipt_storage_path),
+    receiptFileName: latestReceiptPayment?.receipt_original_filename ?? undefined,
+    receiptMimeType: latestReceiptPayment?.receipt_mime_type ?? undefined,
+    receiptUploadedAt: latestReceiptPayment?.receipt_uploaded_at ?? undefined,
+    paidAt: order.paid_at ?? undefined,
+    verifiedByStaff: Boolean(order.verified_by_staff),
+    verificationNote: order.verification_note ?? undefined,
+    correctionReason: order.correction_reason ?? undefined,
+    lastCardAttemptMessage: order.last_card_attempt_message ?? undefined,
+    confirmationEmailStatus:
+      confirmationEmail?.status === 'sending' ? null : (confirmationEmail?.status ?? null),
+    confirmationEmailSentAt: confirmationEmail?.sent_at ?? undefined,
+    createdAt: order.created_at
   };
 }
 
 // Admin order serializer: includes sanitized email delivery error details for authorised staff only
-function toAdminOrder(order: OrderRecord) {
+function toAdminOrder(hydrated: HydratedOrder, signedPhotoUrl: string) {
+  const { confirmationEmail } = hydrated;
   return {
-    ...toPublicOrder(order),
-    confirmationEmailError: order.confirmationEmailError,
-    confirmationEmailLastAttemptAt: order.confirmationEmailLastAttemptAt
+    ...toPublicOrder(hydrated, signedPhotoUrl),
+    confirmationEmailError: confirmationEmail?.error_message ?? undefined,
+    confirmationEmailLastAttemptAt: confirmationEmail?.last_attempt_at ?? undefined
   };
+}
+
+function buildCustomerAuthorizedPhotoUrl(order: OrderRow): string {
+  return `/api/orders/${encodeURIComponent(order.reference)}/photo?token=${encodeURIComponent(order.access_token)}`;
+}
+
+async function resolveAdminOrderPhotoUrl(order: OrderRow): Promise<string> {
+  if (!order.photo_storage_path) return '';
+  const signed = await createShortLivedSignedUrl(
+    order.photo_storage_bucket,
+    order.photo_storage_path,
+    300
+  );
+  return signed || '';
 }
 
 function extractOrderToken(req: express.Request): string {
@@ -562,16 +384,16 @@ function extractOrderToken(req: express.Request): string {
   return (headerToken || queryToken || bodyToken).trim();
 }
 
-function isOrderAuthorized(req: express.Request, order: OrderRecord): boolean {
+function isOrderAuthorized(req: express.Request, order: OrderRow): boolean {
   const token = extractOrderToken(req);
-  if (!token || !order.accessToken) return false;
-  return safeEqualStrings(token, order.accessToken);
+  if (!token || !order.access_token) return false;
+  return safeEqualStrings(token, order.access_token);
 }
 
-// Validate that an asset/QR image path is an existing local asset (/payments/, /uploads/, /assets/, /src/assets/) or an https:// URL
+// Validate that a storefront/QR image path is a local public asset or https:// URL
 function validateImageSource(
   rawUrl: string,
-  allowedPrefixes: Array<'/payments/' | '/uploads/' | '/assets/' | '/src/assets/'>
+  allowedPrefixes: Array<'/payments/' | '/assets/' | '/src/assets/'>
 ): { valid: boolean; normalizedUrl?: string; reason?: string } {
   const trimmed = rawUrl.trim();
   if (!trimmed) {
@@ -593,9 +415,6 @@ function validateImageSource(
   if (normalized.startsWith('/public/payments/')) normalized = normalized.slice('/public'.length);
   else if (normalized.startsWith('public/payments/')) normalized = '/' + normalized.slice('public/'.length);
   else if (normalized.startsWith('payments/')) normalized = '/' + normalized;
-  else if (normalized.startsWith('/public/uploads/')) normalized = normalized.slice('/public'.length);
-  else if (normalized.startsWith('public/uploads/')) normalized = '/' + normalized.slice('public/'.length);
-  else if (normalized.startsWith('uploads/')) normalized = '/' + normalized;
   else if (normalized.startsWith('/public/assets/')) normalized = normalized.slice('/public'.length);
   else if (normalized.startsWith('public/assets/')) normalized = '/' + normalized.slice('public/'.length);
   else if (normalized.startsWith('assets/')) normalized = '/' + normalized;
@@ -603,7 +422,6 @@ function validateImageSource(
 
   const prefixToDir: Record<string, string> = {
     '/payments/': publicPaymentsDir,
-    '/uploads/': publicUploadsDir,
     '/assets/': path.resolve(publicDir, 'assets'),
     '/src/assets/': path.resolve(__dirname, 'src/assets')
   };
@@ -631,16 +449,12 @@ function validateImageSource(
   };
 }
 
-function validateQrImageSource(qrImage: string): { valid: boolean; normalizedUrl?: string; reason?: string } {
+function validateQrImageSource(qrImage: string) {
   return validateImageSource(qrImage, ['/payments/', '/assets/', '/src/assets/']);
 }
 
-function validateStorefrontAssetSource(imagePath: string): {
-  valid: boolean;
-  normalizedUrl?: string;
-  reason?: string;
-} {
-  return validateImageSource(imagePath, ['/uploads/', '/assets/', '/src/assets/', '/payments/']);
+function validateStorefrontAssetSource(imagePath: string) {
+  return validateImageSource(imagePath, ['/assets/', '/src/assets/', '/payments/']);
 }
 
 interface ConfiguredQrMethod {
@@ -676,8 +490,8 @@ function evaluateQrMethod(opts: {
   recipientEnv?: string;
   imageEnv?: string;
   override: { enabled: boolean | null; recipientName: string; qrImage: string };
-  privateStorageReady: boolean;
-  privateStorageIssue?: string;
+  supabaseReady: boolean;
+  supabaseIssue?: string;
 }): QrMethodEvaluation {
   const issues: string[] = [];
 
@@ -721,8 +535,8 @@ function evaluateQrMethod(opts: {
     }
   }
 
-  if (!opts.privateStorageReady) {
-    issues.push(opts.privateStorageIssue || 'Private receipt storage is not configured.');
+  if (!opts.supabaseReady) {
+    issues.push(opts.supabaseIssue || 'Supabase database and private receipts bucket must be configured.');
   }
 
   const configured = enabled && issues.length === 0;
@@ -750,7 +564,7 @@ function evaluateQrMethod(opts: {
   };
 }
 
-function getStripeConfig(): {
+function getStripeConfig(supabaseHealth: SupabaseHealthDiagnostic): {
   client: Stripe | null;
   mode: 'test' | 'live' | 'unconfigured';
   webhookConfigured: boolean;
@@ -761,7 +575,6 @@ function getStripeConfig(): {
   const webhookSecret = (process.env.STRIPE_WEBHOOK_SECRET || '').trim();
   const webhookConfigured = webhookSecret.length > 0;
   const livePaymentsEnabled = (process.env.ENABLE_LIVE_PAYMENTS || '').trim().toLowerCase() === 'true';
-  const storageHealth = checkPrivateStorageHealth();
 
   if (!secretKey) {
     return {
@@ -791,13 +604,13 @@ function getStripeConfig(): {
   const isLiveKey = secretKey.includes('_live_');
   const mode: 'test' | 'live' = isLiveKey ? 'live' : 'test';
 
-  if (!storageHealth.configured) {
+  if (!supabaseHealth.configured) {
     return {
       client: null,
       mode,
       webhookConfigured,
       livePaymentsEnabled,
-      error: storageHealth.issue || 'Private storage must be configured before enabling payments.'
+      error: supabaseHealth.issue || 'Supabase database and private storage must be configured before enabling payments.'
     };
   }
 
@@ -849,27 +662,18 @@ function sanitizeEmailError(raw: unknown): string {
   return (text || 'Email delivery failed').slice(0, 240);
 }
 
+// Resend-only email configuration (no SMTP settings)
 function getEmailConfig(): {
   configured: boolean;
-  provider: 'resend' | 'smtp' | 'none';
+  provider: 'resend' | 'none';
   fromAddress: string | null;
   issue?: string;
 } {
   const fromAddress = (process.env.EMAIL_FROM || '').trim();
   const hasValidFrom = isValidEmailFromHeader(fromAddress);
   const resendKey = (process.env.RESEND_API_KEY || '').trim();
-  const explicitProvider = (process.env.EMAIL_PROVIDER || '').trim().toLowerCase();
 
-  // Primary provider: Resend API (SMTP variables are completely ignored when Resend is selected)
-  if (resendKey || explicitProvider === 'resend') {
-    if (!resendKey) {
-      return {
-        configured: false,
-        provider: 'resend',
-        fromAddress: hasValidFrom ? fromAddress : null,
-        issue: 'RESEND_API_KEY is missing on the server.'
-      };
-    }
+  if (resendKey) {
     if (!fromAddress) {
       return {
         configured: false,
@@ -889,14 +693,6 @@ function getEmailConfig(): {
     return { configured: true, provider: 'resend', fromAddress };
   }
 
-  // Optional legacy SMTP fallback: only used when Resend is not configured AND all SMTP vars are explicitly provided
-  const smtpHost = (process.env.SMTP_HOST || '').trim();
-  const smtpUser = (process.env.SMTP_USER || '').trim();
-  const smtpPass = (process.env.SMTP_PASS || '').trim();
-  if (smtpHost && smtpUser && smtpPass && hasValidFrom) {
-    return { configured: true, provider: 'smtp', fromAddress };
-  }
-
   return {
     configured: false,
     provider: 'none',
@@ -909,8 +705,35 @@ function getEmailConfig(): {
   };
 }
 
-function evaluateAllPaymentMethods() {
-  const privateStorage = checkPrivateStorageHealth();
+async function loadCurrentStoreSettings(
+  supabaseHealth?: SupabaseHealthDiagnostic
+): Promise<{ settings: EditableStoreSettings; supabase: SupabaseHealthDiagnostic }> {
+  const health = supabaseHealth || (await checkSupabaseHealth());
+  if (!health.databaseReady) {
+    return { settings: getDefaultStoreSettings(), supabase: health };
+  }
+  try {
+    const row = await fetchStoreSettingsRow();
+    return { settings: mapStoreSettingsRow(row), supabase: health };
+  } catch (err) {
+    const errMsg = sanitizeSupabaseError(err);
+    clearSupabaseHealthCache();
+    return {
+      settings: getDefaultStoreSettings(),
+      supabase: {
+        ...health,
+        configured: false,
+        databaseReady: false,
+        issues: [...health.issues, errMsg],
+        issue: errMsg
+      }
+    };
+  }
+}
+
+async function evaluateAllPaymentMethods(forceHealthRefresh = false) {
+  const supabaseHealth = await checkSupabaseHealth(forceHealthRefresh);
+  const { settings, supabase } = await loadCurrentStoreSettings(supabaseHealth);
 
   // 1. Touch 'n Go eWallet QR — evaluated independently
   const tngEval = evaluateQrMethod({
@@ -923,9 +746,9 @@ function evaluateAllPaymentMethods() {
     enabledEnv: process.env.TNG_ENABLED,
     recipientEnv: process.env.TNG_RECIPIENT_NAME,
     imageEnv: process.env.TNG_QR_IMAGE,
-    override: storeSettings.qrOverrides.tng,
-    privateStorageReady: privateStorage.configured,
-    privateStorageIssue: privateStorage.issue
+    override: settings.qrOverrides.tng,
+    supabaseReady: supabase.configured,
+    supabaseIssue: supabase.issue
   });
 
   // 2. Public Bank QR Pay — evaluated independently
@@ -939,16 +762,19 @@ function evaluateAllPaymentMethods() {
     enabledEnv: process.env.DUITNOW_ENABLED,
     recipientEnv: process.env.DUITNOW_RECIPIENT_NAME,
     imageEnv: process.env.DUITNOW_QR_IMAGE,
-    override: storeSettings.qrOverrides.duitnow,
-    privateStorageReady: privateStorage.configured,
-    privateStorageIssue: privateStorage.issue
+    override: settings.qrOverrides.duitnow,
+    supabaseReady: supabase.configured,
+    supabaseIssue: supabase.issue
   });
 
   // 3. Credit or Debit Card (Stripe) — evaluated independently
-  const stripeInfo = getStripeConfig();
+  const stripeInfo = getStripeConfig(supabase);
+  // 4. Paid confirmation email (Resend) — independent of payment & storage config
   const emailInfo = getEmailConfig();
 
   return {
+    settings,
+    supabase,
     merchantConfig: {
       tng: tngEval.config,
       duitnow: duitnowEval.config,
@@ -968,20 +794,20 @@ function evaluateAllPaymentMethods() {
         issue: stripeInfo.error
       },
       email: emailInfo,
-      privateStorage
+      supabase
     }
   };
 }
 
-function getPublicStorefrontConfig() {
-  const digits = storeSettings.whatsappSupportNumber.replace(/\D/g, '');
+function getPublicStorefrontConfig(settings: EditableStoreSettings) {
+  const digits = settings.whatsappSupportNumber.replace(/\D/g, '');
   const whatsappUrl = digits.length >= 8 ? `https://wa.me/${digits}` : null;
   return {
-    logoUrl: storeSettings.logoUrl,
-    heroImageUrl: storeSettings.heroImageUrl,
-    productImages: storeSettings.productImages,
-    galleryItems: storeSettings.galleryItems,
-    deliveryRatesSen: storeSettings.deliveryRatesSen,
+    logoUrl: settings.logoUrl,
+    heroImageUrl: settings.heroImageUrl,
+    productImages: settings.productImages,
+    galleryItems: settings.galleryItems,
+    deliveryRatesSen: settings.deliveryRatesSen,
     whatsappSupportNumber: digits,
     whatsappUrl,
     deliveryPromiseText: DELIVERY_PROMISE_TEXT
@@ -1039,27 +865,27 @@ function resolveTrustedOrigin(req?: express.Request): string {
   return `${proto}://${safeHost}`;
 }
 
-function sanitizeDisplayFilename(raw: unknown, fallbackExt: string): string {
+function sanitizeDisplayFilename(raw: unknown, fallbackBase: string, fallbackExt: string): string {
   if (typeof raw !== 'string' || !raw.trim()) {
-    return `receipt.${fallbackExt}`;
+    return `${fallbackBase}.${fallbackExt}`;
   }
   const base = path.basename(raw.trim()).replace(/[^a-zA-Z0-9._-]/g, '_');
-  return base.slice(0, 120) || `receipt.${fallbackExt}`;
+  return base.slice(0, 120) || `${fallbackBase}.${fallbackExt}`;
 }
 
-function buildConfirmationEmailContent(order: OrderRecord, originUrl: string) {
-  const orderLink = `${originUrl}/?order=${encodeURIComponent(order.reference)}&token=${encodeURIComponent(order.accessToken)}`;
-  const methodLabel = getPaymentMethodDisplayLabel(order.paymentMethod) || 'Confirmed payment';
-  const totalPaid = formatRM(order.totalSen);
+function buildConfirmationEmailContent(order: OrderRow, originUrl: string) {
+  const orderLink = `${originUrl}/?order=${encodeURIComponent(order.reference)}&token=${encodeURIComponent(order.access_token)}`;
+  const methodLabel = getPaymentMethodDisplayLabel(order.payment_method) || 'Confirmed payment';
+  const totalPaid = formatRM(order.total_sen);
   const subject = `Order Confirmed — Little Pixel Keepsakes (${order.reference})`;
 
   const text = [
     PAID_CONFIRMATION_HEADING,
     '',
-    `Hi ${order.customer.fullName},`,
+    `Hi ${order.customer_full_name},`,
     '',
     `Order Reference: ${order.reference}`,
-    `Items: ${order.productName} (Qty ${order.itemQuantity})`,
+    `Items: ${order.product_name} (Qty ${order.item_quantity})`,
     `Total Paid: ${totalPaid}`,
     `Payment Method: ${methodLabel}`,
     '',
@@ -1073,10 +899,10 @@ function buildConfirmationEmailContent(order: OrderRecord, originUrl: string) {
   const html = `
     <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: #14233C; max-width: 560px; margin: 0 auto; padding: 24px; background: #FAF6EE; border-radius: 16px;">
       <h1 style="font-size: 22px; margin: 0 0 12px; color: #14233C;">${escapeHtml(PAID_CONFIRMATION_HEADING)}</h1>
-      <p style="font-size: 14px; line-height: 1.6; margin: 0 0 16px;">Hi ${escapeHtml(order.customer.fullName)},</p>
+      <p style="font-size: 14px; line-height: 1.6; margin: 0 0 16px;">Hi ${escapeHtml(order.customer_full_name)},</p>
       <div style="background: #FFFFFF; border: 1px solid rgba(20,35,60,0.12); border-radius: 12px; padding: 16px; margin-bottom: 16px;">
         <p style="margin: 0 0 8px; font-size: 13px;"><strong>Order Reference:</strong> <span style="font-family: monospace;">${escapeHtml(order.reference)}</span></p>
-        <p style="margin: 0 0 8px; font-size: 13px;"><strong>Items:</strong> ${escapeHtml(order.productName)} (Qty ${order.itemQuantity})</p>
+        <p style="margin: 0 0 8px; font-size: 13px;"><strong>Items:</strong> ${escapeHtml(order.product_name)} (Qty ${order.item_quantity})</p>
         <p style="margin: 0 0 8px; font-size: 13px;"><strong>Total Paid:</strong> ${escapeHtml(totalPaid)}</p>
         <p style="margin: 0; font-size: 13px;"><strong>Payment Method:</strong> ${escapeHtml(methodLabel)}</p>
       </div>
@@ -1091,10 +917,10 @@ function buildConfirmationEmailContent(order: OrderRecord, originUrl: string) {
   return { subject, text, html };
 }
 
-// Guaranteed at-most-once confirmation email per paid order.
-// Never mutates order.paymentStatus or blocks payment/storage availability.
+// Guaranteed at-most-once Resend confirmation email per paid order, tracked in public.email_notifications.
+// Never mutates order.payment_status or blocks payment/storage availability.
 async function sendOrderConfirmationEmailOnce(
-  order: OrderRecord,
+  order: OrderRow,
   req?: express.Request
 ): Promise<{
   sent: boolean;
@@ -1102,127 +928,121 @@ async function sendOrderConfirmationEmailOnce(
   status: 'sent' | 'not_configured' | 'failed';
   error?: string;
 }> {
-  if (order.paymentStatus !== 'Paid') {
+  if (order.payment_status !== 'Paid') {
     return { sent: false, skipped: true, status: 'not_configured' };
-  }
-  if (order.confirmationEmailSentAt) {
-    return { sent: false, skipped: true, status: 'sent' };
   }
   if (inFlightConfirmationEmails.has(order.reference)) {
     return { sent: false, skipped: true, status: 'sent' };
   }
 
+  const existing = await fetchOrderConfirmationEmail(order.id).catch(() => null);
+  if (existing?.sent_at || existing?.status === 'sent') {
+    return { sent: false, skipped: true, status: 'sent' };
+  }
+
+  const originUrl = resolveTrustedOrigin(req);
+  const { subject, text, html } = buildConfirmationEmailContent(order, originUrl);
+  const attemptCount = (existing?.attempt_count || 0) + 1;
+  const attemptTime = new Date().toISOString();
+
   const emailCfg = getEmailConfig();
   if (!emailCfg.configured || !emailCfg.fromAddress) {
-    const notConfiguredMsg =
-      emailCfg.issue || 'Set RESEND_API_KEY and EMAIL_FROM on the server to send confirmation emails via Resend.';
-    order.confirmationEmailStatus = 'not_configured';
-    order.confirmationEmailError = sanitizeEmailError(notConfiguredMsg);
-    order.confirmationEmailLastAttemptAt = new Date().toISOString();
-    ordersStore.set(order.reference, order);
-    saveStoreToDisk();
-    return { sent: false, status: 'not_configured', error: order.confirmationEmailError };
+    const safeMsg = sanitizeEmailError(
+      emailCfg.issue || 'Set RESEND_API_KEY and EMAIL_FROM on the server to send confirmation emails via Resend.'
+    );
+    await upsertOrderConfirmationEmail({
+      orderId: order.id,
+      orderReference: order.reference,
+      provider: emailCfg.provider,
+      recipientEmail: order.customer_email,
+      senderEmail: emailCfg.fromAddress,
+      subject,
+      status: 'not_configured',
+      errorMessage: safeMsg,
+      attemptCount,
+      lastAttemptAt: attemptTime
+    }).catch(err => console.error(`Failed to record email status for ${order.reference}:`, err));
+    return { sent: false, status: 'not_configured', error: safeMsg };
   }
 
   inFlightConfirmationEmails.add(order.reference);
-  const attemptTime = new Date().toISOString();
   try {
-    const originUrl = resolveTrustedOrigin(req);
-    const { subject, text, html } = buildConfirmationEmailContent(order, originUrl);
-
-    if (emailCfg.provider === 'resend') {
-      const response = await fetch('https://api.resend.com/emails', {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${(process.env.RESEND_API_KEY || '').trim()}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          from: emailCfg.fromAddress,
-          to: [order.customer.email],
-          subject,
-          text,
-          html
-        }),
-        signal: AbortSignal.timeout(15000)
-      });
-      if (!response.ok) {
-        const rawBody = await response.text().catch(() => '');
-        let detail = rawBody;
-        try {
-          const parsedErr = JSON.parse(rawBody) as { message?: string; name?: string };
-          if (parsedErr?.message) {
-            detail = parsedErr.message;
-          }
-        } catch {
-          // Use raw response text
-        }
-        throw new Error(`Resend HTTP ${response.status}: ${detail || response.statusText || 'Request failed'}`);
-      }
-      const data = (await response.json().catch(() => ({}))) as { id?: string };
-      order.confirmationEmailStatus = 'sent';
-      order.confirmationEmailSentAt = new Date().toISOString();
-      order.confirmationEmailLastAttemptAt = attemptTime;
-      order.confirmationEmailId = data.id || `resend_${Date.now()}`;
-      order.confirmationEmailError = undefined;
-      ordersStore.set(order.reference, order);
-      saveStoreToDisk();
-      return { sent: true, status: 'sent' };
-    }
-
-    if (emailCfg.provider === 'smtp') {
-      const port = Number.parseInt((process.env.SMTP_PORT || '587').trim(), 10) || 587;
-      const secureEnv = (process.env.SMTP_SECURE || '').trim().toLowerCase();
-      const secure = secureEnv ? secureEnv === 'true' || secureEnv === '1' : port === 465;
-
-      const transporter = nodemailer.createTransport({
-        host: (process.env.SMTP_HOST || '').trim(),
-        port,
-        secure,
-        auth: {
-          user: (process.env.SMTP_USER || '').trim(),
-          pass: (process.env.SMTP_PASS || '').trim()
-        }
-      });
-
-      const info = await transporter.sendMail({
+    const response = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${(process.env.RESEND_API_KEY || '').trim()}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
         from: emailCfg.fromAddress,
-        to: order.customer.email,
+        to: [order.customer_email],
         subject,
         text,
         html
-      });
+      }),
+      signal: AbortSignal.timeout(15000)
+    });
 
-      order.confirmationEmailStatus = 'sent';
-      order.confirmationEmailSentAt = new Date().toISOString();
-      order.confirmationEmailLastAttemptAt = attemptTime;
-      order.confirmationEmailId = info.messageId || `smtp_${Date.now()}`;
-      order.confirmationEmailError = undefined;
-      ordersStore.set(order.reference, order);
-      saveStoreToDisk();
-      return { sent: true, status: 'sent' };
+    if (!response.ok) {
+      const rawBody = await response.text().catch(() => '');
+      let detail = rawBody;
+      try {
+        const parsedErr = JSON.parse(rawBody) as { message?: string; name?: string };
+        if (parsedErr?.message) detail = parsedErr.message;
+      } catch {
+        // Keep raw body
+      }
+      throw new Error(`Resend HTTP ${response.status}: ${detail || response.statusText || 'Request failed'}`);
     }
 
-    return { sent: false, status: 'not_configured' };
+    const data = (await response.json().catch(() => ({}))) as { id?: string };
+    const sentAt = new Date().toISOString();
+    await upsertOrderConfirmationEmail({
+      orderId: order.id,
+      orderReference: order.reference,
+      provider: 'resend',
+      recipientEmail: order.customer_email,
+      senderEmail: emailCfg.fromAddress,
+      subject,
+      status: 'sent',
+      providerMessageId: data.id || `resend_${Date.now()}`,
+      errorMessage: null,
+      attemptCount,
+      sentAt,
+      lastAttemptAt: attemptTime
+    });
+    return { sent: true, status: 'sent' };
   } catch (err: any) {
     const safeError = sanitizeEmailError(err?.message || err || 'Email delivery failed');
     console.error(`Confirmation email failed for order ${order.reference}: ${safeError}`);
-    order.confirmationEmailStatus = 'failed';
-    order.confirmationEmailError = safeError;
-    order.confirmationEmailLastAttemptAt = attemptTime;
-    ordersStore.set(order.reference, order);
-    try {
-      saveStoreToDisk();
-    } catch (saveErr) {
-      console.error(`Failed to persist email error for order ${order.reference}:`, saveErr);
-    }
+    await upsertOrderConfirmationEmail({
+      orderId: order.id,
+      orderReference: order.reference,
+      provider: 'resend',
+      recipientEmail: order.customer_email,
+      senderEmail: emailCfg.fromAddress,
+      subject,
+      status: 'failed',
+      errorMessage: safeError,
+      attemptCount,
+      sentAt: null,
+      lastAttemptAt: attemptTime
+    }).catch(saveErr => console.error(`Failed to persist email error for ${order.reference}:`, saveErr));
     return { sent: false, status: 'failed', error: safeError };
   } finally {
     inFlightConfirmationEmails.delete(order.reference);
   }
 }
 
-function requireAdminAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
+interface AuthenticatedAdminRequest extends express.Request {
+  adminSession?: AdminSessionRecord;
+}
+
+function requireAdminAuth(
+  req: AuthenticatedAdminRequest,
+  res: express.Response,
+  next: express.NextFunction
+) {
   const authHeader = req.headers.authorization || '';
   if (!authHeader.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'Staff authentication required.' });
@@ -1233,7 +1053,43 @@ function requireAdminAuth(req: express.Request, res: express.Response, next: exp
     if (session) adminSessions.delete(token);
     return res.status(401).json({ error: 'Admin session expired or invalid. Please sign in again.' });
   }
+  req.adminSession = session;
   return next();
+}
+
+async function requireSupabaseReady(res: express.Response): Promise<SupabaseHealthDiagnostic | null> {
+  const health = await checkSupabaseHealth();
+  if (!health.configured) {
+    res.status(503).json({
+      error:
+        health.issue ||
+        'Supabase PostgreSQL database and private storage buckets are not configured or unavailable.',
+      code: 'SUPABASE_UNAVAILABLE',
+      supabase: health
+    });
+    return null;
+  }
+  return health;
+}
+
+async function getAdminAuthMode(): Promise<{
+  mode: 'env' | 'claimed' | 'bootstrap_required' | 'unavailable';
+  supabase: SupabaseHealthDiagnostic;
+}> {
+  const supabase = await checkSupabaseHealth();
+  const envPasscode = (process.env.ADMIN_PASSCODE || '').trim();
+  if (envPasscode.length > 0) {
+    return { mode: 'env', supabase };
+  }
+  if (!supabase.databaseReady) {
+    return { mode: 'unavailable', supabase };
+  }
+  try {
+    const accounts = await listActiveStaffAccounts();
+    return { mode: accounts.length > 0 ? 'claimed' : 'bootstrap_required', supabase };
+  } catch {
+    return { mode: 'unavailable', supabase };
+  }
 }
 
 async function startServer() {
@@ -1241,12 +1097,22 @@ async function startServer() {
   app.set('trust proxy', 1);
   const PORT = 3000;
 
-  // Stripe webhook route MUST receive the raw request body before express.json()
+  // ============================================================================
+  // STRIPE WEBHOOK (Raw body before express.json)
+  // ============================================================================
   app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
     const sig = req.headers['stripe-signature'];
     const webhookSecret = (process.env.STRIPE_WEBHOOK_SECRET || '').trim();
-    const stripeInfo = getStripeConfig();
+    const supabaseHealth = await checkSupabaseHealth();
 
+    if (!supabaseHealth.configured) {
+      return res.status(503).json({
+        error: supabaseHealth.issue || 'Supabase is unavailable; cannot process webhook.',
+        code: 'SUPABASE_UNAVAILABLE'
+      });
+    }
+
+    const stripeInfo = getStripeConfig(supabaseHealth);
     if (!stripeInfo.client) {
       return res.status(503).json({ error: 'Stripe is not configured on this server.' });
     }
@@ -1265,149 +1131,229 @@ async function startServer() {
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
-    // Safe-to-repeat idempotency check
-    if (processedStripeEvents.has(event.id)) {
-      return res.json({ received: true, duplicate: true });
-    }
-
-    const markEventProcessed = () => {
-      processedStripeEvents.add(event.id);
-      saveStoreToDisk();
-    };
-
-    if (event.type === 'checkout.session.completed' || event.type === 'checkout.session.async_payment_succeeded') {
-      const session = event.data.object as Stripe.Checkout.Session;
-      const reference = session.client_reference_id || session.metadata?.orderReference || session.metadata?.reference;
-
-      if (!reference || !ORDER_REF_REGEX.test(reference) || !ordersStore.has(reference)) {
-        markEventProcessed();
-        return res.json({ received: true, ignored: 'order_not_found' });
-      }
-
-      const order = ordersStore.get(reference)!;
-
-      // Already confirmed paid — idempotent no-op (never sends a duplicate confirmation email)
-      if (order.paymentStatus === 'Paid') {
-        markEventProcessed();
+    try {
+      if (await hasProcessedStripeEvent(event.id)) {
         return res.json({ received: true, duplicate: true });
       }
 
-      // Strictly verify this Stripe session was created by this server for this saved order
-      const knownSessionIds = order.stripeSessionIds || (order.stripeSessionId ? [order.stripeSessionId] : []);
-      const sessionMatchesOrder = knownSessionIds.includes(session.id);
-
-      const amountTotal = session.amount_total;
-      const currency = (session.currency || '').toLowerCase();
-      const paymentStatus = session.payment_status;
-
       if (
-        sessionMatchesOrder &&
-        typeof amountTotal === 'number' &&
-        amountTotal === order.totalSen &&
-        currency === 'myr' &&
-        paymentStatus === 'paid'
+        event.type === 'checkout.session.completed' ||
+        event.type === 'checkout.session.async_payment_succeeded'
       ) {
-        order.paymentStatus = 'Paid';
-        order.paymentMethod = 'card';
-        order.stripeSessionId = session.id;
-        order.stripePaymentIntentId =
-          typeof session.payment_intent === 'string'
-            ? session.payment_intent
-            : session.payment_intent?.id;
-        order.paidAt = new Date().toISOString();
-        order.correctionReason = undefined;
-        order.lastCardAttemptMessage = undefined;
-        ordersStore.set(reference, order);
-        markEventProcessed();
+        const session = event.data.object as Stripe.Checkout.Session;
+        const reference =
+          session.client_reference_id || session.metadata?.orderReference || session.metadata?.reference;
 
-        try {
-          await sendOrderConfirmationEmailOnce(order, req);
-        } catch (emailErr) {
-          console.error(`Unexpected confirmation email error for order ${reference}:`, emailErr);
+        if (!reference || !ORDER_REF_REGEX.test(reference)) {
+          return res.json({ received: true, ignored: 'invalid_reference' });
         }
-        console.log(`Order ${reference} confirmed Paid via verified Stripe webhook (${event.id}).`);
+
+        const order = await fetchOrderByReference(reference);
+        if (!order) {
+          return res.json({ received: true, ignored: 'order_not_found' });
+        }
+
+        // Already confirmed Paid — idempotent no-op (never sends a duplicate confirmation email)
+        if (order.payment_status === 'Paid') {
+          return res.json({ received: true, duplicate: true });
+        }
+
+        // Strictly verify this Stripe session was created by this server for this exact order
+        const paymentRow = await fetchPaymentByStripeSessionId(session.id);
+        const sessionMatchesOrder = Boolean(paymentRow && paymentRow.order_id === order.id);
+
+        const amountTotal = session.amount_total;
+        const currency = (session.currency || '').toLowerCase();
+        const paymentStatus = session.payment_status;
+
+        if (
+          sessionMatchesOrder &&
+          paymentRow &&
+          typeof amountTotal === 'number' &&
+          amountTotal === order.total_sen &&
+          currency === 'myr' &&
+          paymentStatus === 'paid'
+        ) {
+          const paidAt = new Date().toISOString();
+          const paymentIntentId =
+            typeof session.payment_intent === 'string'
+              ? session.payment_intent
+              : session.payment_intent?.id || null;
+
+          await updatePaymentById(paymentRow.id, {
+            status: 'paid',
+            stripe_payment_intent_id: paymentIntentId,
+            stripe_event_id: event.id,
+            paid_at: paidAt
+          });
+
+          const updatedOrder = await updateOrderByReference(reference, {
+            payment_status: 'Paid',
+            payment_method: 'card',
+            paid_at: paidAt,
+            correction_reason: null,
+            last_card_attempt_message: null
+          });
+
+          try {
+            await sendOrderConfirmationEmailOnce(updatedOrder, req);
+          } catch (emailErr) {
+            console.error(`Unexpected confirmation email error for order ${reference}:`, emailErr);
+          }
+          console.log(`Order ${reference} confirmed Paid via verified Stripe webhook (${event.id}).`);
+          return res.json({ received: true });
+        } else {
+          console.warn(`Stripe webhook mismatch for order ${reference}`, {
+            eventId: event.id,
+            sessionMatchesOrder,
+            expectedAmount: order.total_sen,
+            receivedAmount: amountTotal,
+            receivedCurrency: currency,
+            paymentStatus
+          });
+        }
+
         return res.json({ received: true });
-      } else {
-        console.warn(`Stripe webhook mismatch for order ${reference}`, {
-          eventId: event.id,
-          sessionMatchesOrder,
-          expectedAmount: order.totalSen,
-          receivedAmount: amountTotal,
-          receivedCurrency: currency,
-          paymentStatus
-        });
       }
 
-      markEventProcessed();
-      return res.json({ received: true });
-    }
+      if (event.type === 'checkout.session.expired' || event.type === 'checkout.session.async_payment_failed') {
+        const session = event.data.object as Stripe.Checkout.Session;
+        const reference =
+          session.client_reference_id || session.metadata?.orderReference || session.metadata?.reference;
 
-    if (event.type === 'checkout.session.expired' || event.type === 'checkout.session.async_payment_failed') {
-      const session = event.data.object as Stripe.Checkout.Session;
-      const reference = session.client_reference_id || session.metadata?.orderReference || session.metadata?.reference;
-
-      if (reference && ordersStore.has(reference)) {
-        const order = ordersStore.get(reference)!;
-        if (order.paymentStatus === 'Awaiting payment' || order.paymentStatus === 'Receipt correction needed') {
-          order.lastCardAttemptMessage =
-            event.type === 'checkout.session.expired'
-              ? 'Your previous card checkout session expired. You can try again below without re-uploading your photo.'
-              : 'Your card payment failed. You can retry with another card or choose a QR payment method below.';
-          ordersStore.set(reference, order);
+        const paymentRow = await fetchPaymentByStripeSessionId(session.id);
+        if (paymentRow && paymentRow.status !== 'paid') {
+          await updatePaymentById(paymentRow.id, {
+            status: event.type === 'checkout.session.expired' ? 'expired' : 'failed',
+            stripe_event_id: event.id
+          });
         }
+
+        if (reference && ORDER_REF_REGEX.test(reference)) {
+          const order = await fetchOrderByReference(reference);
+          if (
+            order &&
+            (order.payment_status === 'Awaiting payment' ||
+              order.payment_status === 'Receipt correction needed')
+          ) {
+            await updateOrderByReference(reference, {
+              last_card_attempt_message:
+                event.type === 'checkout.session.expired'
+                  ? 'Your previous card checkout session expired. You can try again below without re-uploading your photo.'
+                  : 'Your card payment failed. You can retry with another card or choose a QR payment method below.'
+            });
+          }
+        }
+        return res.json({ received: true });
       }
 
-      markEventProcessed();
       return res.json({ received: true });
+    } catch (err) {
+      console.error('Stripe webhook processing error:', sanitizeSupabaseError(err));
+      return res.status(500).json({ error: 'Failed to persist Stripe webhook state.' });
     }
-
-    markEventProcessed();
-    return res.json({ received: true });
   });
 
   app.use(express.json({ limit: '16mb' }));
 
-  // Public Storefront & Merchant Config Endpoint
-  app.get('/api/store-config', (_req, res) => {
-    const { merchantConfig, diagnostics } = evaluateAllPaymentMethods();
+  // ============================================================================
+  // PUBLIC STOREFRONT CONFIG & HEALTH
+  // ============================================================================
+  app.get('/api/store-config', async (_req, res) => {
+    const { settings, supabase, merchantConfig, diagnostics } = await evaluateAllPaymentMethods();
     return res.json({
       success: true,
-      storefront: getPublicStorefrontConfig(),
+      supabaseReady: supabase.configured,
+      supabaseError: supabase.configured ? null : supabase.issue || 'Supabase is unavailable.',
+      storefront: getPublicStorefrontConfig(settings),
       merchantConfig,
       configIssues: {
         tng: diagnostics.tng.issues,
-        duitnow: diagnostics.duitnow.issues
+        duitnow: diagnostics.duitnow.issues,
+        supabase: supabase.issues
       }
     });
   });
 
-  // Backwards-compatible Merchant Payment Configuration Endpoint
-  app.get('/api/merchant-config', (_req, res) => {
-    const { merchantConfig, diagnostics } = evaluateAllPaymentMethods();
+  // ============================================================================
+  // SECURE CUSTOMER PHOTO UPLOAD SESSIONS (PRIVATE SUPABASE BUCKET)
+  // ============================================================================
+  app.post('/api/photo-upload-session', async (req, res) => {
+    const health = await requireSupabaseReady(res);
+    if (!health) return;
+
+    pruneExpiredUploadSessions();
+
+    const ip = req.ip || 'unknown';
+    const tracker = uploadSessionRateTracker.get(ip);
+    if (tracker && tracker.resetAt > Date.now() && tracker.count >= MAX_UPLOAD_SESSIONS_PER_WINDOW) {
+      return res.status(429).json({
+        error: 'Too many photo upload sessions started recently. Please wait a few minutes and try again.'
+      });
+    }
+    const nextCount = tracker && tracker.resetAt > Date.now() ? tracker.count + 1 : 1;
+    uploadSessionRateTracker.set(ip, { count: nextCount, resetAt: Date.now() + LOGIN_WINDOW_MS });
+
+    const sessionId = crypto.randomBytes(16).toString('hex');
+    const token = crypto.randomBytes(32).toString('base64url');
+    const expiresAt = Date.now() + PHOTO_UPLOAD_SESSION_TTL_MS;
+
+    photoUploadSessions.set(token, {
+      sessionId,
+      token,
+      expiresAt,
+      photoStoragePath: null,
+      photoOriginalFilename: null,
+      photoMimeType: null,
+      photoSizeBytes: null
+    });
+
     return res.json({
       success: true,
-      merchantConfig,
-      configIssues: {
-        tng: diagnostics.tng.issues,
-        duitnow: diagnostics.duitnow.issues
-      }
+      uploadSessionToken: token,
+      expiresAt: new Date(expiresAt).toISOString(),
+      maxFileSizeBytes: MAX_UPLOAD_BYTES,
+      allowedMimeTypes: ['image/jpeg', 'image/png']
     });
   });
 
-  // Photo Upload Endpoint
-  app.post('/api/upload-photo', (req, res) => {
+  app.post('/api/upload-photo', async (req, res) => {
+    const health = await requireSupabaseReady(res);
+    if (!health) return;
+
+    pruneExpiredUploadSessions();
+
+    const headerSession =
+      typeof req.headers['x-upload-session'] === 'string' ? req.headers['x-upload-session'].trim() : '';
+    const bodySession =
+      typeof req.body?.uploadSessionToken === 'string' ? req.body.uploadSessionToken.trim() : '';
+    const uploadSessionToken = headerSession || bodySession;
+
+    if (!uploadSessionToken) {
+      return res.status(401).json({ error: 'A valid secure photo upload session is required.' });
+    }
+
+    const session = photoUploadSessions.get(uploadSessionToken);
+    if (!session || session.expiresAt < Date.now()) {
+      if (session) photoUploadSessions.delete(uploadSessionToken);
+      return res.status(401).json({
+        error: 'Your photo upload session has expired. Please refresh or re-select your photo.'
+      });
+    }
+
     try {
-      const { imageBase64 } = req.body || {};
+      const { imageBase64, filename } = req.body || {};
       if (typeof imageBase64 !== 'string' || !imageBase64) {
         return res.status(400).json({ error: 'No image data provided.' });
       }
 
       const matches = imageBase64.match(/^data:(image\/(?:jpeg|jpg|png));base64,([A-Za-z0-9+/=]+)$/);
       if (!matches || matches.length !== 3) {
-        return res.status(400).json({ error: 'Invalid image format. Please upload a JPG or PNG image.' });
+        return res.status(400).json({ error: 'Please upload a clear JPG or PNG image.' });
       }
 
-      const mimeType = matches[1].toLowerCase() === 'image/png' ? 'image/png' : 'image/jpeg';
+      const mimeType: 'image/jpeg' | 'image/png' =
+        matches[1].toLowerCase() === 'image/png' ? 'image/png' : 'image/jpeg';
       const ext = mimeType === 'image/png' ? 'png' : 'jpg';
       const buffer = Buffer.from(matches[2], 'base64');
 
@@ -1418,74 +1364,113 @@ async function startServer() {
         return res.status(400).json({ error: 'Uploaded file does not match a valid JPG or PNG image.' });
       }
 
-      const uniqueName = `lpk_${Date.now()}_${crypto.randomBytes(6).toString('hex')}.${ext}`;
-      const filePath = path.resolve(publicUploadsDir, uniqueName);
-      if (!filePath.startsWith(publicUploadsDir + path.sep)) {
-        return res.status(400).json({ error: 'Invalid file destination.' });
+      const cfg = getSupabaseEnvConfig();
+      const previousPath = session.photoStoragePath;
+      const storagePath = `pending/${session.sessionId}/${Date.now()}_${crypto.randomBytes(6).toString('hex')}.${ext}`;
+      const originalFilename = sanitizeDisplayFilename(filename, 'customer_photo', ext);
+
+      await uploadPrivateFile({
+        bucket: cfg.photosBucket,
+        storagePath,
+        buffer,
+        contentType: mimeType
+      });
+
+      if (previousPath && previousPath !== storagePath) {
+        void removePrivateFile(cfg.photosBucket, previousPath);
       }
 
-      fs.writeFileSync(filePath, buffer);
-      return res.json({ success: true, photoUrl: `/uploads/${uniqueName}` });
-    } catch {
-      return res.status(500).json({ error: 'Failed to save uploaded photo.' });
+      session.photoStoragePath = storagePath;
+      session.photoOriginalFilename = originalFilename;
+      session.photoMimeType = mimeType;
+      session.photoSizeBytes = buffer.length;
+      session.expiresAt = Date.now() + PHOTO_UPLOAD_SESSION_TTL_MS;
+
+      const signedPreviewUrl = await createShortLivedSignedUrl(cfg.photosBucket, storagePath, 900);
+
+      return res.json({
+        success: true,
+        uploadSessionToken,
+        photoStoragePath: storagePath,
+        photoUrl: signedPreviewUrl || '',
+        fileName: originalFilename,
+        mimeType,
+        sizeBytes: buffer.length
+      });
+    } catch (err) {
+      console.error('Private customer photo upload error:', sanitizeSupabaseError(err));
+      return res.status(502).json({
+        error: 'Could not upload your photo to private storage. Please try again.'
+      });
     }
   });
 
-  // Validate Delivery Endpoint (uses live editable delivery rates)
-  app.post('/api/validate-delivery', (req, res) => {
+  // ============================================================================
+  // DELIVERY VALIDATION & ORDER CREATION
+  // ============================================================================
+  app.post('/api/validate-delivery', async (req, res) => {
+    const { settings } = await loadCurrentStoreSettings();
+    const { state } = req.body || {};
+    if (!state || typeof state !== 'string') {
+      return res.status(400).json({ valid: false, error: 'Please select a delivery state.' });
+    }
+    const delivery = getDeliveryConfigForState(state, settings);
+    if (!delivery) {
+      return res.status(400).json({
+        valid: false,
+        error: 'We currently deliver within Malaysia only. Please select a valid Malaysian state.'
+      });
+    }
+    return res.json({
+      valid: true,
+      zone: delivery.zone,
+      deliveryFeeSen: delivery.rateSen
+    });
+  });
+
+  app.post('/api/create-order', async (req, res) => {
+    const health = await requireSupabaseReady(res);
+    if (!health) return;
+
+    pruneExpiredUploadSessions();
+
     try {
-      const { state } = req.body || {};
-      if (typeof state !== 'string' || !state.trim()) {
-        return res.status(400).json({ error: 'State is required.' });
+      const { productId, bundleId, uploadSessionToken, photoStoragePath, customer } = req.body || {};
+      const resolvedKey = productId === 'bundle' ? bundleId : productId;
+      const product = typeof resolvedKey === 'string' ? PRODUCT_CONFIG[resolvedKey] : undefined;
+
+      if (!product) {
+        return res.status(400).json({ error: 'Invalid product or bundle selection.' });
       }
 
-      const deliveryConfig = getDeliveryConfigForState(state);
-      if (!deliveryConfig) {
+      // Require a valid upload session owning the private photo object
+      const tokenStr = typeof uploadSessionToken === 'string' ? uploadSessionToken.trim() : '';
+      const session = tokenStr ? photoUploadSessions.get(tokenStr) : undefined;
+      if (!session || session.expiresAt < Date.now() || !session.photoStoragePath) {
         return res.status(400).json({
-          valid: false,
-          error: `Delivery rate not configured for state "${state}". Please select a valid Malaysian state.`
+          error: 'Please upload your keepsake photo before creating an order (upload session missing or expired).'
+        });
+      }
+      if (
+        typeof photoStoragePath === 'string' &&
+        photoStoragePath.trim() &&
+        !safeEqualStrings(photoStoragePath.trim(), session.photoStoragePath)
+      ) {
+        return res.status(403).json({
+          error: 'Uploaded photo does not match your active checkout session.'
         });
       }
 
-      return res.json({ valid: true, zone: deliveryConfig.zone, deliveryFeeSen: deliveryConfig.rateSen });
-    } catch {
-      return res.status(500).json({ error: 'Delivery validation error.' });
-    }
-  });
-
-  // Create Order Endpoint
-  app.post('/api/create-order', (req, res) => {
-    try {
-      const { productId, bundleId, photoUrl, customer } = req.body || {};
-      if (typeof productId !== 'string' || typeof photoUrl !== 'string' || !customer || typeof customer !== 'object') {
-        return res.status(400).json({ error: 'Missing required order details.' });
+      if (!customer || typeof customer !== 'object') {
+        return res.status(400).json({ error: 'Customer details are required.' });
       }
-
-      if (!/^\/uploads\/[a-zA-Z0-9._-]+\.(jpg|jpeg|png)$/.test(photoUrl)) {
-        return res.status(400).json({ error: 'Invalid uploaded photo reference.' });
-      }
-      const photoFilePath = path.resolve(publicUploadsDir, path.basename(photoUrl));
-      if (!photoFilePath.startsWith(publicUploadsDir + path.sep) || !fs.existsSync(photoFilePath)) {
-        return res.status(400).json({ error: 'Uploaded photo not found. Please upload your photo again.' });
-      }
-
-      let key = productId;
-      if (productId === 'bundle') {
-        if (typeof bundleId !== 'string' || !PRODUCT_CONFIG[bundleId]) {
-          return res.status(400).json({ error: 'Invalid bundle selection.' });
-        }
-        key = bundleId;
-      }
-
-      const productConfig = PRODUCT_CONFIG[key];
-      if (!productConfig) return res.status(400).json({ error: 'Invalid product.' });
 
       const cleanCustomer = {
         fullName: String(customer.fullName || '').trim().slice(0, 120),
         email: String(customer.email || '').trim().slice(0, 160),
         mobile: String(customer.mobile || '').trim().slice(0, 40),
         address: String(customer.address || '').trim().slice(0, 300),
-        postcode: String(customer.postcode || '').trim().slice(0, 20),
+        postcode: String(customer.postcode || '').trim().slice(0, 16),
         city: String(customer.city || '').trim().slice(0, 80),
         state: String(customer.state || '').trim().slice(0, 60)
       };
@@ -1493,6 +1478,7 @@ async function startServer() {
       if (
         !cleanCustomer.fullName ||
         !cleanCustomer.email ||
+        !cleanCustomer.email.includes('@') ||
         !cleanCustomer.mobile ||
         !cleanCustomer.address ||
         !cleanCustomer.postcode ||
@@ -1502,58 +1488,181 @@ async function startServer() {
         return res.status(400).json({ error: 'Please complete all required customer and delivery fields.' });
       }
 
-      const deliveryConfig = getDeliveryConfigForState(cleanCustomer.state);
-      if (!deliveryConfig) {
-        return res.status(400).json({ error: `Delivery rate not configured for state "${cleanCustomer.state}".` });
+      const { settings } = await loadCurrentStoreSettings(health);
+      const delivery = getDeliveryConfigForState(cleanCustomer.state, settings);
+      if (!delivery) {
+        return res.status(400).json({ error: 'Invalid Malaysian delivery state.' });
       }
 
-      const itemQuantity = productId === 'bundle' ? 2 : 1;
-      const subtotalSen = productConfig.priceSen;
-      const regularSubtotalSen = productConfig.regularSen;
-      const savingsSen = regularSubtotalSen ? regularSubtotalSen - subtotalSen : undefined;
-      const deliveryFeeSen = deliveryConfig.rateSen;
+      const subtotalSen = product.priceSen;
+      const regularSubtotalSen = product.regularSen ?? null;
+      const savingsSen = regularSubtotalSen ? regularSubtotalSen - subtotalSen : null;
+      const deliveryFeeSen = delivery.rateSen;
       const totalSen = subtotalSen + deliveryFeeSen;
 
-      const randomCode = crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 6);
-      const reference = `LPK-${new Date().getFullYear()}-${randomCode}`;
+      const year = new Date().getFullYear();
+      const rand = crypto.randomBytes(4).toString('hex').toUpperCase();
+      const reference = `LPK-${year}-${rand}`;
       const accessToken = crypto.randomBytes(24).toString('base64url');
 
-      const orderRecord: OrderRecord = {
-        reference,
-        accessToken,
-        productId,
-        bundleId: productId === 'bundle' ? bundleId : undefined,
-        productName: productConfig.name,
-        itemQuantity,
-        subtotalSen,
-        regularSubtotalSen,
-        savingsSen,
-        deliveryFeeSen,
-        totalSen,
-        photoUrl,
-        customer: cleanCustomer,
-        paymentStatus: 'Awaiting payment',
-        paymentMethod: null,
-        stripeSessionIds: [],
-        createdAt: new Date().toISOString()
-      };
+      const cfg = getSupabaseEnvConfig();
+      const ext = session.photoMimeType === 'image/png' ? 'png' : 'jpg';
+      const finalPhotoPath = `orders/${reference}/${crypto.randomBytes(6).toString('hex')}.${ext}`;
 
-      ordersStore.set(reference, orderRecord);
-      saveStoreToDisk();
+      // Move photo from pending/ into its permanent order-scoped private path
+      await movePrivateFile({
+        bucket: cfg.photosBucket,
+        fromPath: session.photoStoragePath,
+        toPath: finalPhotoPath
+      });
+
+      let insertedOrder: OrderRow;
+      try {
+        insertedOrder = await insertOrderRow({
+          reference,
+          access_token: accessToken,
+          product_id: productId,
+          bundle_id: productId === 'bundle' ? bundleId : null,
+          product_name: product.name,
+          item_quantity: productId === 'bundle' ? 2 : 1,
+          subtotal_sen: subtotalSen,
+          regular_subtotal_sen: regularSubtotalSen,
+          savings_sen: savingsSen,
+          delivery_fee_sen: deliveryFeeSen,
+          total_sen: totalSen,
+          photo_storage_bucket: cfg.photosBucket,
+          photo_storage_path: finalPhotoPath,
+          photo_original_filename: session.photoOriginalFilename,
+          photo_mime_type: session.photoMimeType,
+          photo_size_bytes: session.photoSizeBytes,
+          customer_full_name: cleanCustomer.fullName,
+          customer_email: cleanCustomer.email,
+          customer_mobile: cleanCustomer.mobile,
+          customer_address: cleanCustomer.address,
+          customer_postcode: cleanCustomer.postcode,
+          customer_city: cleanCustomer.city,
+          customer_state: cleanCustomer.state,
+          payment_status: 'Awaiting payment',
+          payment_method: null,
+          paid_at: null,
+          verified_by_staff: false,
+          verified_by_staff_id: null,
+          verification_note: null,
+          correction_reason: null,
+          last_card_attempt_message: null
+        });
+      } catch (dbErr) {
+        // Roll back moved file if DB insert failed
+        void removePrivateFile(cfg.photosBucket, finalPhotoPath);
+        throw dbErr;
+      }
+
+      // Single-use upload session consumed
+      photoUploadSessions.delete(tokenStr);
+
+      const hydrated: HydratedOrder = {
+        order: insertedOrder,
+        latestPayment: null,
+        latestReceiptPayment: null,
+        confirmationEmail: null
+      };
 
       return res.json({
         success: true,
-        reference,
-        accessToken,
-        order: toPublicOrder(orderRecord)
+        order: toPublicOrder(hydrated, buildCustomerAuthorizedPhotoUrl(insertedOrder))
       });
-    } catch {
-      return res.status(500).json({ error: 'Failed to create order.' });
+    } catch (err) {
+      console.error('Order creation error:', sanitizeSupabaseError(err));
+      return res.status(500).json({ error: 'Could not save order to Supabase. Please try again.' });
     }
   });
 
-  // Upload or Replace Payment Receipt Endpoint (Manual QR — requires secure order token, stores privately outside public/)
-  app.post('/api/upload-receipt', (req, res) => {
+  // ============================================================================
+  // CUSTOMER AUTHORIZED ORDER STATUS & PRIVATE PHOTO ACCESS
+  // ============================================================================
+  app.get('/api/orders/:reference', async (req, res) => {
+    const health = await requireSupabaseReady(res);
+    if (!health) return;
+
+    const { reference } = req.params;
+    if (!ORDER_REF_REGEX.test(reference)) {
+      return res.status(400).json({ error: 'Invalid order reference format.' });
+    }
+
+    try {
+      const hydrated = await fetchHydratedOrderByReference(reference);
+      if (!hydrated) {
+        return res.status(404).json({ error: 'Order not found.' });
+      }
+      if (!isOrderAuthorized(req, hydrated.order)) {
+        return res.status(403).json({
+          error: 'This order requires its full secure order link to view status or upload payment receipts.'
+        });
+      }
+
+      return res.json({
+        success: true,
+        order: toPublicOrder(hydrated, buildCustomerAuthorizedPhotoUrl(hydrated.order))
+      });
+    } catch (err) {
+      console.error(`Failed to fetch order ${reference}:`, sanitizeSupabaseError(err));
+      return res.status(500).json({ error: 'Unable to load order from Supabase.' });
+    }
+  });
+
+  // Customer-only private photo stream (strictly requires matching order accessToken)
+  app.get('/api/orders/:reference/photo', async (req, res) => {
+    const health = await requireSupabaseReady(res);
+    if (!health) return;
+
+    const { reference } = req.params;
+    if (!ORDER_REF_REGEX.test(reference)) {
+      return res.status(400).json({ error: 'Invalid order reference.' });
+    }
+
+    try {
+      const order = await fetchOrderByReference(reference);
+      if (!order) {
+        return res.status(404).json({ error: 'Order not found.' });
+      }
+      if (!isOrderAuthorized(req, order)) {
+        return res.status(403).json({ error: 'Valid secure order session token is required to view this photo.' });
+      }
+      if (!order.photo_storage_path) {
+        return res.status(404).json({ error: 'No photo attached to this order.' });
+      }
+
+      const { buffer, contentType } = await downloadPrivateFile(
+        order.photo_storage_bucket,
+        order.photo_storage_path
+      );
+      const mimeType = order.photo_mime_type || contentType || 'image/jpeg';
+      const ext = mimeType === 'image/png' ? 'png' : 'jpg';
+      const safeName = sanitizeDisplayFilename(
+        order.photo_original_filename || `${order.reference}_photo.${ext}`,
+        `${order.reference}_photo`,
+        ext
+      );
+      const disposition = req.query.download === '1' ? 'attachment' : 'inline';
+
+      res.setHeader('Content-Type', mimeType);
+      res.setHeader('Content-Disposition', `${disposition}; filename="${safeName}"`);
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Cache-Control', 'private, no-store');
+      return res.send(buffer);
+    } catch (err) {
+      console.error(`Failed to stream customer photo for ${reference}:`, sanitizeSupabaseError(err));
+      return res.status(404).json({ error: 'Stored order photo could not be retrieved.' });
+    }
+  });
+
+  // ============================================================================
+  // MANUAL QR PAYMENT RECEIPT UPLOAD (PRIVATE SUPABASE RECEIPTS BUCKET)
+  // ============================================================================
+  app.post('/api/upload-receipt', async (req, res) => {
+    const health = await requireSupabaseReady(res);
+    if (!health) return;
+
     try {
       const { reference, paymentMethod, transactionReference, receiptBase64, filename } = req.body || {};
 
@@ -1561,17 +1670,17 @@ async function startServer() {
         return res.status(400).json({ error: 'Invalid order reference.' });
       }
 
-      const order = ordersStore.get(reference);
+      const order = await fetchOrderByReference(reference);
       if (!order) {
         return res.status(404).json({ error: 'Order not found.' });
       }
       if (!isOrderAuthorized(req, order)) {
         return res.status(403).json({ error: 'Valid secure order link token is required to submit a receipt.' });
       }
-      if (order.paymentStatus === 'Paid') {
+      if (order.payment_status === 'Paid') {
         return res.status(409).json({ error: 'This order has already been paid.' });
       }
-      if (order.paymentStatus === 'Pending verification') {
+      if (order.payment_status === 'Pending verification') {
         return res.status(409).json({
           error: 'A payment receipt has already been submitted for this order and is pending verification.'
         });
@@ -1582,14 +1691,9 @@ async function startServer() {
       }
       const qrMethod: 'tng' | 'duitnow' = paymentMethod;
 
-      const { merchantConfig } = evaluateAllPaymentMethods();
+      const { merchantConfig } = await evaluateAllPaymentMethods();
       if (!merchantConfig[qrMethod]) {
         return res.status(400).json({ error: 'Selected QR payment method is not currently configured.' });
-      }
-
-      const storageHealth = checkPrivateStorageHealth();
-      if (!storageHealth.configured) {
-        return res.status(503).json({ error: 'Private receipt storage is not configured on the server.' });
       }
 
       const cleanTxRef = typeof transactionReference === 'string' ? transactionReference.trim() : '';
@@ -1601,230 +1705,266 @@ async function startServer() {
         return res.status(400).json({ error: 'Please upload your payment receipt (JPG, PNG, or PDF).' });
       }
 
-      const matches = receiptBase64.match(/^data:(image\/(?:jpeg|jpg|png)|application\/pdf);base64,([A-Za-z0-9+/=]+)$/);
+      const matches = receiptBase64.match(
+        /^data:(image\/(?:jpeg|jpg|png)|application\/pdf);base64,([A-Za-z0-9+/=]+)$/
+      );
       if (!matches || matches.length !== 3) {
         return res.status(400).json({ error: 'Invalid receipt file format. Please upload a JPG, PNG, or PDF file.' });
       }
 
       const rawMime = matches[1].toLowerCase();
-      const normalizedMime: PrivateReceiptRecord['mimeType'] =
+      const normalizedMime: 'image/jpeg' | 'image/png' | 'application/pdf' =
         rawMime === 'application/pdf'
           ? 'application/pdf'
           : rawMime === 'image/png'
             ? 'image/png'
             : 'image/jpeg';
-      const ext = normalizedMime === 'application/pdf' ? 'pdf' : normalizedMime === 'image/png' ? 'png' : 'jpg';
-
+      const ext =
+        normalizedMime === 'application/pdf' ? 'pdf' : normalizedMime === 'image/png' ? 'png' : 'jpg';
       const buffer = Buffer.from(matches[2], 'base64');
+
       if (buffer.length === 0 || buffer.length > MAX_UPLOAD_BYTES) {
         return res.status(400).json({ error: 'Receipt file must be smaller than 10 MB.' });
       }
       if (!verifyMagicBytes(buffer, normalizedMime)) {
-        return res.status(400).json({ error: 'Receipt file content does not match a valid JPG, PNG, or PDF file.' });
+        return res.status(400).json({ error: 'Uploaded receipt file content does not match its declared file type.' });
       }
 
-      // If replacing a previously rejected receipt, remove the superseded private file cleanly
-      if (order.privateReceipt?.storageFileName) {
-        const oldPath = path.resolve(privateReceiptsDir, path.basename(order.privateReceipt.storageFileName));
-        if (oldPath.startsWith(privateReceiptsDir + path.sep) && fs.existsSync(oldPath)) {
-          try {
-            fs.unlinkSync(oldPath);
-          } catch {
-            // Best-effort cleanup
-          }
-        }
+      const cfg = getSupabaseEnvConfig();
+      const receiptId = `rcpt_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
+      const storagePath = `orders/${reference}/${receiptId}.${ext}`;
+      const originalFilename = sanitizeDisplayFilename(filename, 'receipt', ext);
+      const uploadedAt = new Date().toISOString();
+
+      await uploadPrivateFile({
+        bucket: cfg.receiptsBucket,
+        storagePath,
+        buffer,
+        contentType: normalizedMime
+      });
+
+      try {
+        await insertPaymentRow({
+          order_id: order.id,
+          order_reference: order.reference,
+          payment_method: qrMethod,
+          status: 'pending_verification',
+          amount_sen: order.total_sen,
+          currency: 'myr',
+          transaction_reference: cleanTxRef,
+          receipt_storage_bucket: cfg.receiptsBucket,
+          receipt_storage_path: storagePath,
+          receipt_original_filename: originalFilename,
+          receipt_mime_type: normalizedMime,
+          receipt_size_bytes: buffer.length,
+          receipt_uploaded_at: uploadedAt,
+          stripe_session_id: null,
+          stripe_payment_intent_id: null,
+          stripe_event_id: null,
+          verified_by_staff: false,
+          verified_by_staff_id: null,
+          verification_note: null,
+          rejection_reason: null,
+          paid_at: null
+        });
+
+        await updateOrderByReference(reference, {
+          payment_method: qrMethod,
+          payment_status: 'Pending verification',
+          correction_reason: null,
+          last_card_attempt_message: null
+        });
+      } catch (dbErr) {
+        void removePrivateFile(cfg.receiptsBucket, storagePath);
+        throw dbErr;
       }
 
-      const receiptId = crypto.randomUUID();
-      const storageFileName = `receipt_${receiptId}.${ext}`;
-      const privatePath = path.resolve(privateReceiptsDir, storageFileName);
-
-      if (!privatePath.startsWith(privateReceiptsDir + path.sep)) {
-        return res.status(400).json({ error: 'Invalid receipt storage path.' });
+      const hydrated = await fetchHydratedOrderByReference(reference);
+      if (!hydrated) {
+        return res.status(500).json({ error: 'Order updated but could not be reloaded.' });
       }
-
-      fs.writeFileSync(privatePath, buffer, { mode: 0o600 });
-
-      order.paymentStatus = 'Pending verification';
-      order.paymentMethod = qrMethod;
-      order.transactionReference = cleanTxRef;
-      order.lastCardAttemptMessage = undefined;
-      order.correctionReason = undefined;
-      order.verificationNote = undefined;
-      order.privateReceipt = {
-        id: receiptId,
-        storageFileName,
-        originalFilename: sanitizeDisplayFilename(filename, ext),
-        mimeType: normalizedMime,
-        sizeBytes: buffer.length,
-        uploadedAt: new Date().toISOString()
-      };
-      ordersStore.set(reference, order);
-      saveStoreToDisk();
 
       return res.json({
         success: true,
-        message: 'We’ve received your receipt. We’ll confirm your order once we verify your payment.',
-        order: toPublicOrder(order)
+        order: toPublicOrder(hydrated, buildCustomerAuthorizedPhotoUrl(hydrated.order))
       });
-    } catch {
-      return res.status(500).json({ error: 'Failed to store payment receipt.' });
+    } catch (err) {
+      console.error('Receipt upload error:', sanitizeSupabaseError(err));
+      return res.status(500).json({ error: 'Failed to save payment receipt to private storage.' });
     }
   });
 
-  // Create Stripe Checkout Session Endpoint (MYR, server-side saved order total, requires secure order token)
+  // ============================================================================
+  // STRIPE CHECKOUT SESSION
+  // ============================================================================
   app.post('/api/create-stripe-session', async (req, res) => {
+    const health = await requireSupabaseReady(res);
+    if (!health) return;
+
     try {
+      const stripeInfo = getStripeConfig(health);
+      if (!stripeInfo.client) {
+        return res.status(503).json({
+          error: stripeInfo.error || 'Credit or Debit Card checkout is currently unavailable.'
+        });
+      }
+
       const { reference } = req.body || {};
       if (typeof reference !== 'string' || !ORDER_REF_REGEX.test(reference)) {
         return res.status(400).json({ error: 'Invalid order reference.' });
       }
 
-      const order = ordersStore.get(reference);
+      const order = await fetchOrderByReference(reference);
       if (!order) {
-        return res.status(404).json({ error: 'Order not found.' });
+        return res.status(404).json({ error: 'Saved order not found.' });
       }
       if (!isOrderAuthorized(req, order)) {
-        return res.status(403).json({ error: 'Valid secure order link token is required to start card payment.' });
+        return res.status(403).json({ error: 'Valid secure order link token is required to start card checkout.' });
       }
-      if (order.paymentStatus === 'Paid') {
-        return res.status(409).json({ error: 'This order is already paid. A new payment session cannot be created.' });
+      if (order.payment_status === 'Paid') {
+        return res.status(409).json({ error: 'This order is already marked as Paid.' });
       }
-      if (order.paymentStatus === 'Pending verification') {
+      if (order.payment_status === 'Pending verification') {
         return res.status(409).json({
-          error: 'A QR receipt is pending verification for this order. Starting another payment is disabled.'
+          error: 'A QR payment receipt is already pending verification for this order.'
         });
       }
 
-      const stripeInfo = getStripeConfig();
-      if (!stripeInfo.client) {
-        return res.status(503).json({
-          code: 'STRIPE_NOT_CONFIGURED',
-          error:
-            stripeInfo.error ||
-            'Card payment is temporarily unavailable. Please use an enabled QR payment method.'
-        });
-      }
-
-      const baseUrl = resolveTrustedOrigin(req);
-      const tokenQuery = `&token=${encodeURIComponent(order.accessToken)}`;
-
-      const lineItems: Stripe.Checkout.SessionCreateParams.LineItem[] = [
-        {
-          price_data: {
-            currency: 'myr',
-            product_data: {
-              name: `Little Pixel Keepsakes — ${order.productName}`,
-              description: order.savingsSen
-                ? `Order ${order.reference} · Includes bundle savings of ${formatRM(order.savingsSen)}`
-                : `Order ${order.reference}`
-            },
-            unit_amount: order.subtotalSen
-          },
-          quantity: 1
-        },
-        {
-          price_data: {
-            currency: 'myr',
-            product_data: {
-              name: `Delivery (${order.customer.state})`,
-              description: `Courier delivery to ${order.customer.city}, ${order.customer.state}`
-            },
-            unit_amount: order.deliveryFeeSen
-          },
-          quantity: 1
-        }
-      ];
+      const origin = resolveTrustedOrigin(req);
+      const tokenParam = encodeURIComponent(order.access_token);
+      const refParam = encodeURIComponent(order.reference);
 
       const session = await stripeInfo.client.checkout.sessions.create({
         mode: 'payment',
-        customer_email: order.customer.email,
+        payment_method_types: ['card'],
         client_reference_id: order.reference,
-        line_items: lineItems,
-        success_url: `${baseUrl}/?order=${encodeURIComponent(order.reference)}${tokenQuery}&payment=success`,
-        cancel_url: `${baseUrl}/?order=${encodeURIComponent(order.reference)}${tokenQuery}&payment=cancelled`,
+        customer_email: order.customer_email,
         metadata: {
-          orderReference: order.reference
+          orderReference: order.reference,
+          productName: order.product_name,
+          expectedTotalSen: String(order.total_sen)
         },
-        payment_intent_data: {
-          metadata: {
-            orderReference: order.reference
+        line_items: [
+          {
+            price_data: {
+              currency: 'myr',
+              product_data: {
+                name: `Little Pixel Keepsakes — ${order.product_name}`,
+                description: `Order Ref: ${order.reference} (Qty: ${order.item_quantity})`
+              },
+              unit_amount: order.subtotal_sen
+            },
+            quantity: 1
+          },
+          {
+            price_data: {
+              currency: 'myr',
+              product_data: {
+                name: `Delivery (${order.customer_state})`,
+                description: DELIVERY_PROMISE_TEXT
+              },
+              unit_amount: order.delivery_fee_sen
+            },
+            quantity: 1
           }
-        }
+        ],
+        success_url: `${origin}/?payment=success&order=${refParam}&token=${tokenParam}`,
+        cancel_url: `${origin}/?payment=cancelled&order=${refParam}&token=${tokenParam}`
       });
 
-      if (!session.url) {
-        return res.status(502).json({ error: 'Stripe did not return a checkout URL.' });
-      }
+      await insertPaymentRow({
+        order_id: order.id,
+        order_reference: order.reference,
+        payment_method: 'card',
+        status: 'pending',
+        amount_sen: order.total_sen,
+        currency: 'myr',
+        transaction_reference: null,
+        receipt_storage_bucket: null,
+        receipt_storage_path: null,
+        receipt_original_filename: null,
+        receipt_mime_type: null,
+        receipt_size_bytes: null,
+        receipt_uploaded_at: null,
+        stripe_session_id: session.id,
+        stripe_payment_intent_id: null,
+        stripe_event_id: null,
+        verified_by_staff: false,
+        verified_by_staff_id: null,
+        verification_note: null,
+        rejection_reason: null,
+        paid_at: null
+      });
 
-      order.paymentMethod = 'card';
-      order.stripeSessionId = session.id;
-      order.stripeSessionIds = Array.from(new Set([...(order.stripeSessionIds || []), session.id]));
-      ordersStore.set(reference, order);
-      saveStoreToDisk();
+      await updateOrderByReference(reference, {
+        last_card_attempt_message: null
+      });
 
-      return res.json({ success: true, url: session.url, sessionId: session.id, mode: stripeInfo.mode });
+      return res.json({ success: true, url: session.url, mode: stripeInfo.mode });
     } catch (err: any) {
-      console.error('Failed to create Stripe Checkout session:', err?.message || err);
+      console.error('Stripe session creation error:', err?.message || err);
       return res.status(502).json({
-        error: 'Unable to start Stripe Checkout right now. Please try again or use a QR payment method.'
+        error: 'Unable to initiate Stripe card checkout right now. You can retry or choose a QR payment method.'
       });
     }
   });
 
-  // Get Saved Order Status Endpoint (requires secure order link token)
-  app.get('/api/orders/:reference', (req, res) => {
-    try {
-      const { reference } = req.params;
-      if (!ORDER_REF_REGEX.test(reference)) {
-        return res.status(400).json({ error: 'Invalid order reference format.' });
-      }
-      const order = ordersStore.get(reference);
-      if (!order) {
-        return res.status(404).json({ error: 'Order not found.' });
-      }
-      if (!isOrderAuthorized(req, order)) {
-        return res.status(403).json({
-          error: 'This order requires its secure order link. Please open the full link provided when you placed your order.'
-        });
-      }
-      return res.json({ success: true, order: toPublicOrder(order) });
-    } catch {
-      return res.status(500).json({ error: 'Failed to retrieve order.' });
+  // ============================================================================
+  // PROTECTED STAFF ADMIN AUTH & OPERATIONS (BACKED BY public.staff_accounts)
+  // ============================================================================
+  app.get('/api/admin/auth-status', async (_req, res) => {
+    const { mode, supabase } = await getAdminAuthMode();
+    return res.json({
+      success: true,
+      mode,
+      supabaseReady: supabase.configured,
+      supabaseError: supabase.configured ? null : supabase.issue || 'Supabase is unavailable.'
+    });
+  });
+
+  // One-time first-run passcode setup stored hashed (scrypt) in public.staff_accounts
+  app.post('/api/admin/bootstrap', async (req, res) => {
+    const { mode, supabase } = await getAdminAuthMode();
+    if (mode === 'unavailable' || !supabase.databaseReady) {
+      return res.status(503).json({
+        error: supabase.issue || 'Supabase database must be configured before setting up staff admin access.',
+        code: 'SUPABASE_UNAVAILABLE'
+      });
     }
-  });
-
-  // =========================================================================
-  // PROTECTED STAFF ADMIN AUTH, ORDER VERIFICATION & STORE SETTINGS ROUTES
-  // =========================================================================
-
-  app.get('/api/admin/auth-status', (_req, res) => {
-    const mode = getAdminAuthMode();
-    return res.json({ success: true, mode });
-  });
-
-  // One-time first-run admin setup when ADMIN_PASSCODE is unset and no hash has been claimed yet
-  app.post('/api/admin/bootstrap', (req, res) => {
-    if (getAdminAuthMode() !== 'bootstrap_required') {
-      return res.status(403).json({ error: 'Admin passcode is already configured.' });
+    if (mode !== 'bootstrap_required') {
+      return res.status(409).json({ error: 'Staff admin access is already configured.' });
     }
     const passcode = typeof req.body?.passcode === 'string' ? req.body.passcode.trim() : '';
     if (passcode.length < 8 || passcode.length > 128) {
-      return res.status(400).json({ error: 'Choose an admin passcode between 8 and 128 characters.' });
+      return res.status(400).json({ error: 'Staff passcode must be between 8 and 128 characters.' });
     }
 
-    const { salt, hash } = hashPasscode(passcode);
-    claimedAdminCredential = { salt, hash, claimedAt: new Date().toISOString() };
-    saveStoreToDisk();
-
-    const token = createAdminSession();
-    return res.json({ success: true, token });
+    try {
+      const { salt, hash } = hashPasscode(passcode);
+      const account = await createBootstrapStaffAccount({
+        username: 'admin',
+        displayName: 'Primary Staff Admin',
+        passwordSalt: salt,
+        passwordHash: hash
+      });
+      const token = createAdminSession(account.id, account.username);
+      return res.json({ success: true, token });
+    } catch (err) {
+      console.error('Admin bootstrap failed:', sanitizeSupabaseError(err));
+      return res.status(500).json({ error: 'Failed to save staff account in Supabase.' });
+    }
   });
 
-  app.post('/api/admin/login', (req, res) => {
-    const mode = getAdminAuthMode();
+  app.post('/api/admin/login', async (req, res) => {
+    const { mode, supabase } = await getAdminAuthMode();
     if (mode === 'bootstrap_required') {
       return res.status(400).json({ error: 'Complete first-run admin passcode setup first.' });
+    }
+    if (mode === 'unavailable') {
+      return res.status(503).json({
+        error: supabase.issue || 'Supabase is unavailable and ADMIN_PASSCODE is not set.',
+        code: 'SUPABASE_UNAVAILABLE'
+      });
     }
 
     const ip = req.ip || 'unknown';
@@ -1834,14 +1974,43 @@ async function startServer() {
     }
 
     const passcode = typeof req.body?.passcode === 'string' ? req.body.passcode : '';
-    if (!passcode || !verifyAdminPasscode(passcode)) {
+    if (!passcode) {
+      return res.status(401).json({ error: 'Incorrect staff passcode.' });
+    }
+
+    let authenticated = false;
+    let staffId: string | null = null;
+    let username = 'admin';
+
+    const envPasscode = (process.env.ADMIN_PASSCODE || '').trim();
+    if (envPasscode.length > 0 && safeEqualStrings(passcode, envPasscode)) {
+      authenticated = true;
+    } else if (supabase.databaseReady) {
+      try {
+        const accounts = await listActiveStaffAccounts();
+        for (const account of accounts) {
+          const candidate = hashPasscode(passcode, account.password_salt);
+          if (safeEqualStrings(candidate.hash, account.password_hash)) {
+            authenticated = true;
+            staffId = account.id;
+            username = account.username;
+            void touchStaffLastLogin(account.id).catch(() => {});
+            break;
+          }
+        }
+      } catch (err) {
+        console.error('Staff account lookup error:', sanitizeSupabaseError(err));
+      }
+    }
+
+    if (!authenticated) {
       const currentCount = tracker && tracker.resetAt > Date.now() ? tracker.count + 1 : 1;
       failedLoginTracker.set(ip, { count: currentCount, resetAt: Date.now() + LOGIN_WINDOW_MS });
       return res.status(401).json({ error: 'Incorrect staff passcode.' });
     }
 
     failedLoginTracker.delete(ip);
-    const token = createAdminSession();
+    const token = createAdminSession(staffId, username);
     return res.json({ success: true, token });
   });
 
@@ -1851,35 +2020,70 @@ async function startServer() {
     return res.json({ success: true });
   });
 
-  // Protected: List all orders, payment/email/storage diagnostics & editable store settings
-  app.get('/api/admin/orders', requireAdminAuth, (_req, res) => {
-    const orders = Array.from(ordersStore.values())
-      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
-      .map(toAdminOrder);
-    const { diagnostics } = evaluateAllPaymentMethods();
-    return res.json({ success: true, orders, diagnostics, settings: storeSettings });
+  // Protected: List all orders, diagnostics & editable settings
+  app.get('/api/admin/orders', requireAdminAuth, async (_req, res) => {
+    const { settings, supabase, diagnostics } = await evaluateAllPaymentMethods(true);
+    if (!supabase.databaseReady) {
+      return res.json({
+        success: true,
+        orders: [],
+        diagnostics,
+        settings,
+        supabaseError: supabase.issue || 'Supabase database is not configured or unavailable.'
+      });
+    }
+
+    try {
+      const hydratedList = await listHydratedOrders();
+      const orders = await Promise.all(
+        hydratedList.map(async hydrated => {
+          const signedPhotoUrl = supabase.photosBucketReady
+            ? await resolveAdminOrderPhotoUrl(hydrated.order)
+            : '';
+          return toAdminOrder(hydrated, signedPhotoUrl);
+        })
+      );
+      return res.json({
+        success: true,
+        orders,
+        diagnostics,
+        settings,
+        supabaseError: supabase.configured ? null : supabase.issue || null
+      });
+    } catch (err) {
+      const msg = sanitizeSupabaseError(err);
+      return res.status(503).json({
+        error: `Failed to load orders from Supabase: ${msg}`,
+        code: 'SUPABASE_UNAVAILABLE',
+        diagnostics
+      });
+    }
   });
 
   // Protected: Read editable store & merchant QR settings
-  app.get('/api/admin/settings', requireAdminAuth, (_req, res) => {
-    const { merchantConfig, diagnostics } = evaluateAllPaymentMethods();
+  app.get('/api/admin/settings', requireAdminAuth, async (_req, res) => {
+    const { settings, merchantConfig, diagnostics } = await evaluateAllPaymentMethods(true);
     return res.json({
       success: true,
-      settings: storeSettings,
+      settings,
       merchantConfig,
       diagnostics
     });
   });
 
-  // Protected: Update editable logo, product images, delivery rates, WhatsApp number, merchant QR images & recipient names
-  app.put('/api/admin/settings', requireAdminAuth, (req, res) => {
+  // Protected: Update editable storefront & merchant QR settings in public.store_settings
+  app.put('/api/admin/settings', requireAdminAuth, async (req: AuthenticatedAdminRequest, res) => {
+    const health = await requireSupabaseReady(res);
+    if (!health) return;
+
     try {
       const incoming = req.body?.settings as Partial<EditableStoreSettings> | undefined;
       if (!incoming || typeof incoming !== 'object') {
         return res.status(400).json({ error: 'Settings payload is required.' });
       }
 
-      const next: EditableStoreSettings = JSON.parse(JSON.stringify(storeSettings));
+      const { settings: current } = await loadCurrentStoreSettings(health);
+      const next: EditableStoreSettings = JSON.parse(JSON.stringify(current));
 
       if (typeof incoming.logoUrl === 'string') {
         const check = validateStorefrontAssetSource(incoming.logoUrl);
@@ -2002,23 +2206,23 @@ async function startServer() {
         }
       }
 
-      storeSettings = next;
-      saveStoreToDisk();
+      await upsertStoreSettingsRow(next, req.adminSession?.staffId ?? null);
 
-      const { merchantConfig, diagnostics } = evaluateAllPaymentMethods();
+      const evaluated = await evaluateAllPaymentMethods();
       return res.json({
         success: true,
-        settings: storeSettings,
-        storefront: getPublicStorefrontConfig(),
-        merchantConfig,
-        diagnostics
+        settings: evaluated.settings,
+        storefront: getPublicStorefrontConfig(evaluated.settings),
+        merchantConfig: evaluated.merchantConfig,
+        diagnostics: evaluated.diagnostics
       });
-    } catch {
-      return res.status(500).json({ error: 'Failed to save store settings.' });
+    } catch (err) {
+      console.error('Failed to save store settings:', sanitizeSupabaseError(err));
+      return res.status(500).json({ error: 'Failed to save store settings to Supabase.' });
     }
   });
 
-  // Protected: Upload a logo, product/gallery image, or merchant QR image from Admin Settings
+  // Protected: Upload a public storefront marketing asset (logo/product/gallery) or merchant QR image
   app.post('/api/admin/upload-asset', requireAdminAuth, (req, res) => {
     try {
       const { target, imageBase64 } = req.body || {};
@@ -2045,9 +2249,9 @@ async function startServer() {
         return res.status(400).json({ error: 'Uploaded file does not match a valid JPG or PNG image.' });
       }
 
-      const baseDir = target === 'qr' ? publicPaymentsDir : publicUploadsDir;
-      const prefix = target === 'qr' ? 'qr' : 'asset';
-      const publicPrefix = target === 'qr' ? '/payments/' : '/uploads/';
+      const baseDir = target === 'qr' ? publicPaymentsDir : publicStorefrontAssetsDir;
+      const prefix = target === 'qr' ? 'qr' : 'storefront';
+      const publicPrefix = target === 'qr' ? '/payments/' : '/assets/storefront/';
       const uniqueName = `${prefix}_${Date.now()}_${crypto.randomBytes(6).toString('hex')}.${ext}`;
       const filePath = path.resolve(baseDir, uniqueName);
 
@@ -2062,139 +2266,273 @@ async function startServer() {
     }
   });
 
-  // Protected: Stream private receipt file for staff verification
-  app.get('/api/admin/orders/:reference/receipt', requireAdminAuth, (req, res) => {
+  // Protected: Staff preview & download of private customer photo from SUPABASE_PHOTOS_BUCKET
+  app.get('/api/admin/orders/:reference/photo', requireAdminAuth, async (req, res) => {
+    const health = await requireSupabaseReady(res);
+    if (!health) return;
+
     const { reference } = req.params;
     if (!ORDER_REF_REGEX.test(reference)) {
       return res.status(400).json({ error: 'Invalid order reference.' });
     }
-    const order = ordersStore.get(reference);
-    if (!order || !order.privateReceipt) {
-      return res.status(404).json({ error: 'No payment receipt attached to this order.' });
-    }
-
-    const resolvedPath = path.resolve(privateReceiptsDir, path.basename(order.privateReceipt.storageFileName));
-    if (!resolvedPath.startsWith(privateReceiptsDir + path.sep) || !fs.existsSync(resolvedPath)) {
-      return res.status(404).json({ error: 'Stored receipt file not found.' });
-    }
-
-    res.setHeader('Content-Type', order.privateReceipt.mimeType);
-    res.setHeader('Content-Disposition', `inline; filename="${order.privateReceipt.originalFilename}"`);
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('Cache-Control', 'private, no-store');
-    return res.sendFile(resolvedPath);
-  });
-
-  // Protected: Staff confirms incoming TNG or Public Bank transfer, marks order Paid, and sends one confirmation email
-  app.post('/api/admin/orders/:reference/verify-payment', requireAdminAuth, async (req, res) => {
-    const { reference } = req.params;
-    if (!ORDER_REF_REGEX.test(reference)) {
-      return res.status(400).json({ error: 'Invalid order reference.' });
-    }
-    const order = ordersStore.get(reference);
-    if (!order) {
-      return res.status(404).json({ error: 'Order not found.' });
-    }
-    if (order.paymentStatus === 'Paid') {
-      return res.status(409).json({ error: 'Order is already marked as Paid.' });
-    }
-    if (
-      order.paymentStatus !== 'Pending verification' ||
-      !order.privateReceipt ||
-      (order.paymentMethod !== 'tng' && order.paymentMethod !== 'duitnow')
-    ) {
-      return res.status(400).json({
-        error: 'Only orders with a submitted TNG or Public Bank QR receipt pending verification can be marked paid by staff.'
-      });
-    }
-
-    const note = typeof req.body?.note === 'string' ? req.body.note.trim().slice(0, 240) : '';
-    order.paymentStatus = 'Paid';
-    order.paidAt = new Date().toISOString();
-    order.verifiedByStaff = true;
-    order.correctionReason = undefined;
-    order.verificationNote =
-      note || `Verified incoming ${getPaymentMethodDisplayLabel(order.paymentMethod)} transfer.`;
-    ordersStore.set(reference, order);
-    saveStoreToDisk();
 
     try {
-      await sendOrderConfirmationEmailOnce(order, req);
-    } catch (emailErr) {
-      console.error(`Unexpected confirmation email error for order ${reference}:`, emailErr);
+      const order = await fetchOrderByReference(reference);
+      if (!order || !order.photo_storage_path) {
+        return res.status(404).json({ error: 'No customer photo attached to this order.' });
+      }
+
+      const { buffer, contentType } = await downloadPrivateFile(
+        order.photo_storage_bucket,
+        order.photo_storage_path
+      );
+      const mimeType = order.photo_mime_type || contentType || 'image/jpeg';
+      const ext = mimeType === 'image/png' ? 'png' : 'jpg';
+      const safeName = sanitizeDisplayFilename(
+        order.photo_original_filename || `${order.reference}_photo.${ext}`,
+        `${order.reference}_photo`,
+        ext
+      );
+      const disposition = req.query.download === '1' ? 'attachment' : 'inline';
+
+      res.setHeader('Content-Type', mimeType);
+      res.setHeader('Content-Disposition', `${disposition}; filename="${safeName}"`);
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Cache-Control', 'private, no-store');
+      return res.send(buffer);
+    } catch (err) {
+      console.error(`Admin photo fetch failed for ${reference}:`, sanitizeSupabaseError(err));
+      return res.status(404).json({ error: 'Stored customer photo could not be retrieved from private bucket.' });
+    }
+  });
+
+  // Protected: Staff preview & download of private payment receipt from SUPABASE_RECEIPTS_BUCKET
+  app.get('/api/admin/orders/:reference/receipt', requireAdminAuth, async (req, res) => {
+    const health = await requireSupabaseReady(res);
+    if (!health) return;
+
+    const { reference } = req.params;
+    if (!ORDER_REF_REGEX.test(reference)) {
+      return res.status(400).json({ error: 'Invalid order reference.' });
     }
 
-    return res.json({ success: true, order: toAdminOrder(order) });
+    try {
+      const hydrated = await fetchHydratedOrderByReference(reference);
+      const receiptPayment = hydrated?.latestReceiptPayment;
+      if (!hydrated || !receiptPayment || !receiptPayment.receipt_storage_bucket || !receiptPayment.receipt_storage_path) {
+        return res.status(404).json({ error: 'No payment receipt attached to this order.' });
+      }
+
+      const { buffer, contentType } = await downloadPrivateFile(
+        receiptPayment.receipt_storage_bucket,
+        receiptPayment.receipt_storage_path
+      );
+      const mimeType = receiptPayment.receipt_mime_type || contentType || 'application/octet-stream';
+      const ext =
+        mimeType === 'application/pdf' ? 'pdf' : mimeType === 'image/png' ? 'png' : 'jpg';
+      const safeName = sanitizeDisplayFilename(
+        receiptPayment.receipt_original_filename || `${reference}_receipt.${ext}`,
+        `${reference}_receipt`,
+        ext
+      );
+      const disposition = req.query.download === '1' ? 'attachment' : 'inline';
+
+      res.setHeader('Content-Type', mimeType);
+      res.setHeader('Content-Disposition', `${disposition}; filename="${safeName}"`);
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Cache-Control', 'private, no-store');
+      return res.send(buffer);
+    } catch (err) {
+      console.error(`Admin receipt fetch failed for ${reference}:`, sanitizeSupabaseError(err));
+      return res.status(404).json({ error: 'Stored payment receipt could not be retrieved from private bucket.' });
+    }
   });
+
+  // Protected: Staff verifies incoming TNG or Public Bank transfer, marks order Paid, and sends one Resend email
+  app.post(
+    '/api/admin/orders/:reference/verify-payment',
+    requireAdminAuth,
+    async (req: AuthenticatedAdminRequest, res) => {
+      const health = await requireSupabaseReady(res);
+      if (!health) return;
+
+      const { reference } = req.params;
+      if (!ORDER_REF_REGEX.test(reference)) {
+        return res.status(400).json({ error: 'Invalid order reference.' });
+      }
+
+      try {
+        const hydrated = await fetchHydratedOrderByReference(reference);
+        if (!hydrated) {
+          return res.status(404).json({ error: 'Order not found.' });
+        }
+        const { order, latestReceiptPayment } = hydrated;
+        if (order.payment_status === 'Paid') {
+          return res.status(409).json({ error: 'Order is already marked as Paid.' });
+        }
+        if (
+          order.payment_status !== 'Pending verification' ||
+          !latestReceiptPayment?.receipt_storage_path ||
+          (order.payment_method !== 'tng' && order.payment_method !== 'duitnow')
+        ) {
+          return res.status(400).json({
+            error:
+              'Only orders with a submitted TNG or Public Bank QR receipt pending verification can be marked paid by staff.'
+          });
+        }
+
+        const note = typeof req.body?.note === 'string' ? req.body.note.trim().slice(0, 240) : '';
+        const verificationNote =
+          note || `Verified incoming ${getPaymentMethodDisplayLabel(order.payment_method)} transfer.`;
+        const paidAt = new Date().toISOString();
+        const staffId = req.adminSession?.staffId ?? null;
+
+        await updatePaymentById(latestReceiptPayment.id, {
+          status: 'paid',
+          verified_by_staff: true,
+          verified_by_staff_id: staffId,
+          verification_note: verificationNote,
+          paid_at: paidAt
+        });
+
+        const updatedOrder = await updateOrderByReference(reference, {
+          payment_status: 'Paid',
+          paid_at: paidAt,
+          verified_by_staff: true,
+          verified_by_staff_id: staffId,
+          verification_note: verificationNote,
+          correction_reason: null
+        });
+
+        try {
+          await sendOrderConfirmationEmailOnce(updatedOrder, req);
+        } catch (emailErr) {
+          console.error(`Unexpected confirmation email error for order ${reference}:`, emailErr);
+        }
+
+        const refreshed = await fetchHydratedOrderByReference(reference);
+        if (!refreshed) {
+          return res.status(500).json({ error: 'Order marked paid but could not be reloaded.' });
+        }
+        const signedPhotoUrl = await resolveAdminOrderPhotoUrl(refreshed.order);
+        return res.json({ success: true, order: toAdminOrder(refreshed, signedPhotoUrl) });
+      } catch (err) {
+        console.error(`Verify payment error for ${reference}:`, sanitizeSupabaseError(err));
+        return res.status(500).json({ error: 'Failed to verify payment in Supabase.' });
+      }
+    }
+  );
 
   // Protected: Retry sending confirmation email for a Paid order without changing its Paid status
   app.post('/api/admin/orders/:reference/retry-email', requireAdminAuth, async (req, res) => {
+    const health = await requireSupabaseReady(res);
+    if (!health) return;
+
     const { reference } = req.params;
     if (!ORDER_REF_REGEX.test(reference)) {
       return res.status(400).json({ error: 'Invalid order reference.' });
     }
-    const order = ordersStore.get(reference);
-    if (!order) {
-      return res.status(404).json({ error: 'Order not found.' });
-    }
-    if (order.paymentStatus !== 'Paid') {
-      return res.status(400).json({ error: 'Only paid orders can send a confirmation email.' });
-    }
-    if (order.confirmationEmailSentAt) {
-      return res.status(409).json({
-        error: 'Confirmation email has already been sent for this order.',
-        order: toAdminOrder(order)
-      });
-    }
 
-    const result = await sendOrderConfirmationEmailOnce(order, req);
-    if (result.sent) {
-      return res.json({ success: true, order: toAdminOrder(order) });
-    }
-    if (result.skipped && result.status === 'sent') {
-      return res.status(409).json({
-        error: 'Confirmation email has already been sent or is currently being sent.',
-        order: toAdminOrder(order)
+    try {
+      const hydrated = await fetchHydratedOrderByReference(reference);
+      if (!hydrated) {
+        return res.status(404).json({ error: 'Order not found.' });
+      }
+      if (hydrated.order.payment_status !== 'Paid') {
+        return res.status(400).json({ error: 'Only paid orders can send a confirmation email.' });
+      }
+      if (hydrated.confirmationEmail?.sent_at || hydrated.confirmationEmail?.status === 'sent') {
+        const signedPhotoUrl = await resolveAdminOrderPhotoUrl(hydrated.order);
+        return res.status(409).json({
+          error: 'Confirmation email has already been sent for this order.',
+          order: toAdminOrder(hydrated, signedPhotoUrl)
+        });
+      }
+
+      const result = await sendOrderConfirmationEmailOnce(hydrated.order, req);
+      const refreshed = (await fetchHydratedOrderByReference(reference)) || hydrated;
+      const signedPhotoUrl = await resolveAdminOrderPhotoUrl(refreshed.order);
+
+      if (result.sent) {
+        return res.json({ success: true, order: toAdminOrder(refreshed, signedPhotoUrl) });
+      }
+      if (result.skipped && result.status === 'sent') {
+        return res.status(409).json({
+          error: 'Confirmation email has already been sent or is currently being sent.',
+          order: toAdminOrder(refreshed, signedPhotoUrl)
+        });
+      }
+
+      const statusCode = result.status === 'not_configured' ? 503 : 502;
+      return res.status(statusCode).json({
+        success: false,
+        error: result.error || 'Could not send confirmation email. Order remains Paid.',
+        order: toAdminOrder(refreshed, signedPhotoUrl)
       });
+    } catch (err) {
+      console.error(`Retry email error for ${reference}:`, sanitizeSupabaseError(err));
+      return res.status(500).json({ error: 'Failed to retry confirmation email.' });
     }
-    const statusCode = result.status === 'not_configured' ? 503 : 502;
-    return res.status(statusCode).json({
-      success: false,
-      error: result.error || 'Could not send confirmation email. Order remains Paid.',
-      order: toAdminOrder(order)
-    });
   });
 
   // Protected: Staff requests a corrected receipt (sets status to "Receipt correction needed")
-  app.post('/api/admin/orders/:reference/reject-payment', requireAdminAuth, (req, res) => {
-    const { reference } = req.params;
-    if (!ORDER_REF_REGEX.test(reference)) {
-      return res.status(400).json({ error: 'Invalid order reference.' });
-    }
-    const order = ordersStore.get(reference);
-    if (!order) {
-      return res.status(404).json({ error: 'Order not found.' });
-    }
-    if (order.paymentStatus !== 'Pending verification') {
-      return res
-        .status(400)
-        .json({ error: 'Only orders pending verification can request a corrected receipt.' });
-    }
+  app.post(
+    '/api/admin/orders/:reference/reject-payment',
+    requireAdminAuth,
+    async (req: AuthenticatedAdminRequest, res) => {
+      const health = await requireSupabaseReady(res);
+      if (!health) return;
 
-    const reason =
-      typeof req.body?.reason === 'string' && req.body.reason.trim()
-        ? req.body.reason.trim().slice(0, 240)
-        : 'We could not match your uploaded receipt to an incoming transaction. Please verify the recipient name and exact amount, then upload a corrected receipt.';
+      const { reference } = req.params;
+      if (!ORDER_REF_REGEX.test(reference)) {
+        return res.status(400).json({ error: 'Invalid order reference.' });
+      }
 
-    order.paymentStatus = 'Receipt correction needed';
-    order.correctionReason = reason;
-    order.verificationNote = reason;
-    order.lastCardAttemptMessage = undefined;
-    ordersStore.set(reference, order);
-    saveStoreToDisk();
+      try {
+        const hydrated = await fetchHydratedOrderByReference(reference);
+        if (!hydrated) {
+          return res.status(404).json({ error: 'Order not found.' });
+        }
+        if (hydrated.order.payment_status !== 'Pending verification') {
+          return res
+            .status(400)
+            .json({ error: 'Only orders pending verification can request a corrected receipt.' });
+        }
 
-    return res.json({ success: true, order: toAdminOrder(order) });
-  });
+        const reason =
+          typeof req.body?.reason === 'string' && req.body.reason.trim()
+            ? req.body.reason.trim().slice(0, 240)
+            : 'We could not match your uploaded receipt to an incoming transaction. Please verify the recipient name and exact amount, then upload a corrected receipt.';
+
+        const payments = await fetchPaymentsForOrder(hydrated.order.id);
+        const pendingPayment = payments.find(p => p.status === 'pending_verification');
+        if (pendingPayment) {
+          await updatePaymentById(pendingPayment.id, {
+            status: 'correction_needed',
+            rejection_reason: reason,
+            verified_by_staff_id: req.adminSession?.staffId ?? null
+          });
+        }
+
+        await updateOrderByReference(reference, {
+          payment_status: 'Receipt correction needed',
+          correction_reason: reason,
+          verification_note: reason,
+          last_card_attempt_message: null
+        });
+
+        const refreshed = await fetchHydratedOrderByReference(reference);
+        if (!refreshed) {
+          return res.status(500).json({ error: 'Order updated but could not be reloaded.' });
+        }
+        const signedPhotoUrl = await resolveAdminOrderPhotoUrl(refreshed.order);
+        return res.json({ success: true, order: toAdminOrder(refreshed, signedPhotoUrl) });
+      } catch (err) {
+        console.error(`Reject payment error for ${reference}:`, sanitizeSupabaseError(err));
+        return res.status(500).json({ error: 'Failed to request corrected receipt in Supabase.' });
+      }
+    }
+  );
 
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
@@ -2204,8 +2542,8 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     app.use(express.static(distDir));
-    app.use('/uploads', express.static(publicUploadsDir));
     app.use('/payments', express.static(publicPaymentsDir));
+    app.use('/assets', express.static(path.resolve(publicDir, 'assets')));
     app.get('*', (_req, res) => {
       res.sendFile(path.join(distDir, 'index.html'));
     });

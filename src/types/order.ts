@@ -162,7 +162,7 @@ export interface AdminConfigDiagnostics {
   };
   email: {
     configured: boolean;
-    provider: 'resend' | 'smtp' | 'none';
+    provider: 'resend' | 'none';
     fromAddress: string | null;
     issue?: string;
   };

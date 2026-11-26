@@ -6,8 +6,10 @@ import {
   CheckCircle2,
   Clock,
   Copy,
+  Download,
   Eye,
   FileText,
+  Image as ImageIcon,
   Lock,
   LogOut,
   Mail,
@@ -67,7 +69,8 @@ export default function AdminPage({
   onOpenOrderPayment,
   onStorefrontUpdated
 }: AdminPageProps) {
-  const [authMode, setAuthMode] = useState<'loading' | 'env' | 'claimed' | 'bootstrap_required'>('loading');
+  const [authMode, setAuthMode] = useState<'loading' | 'env' | 'claimed' | 'bootstrap_required' | 'unavailable'>('loading');
+  const [supabaseBannerError, setSupabaseBannerError] = useState<string | null>(null);
   // Session token kept strictly in React memory (never localStorage or sessionStorage)
   const [authToken, setAuthToken] = useState<string | null>(null);
   const [passcodeInput, setPasscodeInput] = useState('');
@@ -97,19 +100,23 @@ export default function AdminPage({
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
   const [copiedLinkRef, setCopiedLinkRef] = useState<string | null>(null);
 
-  // In-app private receipt preview modal
-  const [receiptPreview, setReceiptPreview] = useState<{
+  // In-app private file preview modal (supports both customer photos & payment receipts)
+  const [filePreview, setFilePreview] = useState<{
+    kind: 'photo' | 'receipt';
     reference: string;
     fileName: string;
     mimeType: string;
     objectUrl: string;
   } | null>(null);
-  const [loadingReceiptRef, setLoadingReceiptRef] = useState<string | null>(null);
+  const [loadingFileKey, setLoadingFileKey] = useState<string | null>(null);
 
   useEffect(() => {
     fetch('/api/admin/auth-status')
       .then(res => res.json())
       .then(data => {
+        if (data.supabaseError) {
+          setSupabaseBannerError(data.supabaseError);
+        }
         if (data.success && data.mode) {
           setAuthMode(data.mode);
         } else {
@@ -121,11 +128,11 @@ export default function AdminPage({
 
   useEffect(() => {
     return () => {
-      if (receiptPreview?.objectUrl) {
-        URL.revokeObjectURL(receiptPreview.objectUrl);
+      if (filePreview?.objectUrl) {
+        URL.revokeObjectURL(filePreview.objectUrl);
       }
     };
-  }, [receiptPreview]);
+  }, [filePreview]);
 
   const hydrateSettings = (loaded: EditableStoreSettings) => {
     setSettings(loaded);
@@ -149,10 +156,12 @@ export default function AdminPage({
       if (res.ok && data.success) {
         setOrders(data.orders || []);
         setDiagnostics(data.diagnostics || null);
+        setSupabaseBannerError(data.supabaseError || null);
         if (data.settings) {
           hydrateSettings(data.settings);
         }
       } else {
+        if (data.diagnostics) setDiagnostics(data.diagnostics);
         setDashboardError(data.error || 'Failed to load orders.');
       }
     } catch {
@@ -245,12 +254,21 @@ export default function AdminPage({
     setConfirmingRef(null);
   };
 
-  const handleViewReceipt = async (order: OrderPublic) => {
+  const handleOpenPrivateFile = async (
+    order: OrderPublic,
+    kind: 'photo' | 'receipt',
+    downloadOnly = false
+  ) => {
     if (!authToken) return;
-    setLoadingReceiptRef(order.reference);
+    const key = `${kind}:${order.reference}:${downloadOnly ? 'dl' : 'view'}`;
+    setLoadingFileKey(key);
     setDashboardError(null);
     try {
-      const res = await fetch(`/api/admin/orders/${encodeURIComponent(order.reference)}/receipt`, {
+      const endpoint =
+        kind === 'photo'
+          ? `/api/admin/orders/${encodeURIComponent(order.reference)}/photo${downloadOnly ? '?download=1' : ''}`
+          : `/api/admin/orders/${encodeURIComponent(order.reference)}/receipt${downloadOnly ? '?download=1' : ''}`;
+      const res = await fetch(endpoint, {
         headers: { Authorization: `Bearer ${authToken}` }
       });
       if (res.status === 401) {
@@ -260,21 +278,42 @@ export default function AdminPage({
       }
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
-        setDashboardError(errData.error || 'Unable to load private receipt.');
+        setDashboardError(errData.error || `Unable to load private ${kind}.`);
         return;
       }
       const blob = await res.blob();
+      const mimeType =
+        blob.type ||
+        (kind === 'receipt' ? order.receiptMimeType || 'image/jpeg' : 'image/jpeg');
+      const fallbackExt =
+        mimeType === 'application/pdf' ? 'pdf' : mimeType === 'image/png' ? 'png' : 'jpg';
+      const fileName =
+        kind === 'photo'
+          ? order.photoFileName || `${order.reference}_photo.${fallbackExt}`
+          : order.receiptFileName || `${order.reference}_receipt.${fallbackExt}`;
       const objectUrl = URL.createObjectURL(blob);
-      setReceiptPreview({
-        reference: order.reference,
-        fileName: order.receiptFileName || 'receipt',
-        mimeType: blob.type || order.receiptMimeType || 'image/jpeg',
-        objectUrl
-      });
+
+      if (downloadOnly) {
+        const link = document.createElement('a');
+        link.href = objectUrl;
+        link.download = fileName;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1500);
+      } else {
+        setFilePreview({
+          kind,
+          reference: order.reference,
+          fileName,
+          mimeType,
+          objectUrl
+        });
+      }
     } catch {
-      setDashboardError('Failed to fetch private receipt.');
+      setDashboardError(`Failed to fetch private ${kind}.`);
     } finally {
-      setLoadingReceiptRef(null);
+      setLoadingFileKey(null);
     }
   };
 
@@ -566,13 +605,35 @@ export default function AdminPage({
             </h1>
             <p className="text-xs text-[#14233C]/70 leading-relaxed">
               {authMode === 'bootstrap_required'
-                ? 'Create a one-time staff passcode to protect order verification, private payment receipts, and store settings. Setting ADMIN_PASSCODE on the server always overrides this setup.'
-                : 'Sign in with your staff passcode to verify manual QR payments, request corrected receipts, and edit shop settings.'}
+                ? 'Create a one-time staff passcode stored hashed in Supabase staff_accounts. Setting ADMIN_PASSCODE on the server always overrides this setup.'
+                : authMode === 'unavailable'
+                  ? 'Supabase must be configured (or ADMIN_PASSCODE set on the server) before signing in to Staff Admin.'
+                  : 'Sign in with your staff passcode to verify manual QR payments, preview private customer photos and receipts, and edit shop settings.'}
             </p>
           </div>
 
+          {supabaseBannerError && (
+            <div
+              role="alert"
+              className="flex items-start gap-2.5 p-3.5 rounded-xl bg-red-50 border border-red-200 text-xs text-red-900 leading-relaxed"
+            >
+              <AlertCircle className="w-4 h-4 text-red-700 shrink-0 mt-0.5" />
+              <div>
+                <p className="font-bold">Supabase configuration required</p>
+                <p className="mt-0.5">{supabaseBannerError}</p>
+              </div>
+            </div>
+          )}
+
           {authMode === 'loading' ? (
             <p className="text-xs text-[#14233C]/60">Checking admin access status…</p>
+          ) : authMode === 'unavailable' ? (
+            <p className="text-xs text-[#14233C]/70">
+              Configure <span className="font-mono font-semibold">SUPABASE_URL</span>,{' '}
+              <span className="font-mono font-semibold">SUPABASE_SECRET_KEY</span>,{' '}
+              <span className="font-mono font-semibold">SUPABASE_PHOTOS_BUCKET</span>, and{' '}
+              <span className="font-mono font-semibold">SUPABASE_RECEIPTS_BUCKET</span> on the server, run the SQL migration, then reload.
+            </p>
           ) : authMode === 'bootstrap_required' ? (
             <form onSubmit={handleBootstrap} className="space-y-4">
               <div>
@@ -722,6 +783,19 @@ export default function AdminPage({
       </div>
 
       {/* Alerts / Feedback */}
+      {supabaseBannerError && (
+        <div
+          role="alert"
+          className="flex items-start gap-2.5 p-4 rounded-xl bg-red-50 border border-red-200 text-xs text-red-900 leading-relaxed"
+        >
+          <AlertCircle className="w-4 h-4 text-red-700 shrink-0 mt-0.5" />
+          <div>
+            <p className="font-bold">Supabase Configuration Error (no local JSON fallback)</p>
+            <p className="mt-0.5">{supabaseBannerError}</p>
+          </div>
+        </div>
+      )}
+
       {dashboardError && (
         <div
           role="alert"
@@ -797,20 +871,27 @@ export default function AdminPage({
 
             <div className="p-3.5 rounded-xl bg-[#FAF6EE]/70 border border-[#14233C]/10 space-y-1.5">
               <div className="flex items-center justify-between gap-2">
-                <span className="font-bold text-[#14233C]">Private Storage</span>
+                <span className="font-bold text-[#14233C]">Supabase</span>
                 <span
                   className={`font-bold ${
-                    diagnostics.privateStorage.configured ? 'text-emerald-800' : 'text-red-700'
+                    diagnostics.supabase.configured ? 'text-emerald-800' : 'text-red-700'
                   }`}
                 >
-                  {diagnostics.privateStorage.configured ? 'Ready' : 'Action Needed'}
+                  {diagnostics.supabase.configured ? 'Connected' : 'Action Needed'}
                 </span>
               </div>
-              <p className="text-[#14233C]/70">
-                {diagnostics.privateStorage.configured
-                  ? 'Receipts stored outside public/ and writable.'
-                  : diagnostics.privateStorage.issue}
-              </p>
+              {diagnostics.supabase.configured ? (
+                <p className="text-[#14233C]/70 break-words">
+                  PostgreSQL & private buckets ({diagnostics.supabase.photosBucket},{' '}
+                  {diagnostics.supabase.receiptsBucket}) ready.
+                </p>
+              ) : (
+                <ul className="text-red-800 list-disc list-inside space-y-0.5">
+                  {diagnostics.supabase.issues.map((issue, idx) => (
+                    <li key={idx}>{issue}</li>
+                  ))}
+                </ul>
+              )}
             </div>
 
             <div className="p-3.5 rounded-xl bg-[#FAF6EE]/70 border border-[#14233C]/10 space-y-1.5">
@@ -821,11 +902,7 @@ export default function AdminPage({
                     diagnostics.email.configured ? 'text-emerald-800' : 'text-amber-800'
                   }`}
                 >
-                  {diagnostics.email.configured
-                    ? diagnostics.email.provider === 'resend'
-                      ? 'Resend API'
-                      : 'SMTP (Optional)'
-                    : 'Not Set'}
+                  {diagnostics.email.configured ? 'Resend API' : 'Not Set'}
                 </span>
               </div>
               <p className="text-[#14233C]/70 break-words">
@@ -990,18 +1067,63 @@ export default function AdminPage({
                       </div>
 
                       <div className="md:col-span-4 flex flex-wrap md:justify-end gap-2">
+                        <button
+                          type="button"
+                          disabled={loadingFileKey === `photo:${order.reference}:view`}
+                          onClick={() => handleOpenPrivateFile(order, 'photo', false)}
+                          className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-[#14233C]/20 text-xs font-bold text-[#14233C] hover:bg-[#FAF6EE] transition-colors whitespace-nowrap shrink-0"
+                        >
+                          <ImageIcon className="w-3.5 h-3.5" />
+                          <span>
+                            {loadingFileKey === `photo:${order.reference}:view`
+                              ? 'Opening…'
+                              : 'Preview Photo'}
+                          </span>
+                        </button>
+
+                        <button
+                          type="button"
+                          disabled={loadingFileKey === `photo:${order.reference}:dl`}
+                          onClick={() => handleOpenPrivateFile(order, 'photo', true)}
+                          className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-[#14233C]/20 text-xs font-bold text-[#14233C] hover:bg-[#FAF6EE] transition-colors whitespace-nowrap shrink-0"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          <span>
+                            {loadingFileKey === `photo:${order.reference}:dl`
+                              ? 'Downloading…'
+                              : 'Download Photo'}
+                          </span>
+                        </button>
+
                         {order.receiptSubmitted && (
-                          <button
-                            type="button"
-                            disabled={loadingReceiptRef === order.reference}
-                            onClick={() => handleViewReceipt(order)}
-                            className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-[#14233C]/20 text-xs font-bold text-[#14233C] hover:bg-[#FAF6EE] transition-colors whitespace-nowrap shrink-0"
-                          >
-                            <Eye className="w-3.5 h-3.5" />
-                            <span>
-                              {loadingReceiptRef === order.reference ? 'Opening…' : 'View Receipt'}
-                            </span>
-                          </button>
+                          <>
+                            <button
+                              type="button"
+                              disabled={loadingFileKey === `receipt:${order.reference}:view`}
+                              onClick={() => handleOpenPrivateFile(order, 'receipt', false)}
+                              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-[#14233C]/20 text-xs font-bold text-[#14233C] hover:bg-[#FAF6EE] transition-colors whitespace-nowrap shrink-0"
+                            >
+                              <Eye className="w-3.5 h-3.5" />
+                              <span>
+                                {loadingFileKey === `receipt:${order.reference}:view`
+                                  ? 'Opening…'
+                                  : 'View Receipt'}
+                              </span>
+                            </button>
+                            <button
+                              type="button"
+                              disabled={loadingFileKey === `receipt:${order.reference}:dl`}
+                              onClick={() => handleOpenPrivateFile(order, 'receipt', true)}
+                              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-[#14233C]/20 text-xs font-bold text-[#14233C] hover:bg-[#FAF6EE] transition-colors whitespace-nowrap shrink-0"
+                            >
+                              <Download className="w-3.5 h-3.5" />
+                              <span>
+                                {loadingFileKey === `receipt:${order.reference}:dl`
+                                  ? 'Downloading…'
+                                  : 'Receipt'}
+                              </span>
+                            </button>
+                          </>
                         )}
 
                         {isPending && !isConfirming && (
@@ -1562,42 +1684,53 @@ export default function AdminPage({
         </form>
       )}
 
-      {/* Private Receipt Preview Modal */}
-      {receiptPreview && (
+      {/* Private Customer Photo / Payment Receipt Preview Modal */}
+      {filePreview && (
         <div
           role="dialog"
           aria-modal="true"
-          aria-label={`Receipt preview for ${receiptPreview.reference}`}
+          aria-label={`${filePreview.kind === 'photo' ? 'Customer photo' : 'Receipt'} preview for ${filePreview.reference}`}
           className="fixed inset-0 z-50 bg-[#14233C]/60 flex items-center justify-center p-4"
         >
           <div className="bg-white rounded-2xl max-w-2xl w-full max-h-[85vh] flex flex-col overflow-hidden border border-[#14233C]/15">
             <div className="px-5 py-4 border-b border-[#14233C]/10 flex items-center justify-between gap-4">
               <div className="min-w-0">
                 <p className="text-sm font-bold text-[#14233C] truncate">
-                  Private Receipt · {receiptPreview.reference}
+                  {filePreview.kind === 'photo' ? 'Private Customer Photo' : 'Private Receipt'} ·{' '}
+                  {filePreview.reference}
                 </p>
-                <p className="text-xs text-[#14233C]/65 truncate">{receiptPreview.fileName}</p>
+                <p className="text-xs text-[#14233C]/65 truncate">{filePreview.fileName}</p>
               </div>
-              <button
-                type="button"
-                onClick={() => setReceiptPreview(null)}
-                aria-label="Close receipt preview"
-                className="p-2 rounded-lg text-[#14233C]/70 hover:bg-[#FAF6EE] hover:text-[#14233C]"
-              >
-                <X className="w-5 h-5" />
-              </button>
+              <div className="flex items-center gap-2 shrink-0">
+                <a
+                  href={filePreview.objectUrl}
+                  download={filePreview.fileName}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-[#14233C]/20 text-xs font-bold text-[#14233C] hover:bg-[#FAF6EE]"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Download</span>
+                </a>
+                <button
+                  type="button"
+                  onClick={() => setFilePreview(null)}
+                  aria-label="Close preview"
+                  className="p-2 rounded-lg text-[#14233C]/70 hover:bg-[#FAF6EE] hover:text-[#14233C]"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
             </div>
             <div className="p-5 overflow-auto flex-1 bg-[#FAF6EE] flex items-center justify-center">
-              {receiptPreview.mimeType === 'application/pdf' ? (
+              {filePreview.mimeType === 'application/pdf' ? (
                 <iframe
-                  src={receiptPreview.objectUrl}
-                  title={`PDF receipt for ${receiptPreview.reference}`}
+                  src={filePreview.objectUrl}
+                  title={`PDF receipt for ${filePreview.reference}`}
                   className="w-full h-[65vh] rounded-xl border border-[#14233C]/15 bg-white"
                 />
               ) : (
                 <img
-                  src={receiptPreview.objectUrl}
-                  alt={`Payment receipt for ${receiptPreview.reference}`}
+                  src={filePreview.objectUrl}
+                  alt={`${filePreview.kind === 'photo' ? 'Customer photo' : 'Payment receipt'} for ${filePreview.reference}`}
                   className="max-w-full max-h-[65vh] object-contain rounded-xl border border-[#14233C]/15 bg-white"
                 />
               )}
