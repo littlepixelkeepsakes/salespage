@@ -867,6 +867,12 @@ export default function AdminPage({
                     ? 'Webhook signing secret configured.'
                     : 'Webhook secret not set.')}
               </p>
+              {diagnostics.stripe.lastCheckoutError && (
+                <p className="text-red-700 break-words">
+                  Last checkout error ({diagnostics.stripe.lastCheckoutError.code}):{' '}
+                  {diagnostics.stripe.lastCheckoutError.message}
+                </p>
+              )}
             </div>
 
             <div className="p-3.5 rounded-xl bg-[#FAF6EE]/70 border border-[#14233C]/10 space-y-1.5">

@@ -150,6 +150,18 @@ export interface SupabaseHealthDiagnostic {
   issue?: string;
 }
 
+export interface StripeCheckoutDiagnostic {
+  timestamp: string;
+  stage: 'config' | 'order_lookup' | 'redirect_url' | 'stripe_api' | 'save_payment';
+  code: string;
+  mode: 'test' | 'live' | 'unconfigured';
+  httpStatus: number;
+  stripeType?: string;
+  stripeCode?: string;
+  originSource?: 'app_url' | 'request_headers' | 'fallback_localhost';
+  message: string;
+}
+
 export interface AdminConfigDiagnostics {
   tng: QrConfigDiagnostic;
   duitnow: QrConfigDiagnostic;
@@ -158,7 +170,10 @@ export interface AdminConfigDiagnostics {
     mode: 'test' | 'live' | 'unconfigured';
     webhookConfigured: boolean;
     livePaymentsEnabled: boolean;
+    redirectOrigin?: string;
+    redirectOriginSource?: 'app_url' | 'request_headers' | 'fallback_localhost';
     issue?: string;
+    lastCheckoutError?: StripeCheckoutDiagnostic | null;
   };
   email: {
     configured: boolean;

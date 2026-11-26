@@ -10,6 +10,7 @@ import type {
   EditableStoreSettings,
   PaymentMethodKey,
   StoreGalleryImage,
+  StripeCheckoutDiagnostic,
   SupabaseHealthDiagnostic
 } from './src/types/order';
 import {
@@ -564,17 +565,76 @@ function evaluateQrMethod(opts: {
   };
 }
 
+let cachedStripeSignature = '';
+let cachedStripeClient: Stripe | null = null;
+let lastStripeCheckoutDiagnostic: StripeCheckoutDiagnostic | null = null;
+
+function stripWrappingQuotes(value: string): string {
+  const trimmed = value.trim();
+  if (
+    trimmed.length >= 2 &&
+    ((trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+      (trimmed.startsWith("'") && trimmed.endsWith("'")))
+  ) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
+function sanitizeSensitiveText(raw: unknown, maxLen = 240): string {
+  const rawMessage =
+    typeof raw === 'string'
+      ? raw
+      : raw && typeof raw === 'object' && 'message' in raw
+        ? String((raw as { message?: unknown }).message || '')
+        : String(raw || '');
+  return rawMessage
+    .replace(/Bearer\s+\S+/gi, 'Bearer [REDACTED]')
+    .replace(/\b(sk|rk|pk)_(test|live)_[A-Za-z0-9_*]{4,}\b/gi, '$1_$2_[REDACTED]')
+    .replace(/\bwhsec_[A-Za-z0-9_*]{4,}\b/gi, 'whsec_[REDACTED]')
+    .replace(/\bsb_secret_[A-Za-z0-9_-]{6,}\b/gi, '[REDACTED_KEY]')
+    .replace(/\bre_[A-Za-z0-9_-]{8,}\b/gi, '[REDACTED_KEY]')
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[REDACTED_JWT]')
+    .replace(/([?&]token=)[^&\s"'<>]+/gi, '$1[REDACTED]')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maxLen);
+}
+
+function recordStripeCheckoutDiagnostic(
+  diag: Omit<StripeCheckoutDiagnostic, 'timestamp'> & { stripeParam?: string }
+): void {
+  const sanitized: StripeCheckoutDiagnostic = {
+    timestamp: new Date().toISOString(),
+    stage: diag.stage,
+    code: diag.code,
+    mode: diag.mode,
+    httpStatus: diag.httpStatus,
+    ...(diag.stripeType ? { stripeType: diag.stripeType } : {}),
+    ...(diag.stripeCode ? { stripeCode: diag.stripeCode } : {}),
+    ...(diag.originSource ? { originSource: diag.originSource } : {}),
+    message: sanitizeSensitiveText(diag.message || 'Stripe checkout failed.')
+  };
+  lastStripeCheckoutDiagnostic = sanitized;
+  const logPayload = diag.stripeParam
+    ? { ...sanitized, stripeParam: sanitizeSensitiveText(diag.stripeParam, 80) }
+    : sanitized;
+  console.error('[StripeCheckoutDiagnostic]', JSON.stringify(logPayload));
+}
+
 function getStripeConfig(supabaseHealth: SupabaseHealthDiagnostic): {
   client: Stripe | null;
   mode: 'test' | 'live' | 'unconfigured';
   webhookConfigured: boolean;
   livePaymentsEnabled: boolean;
+  errorCode?: string;
   error?: string;
 } {
-  const secretKey = (process.env.STRIPE_SECRET_KEY || '').trim();
-  const webhookSecret = (process.env.STRIPE_WEBHOOK_SECRET || '').trim();
+  const secretKey = stripWrappingQuotes(process.env.STRIPE_SECRET_KEY || '');
+  const webhookSecret = stripWrappingQuotes(process.env.STRIPE_WEBHOOK_SECRET || '');
   const webhookConfigured = webhookSecret.length > 0;
-  const livePaymentsEnabled = (process.env.ENABLE_LIVE_PAYMENTS || '').trim().toLowerCase() === 'true';
+  const livePaymentsEnabled =
+    stripWrappingQuotes(process.env.ENABLE_LIVE_PAYMENTS || '').toLowerCase() === 'true';
 
   if (!secretKey) {
     return {
@@ -582,7 +642,20 @@ function getStripeConfig(supabaseHealth: SupabaseHealthDiagnostic): {
       mode: 'unconfigured',
       webhookConfigured,
       livePaymentsEnabled,
-      error: 'Add STRIPE_SECRET_KEY (sk_test_...) on the server to enable card payments.'
+      errorCode: 'STRIPE_KEY_MISSING',
+      error: 'Add STRIPE_SECRET_KEY (sk_test_... or sk_live_...) on the server to enable card payments.'
+    };
+  }
+
+  if (secretKey.startsWith('pk_test_') || secretKey.startsWith('pk_live_')) {
+    return {
+      client: null,
+      mode: 'unconfigured',
+      webhookConfigured,
+      livePaymentsEnabled,
+      errorCode: 'STRIPE_PUBLISHABLE_KEY_USED',
+      error:
+        'STRIPE_SECRET_KEY is set to a publishable key (pk_...). Replace it with a server secret key (sk_test_... or sk_live_...).'
     };
   }
 
@@ -597,6 +670,7 @@ function getStripeConfig(supabaseHealth: SupabaseHealthDiagnostic): {
       mode: 'unconfigured',
       webhookConfigured,
       livePaymentsEnabled,
+      errorCode: 'STRIPE_KEY_INVALID_FORMAT',
       error: 'Invalid STRIPE_SECRET_KEY format configured on the server.'
     };
   }
@@ -610,7 +684,10 @@ function getStripeConfig(supabaseHealth: SupabaseHealthDiagnostic): {
       mode,
       webhookConfigured,
       livePaymentsEnabled,
-      error: supabaseHealth.issue || 'Supabase database and private storage must be configured before enabling payments.'
+      errorCode: 'SUPABASE_UNAVAILABLE',
+      error:
+        supabaseHealth.issue ||
+        'Supabase database and private storage must be configured before enabling payments.'
     };
   }
 
@@ -621,6 +698,7 @@ function getStripeConfig(supabaseHealth: SupabaseHealthDiagnostic): {
         mode: 'live',
         webhookConfigured,
         livePaymentsEnabled,
+        errorCode: 'STRIPE_LIVE_MODE_DISABLED',
         error: 'Live Stripe payments stay disabled until ENABLE_LIVE_PAYMENTS=true is explicitly set.'
       };
     }
@@ -630,20 +708,34 @@ function getStripeConfig(supabaseHealth: SupabaseHealthDiagnostic): {
         mode: 'live',
         webhookConfigured,
         livePaymentsEnabled,
+        errorCode: 'STRIPE_WEBHOOK_SECRET_MISSING',
         error: 'Live Stripe payments stay disabled until STRIPE_WEBHOOK_SECRET is configured.'
       };
     }
   }
 
-  const client = new Stripe(secretKey);
+  if (!cachedStripeClient || cachedStripeSignature !== secretKey) {
+    cachedStripeClient = new Stripe(secretKey, {
+      timeout: 20_000,
+      maxNetworkRetries: 1
+    });
+    cachedStripeSignature = secretKey;
+  }
+
+  const warnings: string[] = [];
+  if (!webhookConfigured) {
+    warnings.push('STRIPE_WEBHOOK_SECRET is not set yet (required for automatic webhook confirmation).');
+  }
+  if (!isLiveKey && livePaymentsEnabled) {
+    warnings.push('ENABLE_LIVE_PAYMENTS=true is set, but STRIPE_SECRET_KEY is a test key (running in Test Mode).');
+  }
+
   return {
-    client,
+    client: cachedStripeClient,
     mode,
     webhookConfigured,
     livePaymentsEnabled,
-    error: !webhookConfigured
-      ? 'STRIPE_WEBHOOK_SECRET is not set yet (required for automatic webhook confirmation).'
-      : undefined
+    error: warnings.length > 0 ? warnings.join(' ') : undefined
   };
 }
 
@@ -769,8 +861,11 @@ async function evaluateAllPaymentMethods(forceHealthRefresh = false) {
 
   // 3. Credit or Debit Card (Stripe) — evaluated independently
   const stripeInfo = getStripeConfig(supabase);
+  const originInfo = resolveTrustedOriginInfo();
   // 4. Paid confirmation email (Resend) — independent of payment & storage config
   const emailInfo = getEmailConfig();
+
+  const stripeIssues = [stripeInfo.error, originInfo.issue].filter(Boolean).join(' ');
 
   return {
     settings,
@@ -791,7 +886,10 @@ async function evaluateAllPaymentMethods(forceHealthRefresh = false) {
         mode: stripeInfo.mode,
         webhookConfigured: stripeInfo.webhookConfigured,
         livePaymentsEnabled: stripeInfo.livePaymentsEnabled,
-        issue: stripeInfo.error
+        redirectOrigin: originInfo.origin,
+        redirectOriginSource: originInfo.source,
+        issue: stripeIssues || undefined,
+        lastCheckoutError: lastStripeCheckoutDiagnostic
       },
       email: emailInfo,
       supabase
@@ -839,30 +937,62 @@ function verifyMagicBytes(buffer: Buffer, mimeType: string): boolean {
   return false;
 }
 
-function resolveTrustedOrigin(req?: express.Request): string {
-  const configuredAppUrl = (process.env.APP_URL || '').trim();
+function resolveTrustedOriginInfo(req?: express.Request): {
+  origin: string;
+  source: 'app_url' | 'request_headers' | 'fallback_localhost';
+  issue?: string;
+} {
+  const configuredAppUrl = stripWrappingQuotes(process.env.APP_URL || '');
+  let appUrlIssue: string | undefined;
+
   if (configuredAppUrl) {
     try {
       const parsed = new URL(configuredAppUrl);
       if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
-        return parsed.origin;
+        return { origin: parsed.origin, source: 'app_url' };
       }
+      appUrlIssue = 'APP_URL must start with https:// or http://.';
     } catch {
-      // Fall through to request host detection
+      appUrlIssue = 'APP_URL is not a valid URL.';
     }
   }
-  if (!req) return 'http://localhost:3000';
+
+  if (!req) {
+    return {
+      origin: 'http://localhost:3000',
+      source: 'fallback_localhost',
+      issue: appUrlIssue
+    };
+  }
+
   const forwardedProto = (req.headers['x-forwarded-proto'] as string | undefined)?.split(',')[0]?.trim();
   const forwardedHost = (req.headers['x-forwarded-host'] as string | undefined)?.split(',')[0]?.trim();
-  const rawHost = forwardedHost || req.headers.host || 'localhost:3000';
-  const safeHost = /^[a-zA-Z0-9.-]+(?::\d{1,5})?$/.test(rawHost) ? rawHost : 'localhost:3000';
-  const proto =
-    forwardedProto === 'https' || forwardedProto === 'http'
-      ? forwardedProto
-      : req.protocol === 'https'
-        ? 'https'
-        : 'http';
-  return `${proto}://${safeHost}`;
+  const rawHost = (forwardedHost || req.headers.host || '').trim();
+  const safeHost = /^[a-zA-Z0-9.-]+(?::\d{1,5})?$/.test(rawHost) ? rawHost : '';
+
+  if (safeHost) {
+    const proto =
+      forwardedProto === 'https' || forwardedProto === 'http'
+        ? forwardedProto
+        : req.protocol === 'https'
+          ? 'https'
+          : 'http';
+    return {
+      origin: `${proto}://${safeHost}`,
+      source: 'request_headers',
+      issue: appUrlIssue
+    };
+  }
+
+  return {
+    origin: 'http://localhost:3000',
+    source: 'fallback_localhost',
+    issue: appUrlIssue
+  };
+}
+
+function resolveTrustedOrigin(req?: express.Request): string {
+  return resolveTrustedOriginInfo(req).origin;
 }
 
 function sanitizeDisplayFilename(raw: unknown, fallbackBase: string, fallbackExt: string): string {
@@ -1058,18 +1188,28 @@ function requireAdminAuth(
 }
 
 async function requireSupabaseReady(res: express.Response): Promise<SupabaseHealthDiagnostic | null> {
-  const health = await checkSupabaseHealth();
-  if (!health.configured) {
+  try {
+    const health = await checkSupabaseHealth();
+    if (!health.configured) {
+      res.status(503).json({
+        error:
+          health.issue ||
+          'Supabase PostgreSQL database and private storage buckets are not configured or unavailable.',
+        code: 'SUPABASE_UNAVAILABLE',
+        supabase: health
+      });
+      return null;
+    }
+    return health;
+  } catch (err) {
+    const msg = sanitizeSupabaseError(err);
+    clearSupabaseHealthCache();
     res.status(503).json({
-      error:
-        health.issue ||
-        'Supabase PostgreSQL database and private storage buckets are not configured or unavailable.',
-      code: 'SUPABASE_UNAVAILABLE',
-      supabase: health
+      error: `Unable to verify Supabase availability: ${msg}`,
+      code: 'SUPABASE_UNAVAILABLE'
     });
     return null;
   }
-  return health;
 }
 
 async function getAdminAuthMode(): Promise<{
@@ -1799,44 +1939,141 @@ async function startServer() {
   // ============================================================================
   app.post('/api/create-stripe-session', async (req, res) => {
     const health = await requireSupabaseReady(res);
-    if (!health) return;
+    if (!health) {
+      recordStripeCheckoutDiagnostic({
+        stage: 'config',
+        code: 'SUPABASE_UNAVAILABLE',
+        mode: 'unconfigured',
+        httpStatus: 503,
+        message: 'Supabase health check failed before starting Stripe Checkout.'
+      });
+      return;
+    }
+
+    const stripeInfo = getStripeConfig(health);
+    if (!stripeInfo.client) {
+      const code = stripeInfo.errorCode || 'STRIPE_UNAVAILABLE';
+      const errMsg = stripeInfo.error || 'Credit or Debit Card checkout is currently unavailable.';
+      recordStripeCheckoutDiagnostic({
+        stage: 'config',
+        code,
+        mode: stripeInfo.mode,
+        httpStatus: 503,
+        message: errMsg
+      });
+      return res.status(503).json({
+        error: errMsg,
+        code
+      });
+    }
+
+    const { reference } = req.body || {};
+    if (typeof reference !== 'string' || !ORDER_REF_REGEX.test(reference)) {
+      return res.status(400).json({
+        error: 'Invalid order reference.',
+        code: 'INVALID_ORDER_REFERENCE'
+      });
+    }
+
+    let order: OrderRow | null;
+    try {
+      order = await fetchOrderByReference(reference);
+    } catch (dbErr) {
+      const msg = sanitizeSupabaseError(dbErr);
+      clearSupabaseHealthCache();
+      recordStripeCheckoutDiagnostic({
+        stage: 'order_lookup',
+        code: 'SUPABASE_ORDER_LOOKUP_FAILED',
+        mode: stripeInfo.mode,
+        httpStatus: 503,
+        message: msg
+      });
+      return res.status(503).json({
+        error: 'Unable to load your saved order right now. Please try again.',
+        code: 'SUPABASE_ORDER_LOOKUP_FAILED'
+      });
+    }
+
+    if (!order) {
+      return res.status(404).json({ error: 'Saved order not found.', code: 'ORDER_NOT_FOUND' });
+    }
+    if (!isOrderAuthorized(req, order)) {
+      return res.status(403).json({
+        error: 'Valid secure order link token is required to start card checkout.',
+        code: 'ORDER_UNAUTHORIZED'
+      });
+    }
+    if (order.payment_status === 'Paid') {
+      return res.status(409).json({
+        error: 'This order is already marked as Paid.',
+        code: 'ORDER_ALREADY_PAID'
+      });
+    }
+    if (order.payment_status === 'Pending verification') {
+      return res.status(409).json({
+        error: 'A QR payment receipt is already pending verification for this order.',
+        code: 'ORDER_PENDING_VERIFICATION'
+      });
+    }
+
+    if (
+      !Number.isInteger(order.subtotal_sen) ||
+      order.subtotal_sen < 0 ||
+      !Number.isInteger(order.delivery_fee_sen) ||
+      order.delivery_fee_sen < 0 ||
+      !Number.isInteger(order.total_sen) ||
+      order.subtotal_sen + order.delivery_fee_sen !== order.total_sen ||
+      order.total_sen < 200
+    ) {
+      recordStripeCheckoutDiagnostic({
+        stage: 'config',
+        code: 'INVALID_ORDER_AMOUNT',
+        mode: stripeInfo.mode,
+        httpStatus: 400,
+        message: `Order ${order.reference} has an invalid MYR amount for Stripe Checkout.`
+      });
+      return res.status(400).json({
+        error: 'Order total is invalid for card checkout. Please contact support.',
+        code: 'INVALID_ORDER_AMOUNT'
+      });
+    }
+
+    const originInfo = resolveTrustedOriginInfo(req);
+    const tokenParam = encodeURIComponent(order.access_token);
+    const refParam = encodeURIComponent(order.reference);
+    const successUrl = `${originInfo.origin}/?payment=success&order=${refParam}&token=${tokenParam}`;
+    const cancelUrl = `${originInfo.origin}/?payment=cancelled&order=${refParam}&token=${tokenParam}`;
 
     try {
-      const stripeInfo = getStripeConfig(health);
-      if (!stripeInfo.client) {
-        return res.status(503).json({
-          error: stripeInfo.error || 'Credit or Debit Card checkout is currently unavailable.'
-        });
+      const parsedSuccess = new URL(successUrl);
+      const parsedCancel = new URL(cancelUrl);
+      if (
+        (parsedSuccess.protocol !== 'https:' && parsedSuccess.protocol !== 'http:') ||
+        (parsedCancel.protocol !== 'https:' && parsedCancel.protocol !== 'http:')
+      ) {
+        throw new Error('Redirect URLs must use https:// or http://.');
       }
+    } catch (urlErr) {
+      const msg = sanitizeSensitiveText(urlErr);
+      recordStripeCheckoutDiagnostic({
+        stage: 'redirect_url',
+        code: 'INVALID_REDIRECT_URL',
+        mode: stripeInfo.mode,
+        httpStatus: 500,
+        originSource: originInfo.source,
+        message: `Invalid Stripe redirect URL resolved from ${originInfo.source}: ${msg}`
+      });
+      return res.status(500).json({
+        error: 'Checkout redirect URL is misconfigured on the server. Please contact support.',
+        code: 'INVALID_REDIRECT_URL'
+      });
+    }
 
-      const { reference } = req.body || {};
-      if (typeof reference !== 'string' || !ORDER_REF_REGEX.test(reference)) {
-        return res.status(400).json({ error: 'Invalid order reference.' });
-      }
-
-      const order = await fetchOrderByReference(reference);
-      if (!order) {
-        return res.status(404).json({ error: 'Saved order not found.' });
-      }
-      if (!isOrderAuthorized(req, order)) {
-        return res.status(403).json({ error: 'Valid secure order link token is required to start card checkout.' });
-      }
-      if (order.payment_status === 'Paid') {
-        return res.status(409).json({ error: 'This order is already marked as Paid.' });
-      }
-      if (order.payment_status === 'Pending verification') {
-        return res.status(409).json({
-          error: 'A QR payment receipt is already pending verification for this order.'
-        });
-      }
-
-      const origin = resolveTrustedOrigin(req);
-      const tokenParam = encodeURIComponent(order.access_token);
-      const refParam = encodeURIComponent(order.reference);
-
-      const session = await stripeInfo.client.checkout.sessions.create({
+    let session: Stripe.Checkout.Session;
+    try {
+      session = await stripeInfo.client.checkout.sessions.create({
         mode: 'payment',
-        payment_method_types: ['card'],
+        allowed_payment_method_types: ['card'],
         client_reference_id: order.reference,
         customer_email: order.customer_email,
         metadata: {
@@ -1868,10 +2105,98 @@ async function startServer() {
             quantity: 1
           }
         ],
-        success_url: `${origin}/?payment=success&order=${refParam}&token=${tokenParam}`,
-        cancel_url: `${origin}/?payment=cancelled&order=${refParam}&token=${tokenParam}`
+        success_url: successUrl,
+        cancel_url: cancelUrl
+      });
+    } catch (stripeErr: any) {
+      const stripeType = typeof stripeErr?.type === 'string' ? stripeErr.type : undefined;
+      const stripeCode =
+        typeof stripeErr?.code === 'string'
+          ? stripeErr.code
+          : typeof stripeErr?.raw?.code === 'string'
+            ? stripeErr.raw.code
+            : undefined;
+      const rawMessage = sanitizeSensitiveText(stripeErr?.message || stripeErr || 'Stripe API call failed');
+
+      let httpStatus = 502;
+      let code = 'STRIPE_API_ERROR';
+      let customerError =
+        'Unable to initiate Stripe card checkout right now. You can retry or choose a QR payment method.';
+
+      if (stripeType === 'StripeAuthenticationError' || stripeErr?.statusCode === 401) {
+        httpStatus = 503;
+        code = 'STRIPE_AUTH_ERROR';
+        customerError =
+          'Card payments are temporarily unavailable due to a payment gateway credential issue. Please choose a QR payment method or contact support.';
+      } else if (stripeType === 'StripePermissionError' || stripeErr?.statusCode === 403) {
+        httpStatus = 503;
+        code = 'STRIPE_PERMISSION_ERROR';
+        customerError =
+          'Card payments are temporarily unavailable due to a payment gateway permission configuration issue. Please choose a QR payment method or contact support.';
+      } else if (
+        stripeType === 'StripeConnectionError' ||
+        stripeCode === 'ETIMEDOUT' ||
+        stripeCode === 'ECONNRESET' ||
+        stripeCode === 'ENOTFOUND' ||
+        /timeout|timed out|socket hang up|network/i.test(rawMessage)
+      ) {
+        httpStatus = 504;
+        code = 'STRIPE_CONNECTION_ERROR';
+        customerError =
+          'Could not reach Stripe Checkout right now. Please wait a moment and try again, or choose a QR payment method.';
+      } else if (stripeType === 'StripeRateLimitError' || stripeErr?.statusCode === 429) {
+        httpStatus = 429;
+        code = 'STRIPE_RATE_LIMIT';
+        customerError =
+          'Card checkout is busy right now. Please wait a few seconds and try again, or use a QR payment method.';
+      } else if (stripeType === 'StripeInvalidRequestError' || stripeErr?.statusCode === 400) {
+        httpStatus = 502;
+        code = 'STRIPE_INVALID_REQUEST';
+        customerError =
+          'Unable to start Stripe card checkout due to a checkout configuration error. Please try a QR payment method or contact support.';
+      }
+
+      const stripeParam =
+        typeof stripeErr?.param === 'string'
+          ? stripeErr.param
+          : typeof stripeErr?.raw?.param === 'string'
+            ? stripeErr.raw.param
+            : undefined;
+
+      recordStripeCheckoutDiagnostic({
+        stage: 'stripe_api',
+        code,
+        mode: stripeInfo.mode,
+        httpStatus,
+        stripeType,
+        stripeCode,
+        stripeParam,
+        originSource: originInfo.source,
+        message: rawMessage
       });
 
+      return res.status(httpStatus).json({
+        error: customerError,
+        code
+      });
+    }
+
+    if (!session?.id || !session?.url || !session.url.startsWith('https://')) {
+      recordStripeCheckoutDiagnostic({
+        stage: 'stripe_api',
+        code: 'STRIPE_MISSING_CHECKOUT_URL',
+        mode: stripeInfo.mode,
+        httpStatus: 502,
+        originSource: originInfo.source,
+        message: 'Stripe created a session without a valid HTTPS checkout URL.'
+      });
+      return res.status(502).json({
+        error: 'Stripe did not return a valid checkout URL. Please retry or choose a QR payment method.',
+        code: 'STRIPE_MISSING_CHECKOUT_URL'
+      });
+    }
+
+    try {
       await insertPaymentRow({
         order_id: order.id,
         order_reference: order.reference,
@@ -1895,18 +2220,38 @@ async function startServer() {
         rejection_reason: null,
         paid_at: null
       });
+    } catch (saveErr) {
+      const msg = sanitizeSupabaseError(saveErr);
+      recordStripeCheckoutDiagnostic({
+        stage: 'save_payment',
+        code: 'PAYMENT_RECORD_SAVE_FAILED',
+        mode: stripeInfo.mode,
+        httpStatus: 500,
+        originSource: originInfo.source,
+        message: msg
+      });
+      // Best-effort expire orphaned Stripe session so it cannot be paid without a matching DB payment row
+      void stripeInfo.client.checkout.sessions.expire(session.id).catch(() => {});
+      return res.status(500).json({
+        error:
+          'Unable to record your card checkout session in the database. Please retry or choose a QR payment method.',
+        code: 'PAYMENT_RECORD_SAVE_FAILED'
+      });
+    }
 
+    try {
       await updateOrderByReference(reference, {
         last_card_attempt_message: null
       });
-
-      return res.json({ success: true, url: session.url, mode: stripeInfo.mode });
-    } catch (err: any) {
-      console.error('Stripe session creation error:', err?.message || err);
-      return res.status(502).json({
-        error: 'Unable to initiate Stripe card checkout right now. You can retry or choose a QR payment method.'
-      });
+    } catch (orderUpdateErr) {
+      console.warn(
+        `Non-fatal warning clearing last_card_attempt_message for ${reference}:`,
+        sanitizeSupabaseError(orderUpdateErr)
+      );
     }
+
+    lastStripeCheckoutDiagnostic = null;
+    return res.json({ success: true, url: session.url, sessionId: session.id, mode: stripeInfo.mode });
   });
 
   // ============================================================================
@@ -2533,6 +2878,39 @@ async function startServer() {
       }
     }
   );
+
+  // Ensure unmatched /api/* routes always return JSON (never Vite or SPA HTML)
+  app.use('/api', (_req, res) => {
+    return res.status(404).json({
+      error: 'API endpoint not found.',
+      code: 'API_NOT_FOUND'
+    });
+  });
+
+  // Global JSON error handler for /api/* (e.g., invalid JSON body or unexpected middleware errors)
+  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (!req.path.startsWith('/api')) {
+      return next(err);
+    }
+    if (res.headersSent) {
+      return next(err);
+    }
+    const isBodyParseError = err?.type === 'entity.parse.failed' || err instanceof SyntaxError;
+    const status = isBodyParseError
+      ? 400
+      : typeof err?.status === 'number' && err.status >= 400 && err.status < 600
+        ? err.status
+        : typeof err?.statusCode === 'number' && err.statusCode >= 400 && err.statusCode < 600
+          ? err.statusCode
+          : 500;
+    console.error(`API error on ${req.method} ${req.path}:`, sanitizeSensitiveText(err?.message || err));
+    return res.status(status).json({
+      error: isBodyParseError
+        ? 'Invalid JSON request payload.'
+        : 'An unexpected server error occurred. Please try again.',
+      code: isBodyParseError ? 'INVALID_JSON_BODY' : 'INTERNAL_SERVER_ERROR'
+    });
+  });
 
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({

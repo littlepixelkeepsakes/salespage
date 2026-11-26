@@ -93,6 +93,7 @@ export default function PaymentPage({
   // Stripe card checkout state
   const [cardLoading, setCardLoading] = useState(false);
   const [cardError, setCardError] = useState<string | null>(null);
+  const [stripeCheckoutUrl, setStripeCheckoutUrl] = useState<string | null>(null);
 
   // Webhook confirmation polling when returning from Stripe ?payment=success
   const [waitingForWebhook, setWaitingForWebhook] = useState(
@@ -301,31 +302,141 @@ export default function PaymentPage({
     if (!canSubmitPayment) return;
     setCardLoading(true);
     setCardError(null);
+    setStripeCheckoutUrl(null);
 
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), 25_000);
+
+    let res: Response;
     try {
-      const res = await fetch('/api/create-stripe-session', {
+      res = await fetch('/api/create-stripe-session', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          Accept: 'application/json',
           'x-order-token': order.accessToken
         },
         body: JSON.stringify({
           reference: order.reference,
           accessToken: order.accessToken
-        })
+        }),
+        signal: controller.signal
       });
-      const data = await res.json();
-      if (res.ok && data.success && data.url) {
-        window.location.assign(data.url);
+    } catch (err: any) {
+      window.clearTimeout(timeoutId);
+      if (err?.name === 'AbortError') {
+        setCardError(
+          'Connecting to Stripe Checkout timed out. Please try again or choose a QR payment method.'
+        );
       } else {
-        setCardError(data.error || 'Unable to open Stripe Checkout right now.');
-        setCardLoading(false);
-        if (res.status === 409) {
-          await onRefreshOrder();
+        setCardError(
+          'Unable to reach the payment server. Please check your internet connection and try again.'
+        );
+      }
+      setCardLoading(false);
+      return;
+    } finally {
+      window.clearTimeout(timeoutId);
+    }
+
+    let rawBody = '';
+    try {
+      rawBody = await res.text();
+    } catch {
+      setCardError(
+        'Connection was interrupted while reading the checkout response. Please try again.'
+      );
+      setCardLoading(false);
+      return;
+    }
+
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    let data: { success?: boolean; url?: string; error?: string; code?: string } | null = null;
+
+    if (rawBody.trim()) {
+      try {
+        const parsed = JSON.parse(rawBody);
+        if (parsed && typeof parsed === 'object') {
+          data = parsed as { success?: boolean; url?: string; error?: string; code?: string };
         }
+      } catch {
+        data = null;
+      }
+    }
+
+    if (!data) {
+      const looksHtml = contentType.includes('text/html') || /^\s*</.test(rawBody);
+      if (!res.ok) {
+        setCardError(
+          looksHtml
+            ? `The payment service returned an unexpected server error (HTTP ${res.status}). Please try again or choose a QR payment method.`
+            : `The payment server returned an invalid error response (HTTP ${res.status}). Please try again or choose a QR payment method.`
+        );
+      } else {
+        setCardError(
+          'Received an invalid response format from the payment server. Please try again or choose a QR payment method.'
+        );
+      }
+      setCardLoading(false);
+      return;
+    }
+
+    if (!res.ok) {
+      setCardError(
+        data.error ||
+          `Unable to start Stripe Checkout (HTTP ${res.status}). Please retry or choose a QR payment method.`
+      );
+      setCardLoading(false);
+      if (res.status === 409) {
+        await onRefreshOrder();
+      }
+      return;
+    }
+
+    if (!data.success || typeof data.url !== 'string' || !data.url.trim()) {
+      setCardError(
+        data.error ||
+          'The payment server did not return a valid Stripe Checkout link. Please try again or choose a QR payment method.'
+      );
+      setCardLoading(false);
+      return;
+    }
+
+    let checkoutUrl: URL;
+    try {
+      checkoutUrl = new URL(data.url);
+      if (checkoutUrl.protocol !== 'https:') {
+        throw new Error('Checkout URL must use HTTPS.');
       }
     } catch {
-      setCardError('Network error while connecting to Stripe Checkout. Please try again.');
+      setCardError(
+        'Received an invalid Stripe Checkout redirect link from the server. Please try again or choose a QR payment method.'
+      );
+      setCardLoading(false);
+      return;
+    }
+
+    const isEmbeddedFrame = (() => {
+      try {
+        return window.self !== window.top;
+      } catch {
+        return true;
+      }
+    })();
+
+    if (isEmbeddedFrame) {
+      setStripeCheckoutUrl(checkoutUrl.toString());
+      setCardLoading(false);
+      return;
+    }
+
+    try {
+      window.location.assign(checkoutUrl.toString());
+    } catch {
+      setStripeCheckoutUrl(checkoutUrl.toString());
+      setCardError(
+        'Automatic redirect was blocked by your browser. Click the button below to continue to Stripe Checkout.'
+      );
       setCardLoading(false);
     }
   };
@@ -1111,19 +1222,36 @@ export default function PaymentPage({
                     </div>
                   )}
 
-                  <button
-                    type="button"
-                    disabled={cardLoading}
-                    onClick={handleStartStripeCheckout}
-                    className="w-full py-3.5 px-6 rounded-xl bg-[#FF8D76] text-[#14233C] font-extrabold text-sm hover:bg-[#ff7b60] disabled:opacity-60 disabled:cursor-not-allowed transition-colors flex items-center justify-center gap-2"
-                  >
-                    <CreditCard className="w-4 h-4" />
-                    <span>
-                      {cardLoading
-                        ? 'Opening Stripe Checkout…'
-                        : `Pay ${formatRM(order.totalSen)} with Card`}
-                    </span>
-                  </button>
+                  {stripeCheckoutUrl ? (
+                    <div className="space-y-2.5">
+                      <a
+                        href={stripeCheckoutUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="w-full py-3.5 px-6 rounded-xl bg-[#FF8D76] text-[#14233C] font-extrabold text-sm hover:bg-[#ff7b60] transition-colors flex items-center justify-center gap-2"
+                      >
+                        <CreditCard className="w-4 h-4" />
+                        <span>Continue to Stripe Checkout ({formatRM(order.totalSen)})</span>
+                      </a>
+                      <p className="text-[11px] text-center text-[#14233C]/70">
+                        Your Stripe Checkout session is ready and will open in a secure top-level tab.
+                      </p>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={cardLoading}
+                      onClick={handleStartStripeCheckout}
+                      className="w-full py-3.5 px-6 rounded-xl bg-[#FF8D76] text-[#14233C] font-extrabold text-sm hover:bg-[#ff7b60] disabled:opacity-60 disabled:cursor-not-allowed transition-colors flex items-center justify-center gap-2"
+                    >
+                      <CreditCard className="w-4 h-4" />
+                      <span>
+                        {cardLoading
+                          ? 'Opening Stripe Checkout…'
+                          : `Pay ${formatRM(order.totalSen)} with Card`}
+                      </span>
+                    </button>
+                  )}
 
                   <p className="text-[11px] text-[#14233C]/60 flex items-center justify-center gap-1.5">
                     <Lock className="w-3.5 h-3.5 shrink-0" />
