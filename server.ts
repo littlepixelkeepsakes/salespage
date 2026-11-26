@@ -6,20 +6,82 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import Stripe from 'stripe';
+import nodemailer from 'nodemailer';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Private storage directories (strictly outside public/ and dist/)
-const privateStorageDir = path.resolve(__dirname, 'private_storage');
+const DELIVERY_PROMISE_TEXT =
+  'Your order will be delivered within 14 days after your payment is confirmed and we receive a usable photo.';
+const PAID_CONFIRMATION_HEADING = 'Thank you! Your order is confirmed.';
+
+// Public & private directories (private storage must remain strictly outside public/ and dist/)
+const publicDir = path.resolve(__dirname, 'public');
+const distDir = path.resolve(__dirname, 'dist');
+const publicUploadsDir = path.resolve(publicDir, 'uploads');
+const publicPaymentsDir = path.resolve(publicDir, 'payments');
+
+const configuredPrivateDir = (process.env.PRIVATE_STORAGE_DIR || '').trim();
+const privateStorageDir = configuredPrivateDir
+  ? path.resolve(__dirname, configuredPrivateDir)
+  : path.resolve(__dirname, 'private_storage');
 const privateReceiptsDir = path.resolve(privateStorageDir, 'receipts');
 const storeFilePath = path.resolve(privateStorageDir, 'store.json');
-const publicUploadsDir = path.resolve(__dirname, 'public/uploads');
-const publicPaymentsDir = path.resolve(__dirname, 'public/payments');
 
-for (const dir of [privateStorageDir, privateReceiptsDir, publicUploadsDir]) {
+function isStrictlyOutsidePublicDirs(targetPath: string): boolean {
+  const normalized = path.resolve(targetPath);
+  const insidePublic = normalized === publicDir || normalized.startsWith(publicDir + path.sep);
+  const insideDist = normalized === distDir || normalized.startsWith(distDir + path.sep);
+  return !insidePublic && !insideDist;
+}
+
+for (const dir of [publicUploadsDir, publicPaymentsDir]) {
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
+  }
+}
+
+if (isStrictlyOutsidePublicDirs(privateStorageDir)) {
+  for (const dir of [privateStorageDir, privateReceiptsDir]) {
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+  }
+}
+
+function checkPrivateStorageHealth(): {
+  configured: boolean;
+  outsidePublic: boolean;
+  writable: boolean;
+  issue?: string;
+} {
+  const outsidePublic =
+    isStrictlyOutsidePublicDirs(privateStorageDir) && isStrictlyOutsidePublicDirs(privateReceiptsDir);
+  if (!outsidePublic) {
+    return {
+      configured: false,
+      outsidePublic: false,
+      writable: false,
+      issue: 'PRIVATE_STORAGE_DIR must point outside public/ and dist/ so receipts stay private.'
+    };
+  }
+  try {
+    if (!fs.existsSync(privateStorageDir)) {
+      fs.mkdirSync(privateStorageDir, { recursive: true });
+    }
+    if (!fs.existsSync(privateReceiptsDir)) {
+      fs.mkdirSync(privateReceiptsDir, { recursive: true });
+    }
+    fs.accessSync(privateStorageDir, fs.constants.R_OK | fs.constants.W_OK);
+    fs.accessSync(privateReceiptsDir, fs.constants.R_OK | fs.constants.W_OK);
+    return { configured: true, outsidePublic: true, writable: true };
+  } catch {
+    return {
+      configured: false,
+      outsidePublic: true,
+      writable: false,
+      issue: 'Private storage directory is not writable on the server.'
+    };
   }
 }
 
@@ -32,32 +94,114 @@ const PRODUCT_CONFIG: Record<string, { name: string; priceSen: number; regularSe
   bundle_2_magnets: { name: '2-Piece Bundle (2 Fridge Magnets)', priceSen: 5104, regularSen: 6380 }
 };
 
-// Configurable delivery rates by region / state (in integer sen)
-const DELIVERY_RATES: Record<string, { zone: string; rateSen: number }> = {
-  'johor': { zone: 'Peninsular Malaysia', rateSen: 800 },
-  'kedah': { zone: 'Peninsular Malaysia', rateSen: 800 },
-  'kelantan': { zone: 'Peninsular Malaysia', rateSen: 800 },
-  'melaka': { zone: 'Peninsular Malaysia', rateSen: 800 },
-  'negeri sembilan': { zone: 'Peninsular Malaysia', rateSen: 800 },
-  'pahang': { zone: 'Peninsular Malaysia', rateSen: 800 },
-  'perak': { zone: 'Peninsular Malaysia', rateSen: 800 },
-  'perlis': { zone: 'Peninsular Malaysia', rateSen: 800 },
-  'penang': { zone: 'Peninsular Malaysia', rateSen: 800 },
-  'pulau pinang': { zone: 'Peninsular Malaysia', rateSen: 800 },
-  'selangor': { zone: 'Peninsular Malaysia', rateSen: 800 },
-  'terengganu': { zone: 'Peninsular Malaysia', rateSen: 800 },
-  'kuala lumpur': { zone: 'Peninsular Malaysia', rateSen: 800 },
-  'putrajaya': { zone: 'Peninsular Malaysia', rateSen: 800 },
-  'sabah': { zone: 'Sabah & Sarawak', rateSen: 1500 },
-  'sarawak': { zone: 'Sabah & Sarawak', rateSen: 1500 },
-  'labuan': { zone: 'Sabah & Sarawak', rateSen: 1500 }
-};
+const PENINSULAR_STATES = new Set([
+  'johor',
+  'kedah',
+  'kelantan',
+  'melaka',
+  'negeri sembilan',
+  'pahang',
+  'perak',
+  'perlis',
+  'penang',
+  'pulau pinang',
+  'selangor',
+  'terengganu',
+  'kuala lumpur',
+  'putrajaya'
+]);
+
+const EAST_MALAYSIA_STATES = new Set(['sabah', 'sarawak', 'labuan']);
 
 const ORDER_REF_REGEX = /^LPK-\d{4}-[A-Z0-9]{6,10}$/;
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024; // 10 MB
 const ADMIN_SESSION_TTL_MS = 8 * 60 * 60 * 1000; // 8 hours
 const LOGIN_WINDOW_MS = 15 * 60 * 1000; // 15 min
 const MAX_LOGIN_ATTEMPTS = 10;
+
+interface StoreGalleryImage {
+  id: string;
+  category: string;
+  title: string;
+  description: string;
+  image: string;
+  tag: string;
+}
+
+interface EditableStoreSettings {
+  logoUrl: string;
+  heroImageUrl: string;
+  productImages: {
+    keychain: string;
+    magnet: string;
+    bundle: string;
+  };
+  galleryItems: StoreGalleryImage[];
+  deliveryRatesSen: {
+    peninsular: number;
+    eastMalaysia: number;
+  };
+  whatsappSupportNumber: string;
+  qrOverrides: {
+    tng: {
+      enabled: boolean | null;
+      recipientName: string;
+      qrImage: string;
+    };
+    duitnow: {
+      enabled: boolean | null;
+      recipientName: string;
+      qrImage: string;
+    };
+  };
+}
+
+function getDefaultStoreSettings(): EditableStoreSettings {
+  return {
+    logoUrl: '/assets/aistudio/Beaded_heart_keepsakes_logo_4fef68e3.png',
+    heroImageUrl: '/src/assets/images/hero_bead_art_showcase_1795515646405.jpg',
+    productImages: {
+      keychain: '/src/assets/images/pet_bead_art_1795515646980.jpg',
+      magnet: '/src/assets/images/couple_bead_art_1795515653017.jpg',
+      bundle: '/src/assets/images/family_bead_art_1795515653155.jpg'
+    },
+    galleryItems: [
+      {
+        id: 'pet',
+        category: 'Pet Portrait',
+        title: 'Golden Retriever Buddy',
+        description: 'Turned from a smartphone portrait into a vibrant beaded keychain.',
+        image: '/src/assets/images/pet_bead_art_1795515646980.jpg',
+        tag: 'Popular'
+      },
+      {
+        id: 'couple',
+        category: 'Couple Keepsake',
+        title: 'Anniversary Memory',
+        description: 'Crafted into a charming fridge magnet with pastel cloud and heart details.',
+        image: '/src/assets/images/couple_bead_art_1795515653017.jpg',
+        tag: 'Best Seller'
+      },
+      {
+        id: 'family',
+        category: 'Family Portrait',
+        title: 'Weekend Family Outing',
+        description: 'Detailed multi-person pixel bead art keepsake mounted in a wooden frame.',
+        image: '/src/assets/images/family_bead_art_1795515653155.jpg',
+        tag: 'Special Gift'
+      }
+    ],
+    deliveryRatesSen: {
+      peninsular: 800,
+      eastMalaysia: 1500
+    },
+    whatsappSupportNumber: (process.env.WHATSAPP_SUPPORT_NUMBER || '').replace(/\D/g, ''),
+    qrOverrides: {
+      tng: { enabled: null, recipientName: '', qrImage: '' },
+      duitnow: { enabled: null, recipientName: '', qrImage: '' }
+    }
+  };
+}
 
 interface PrivateReceiptRecord {
   id: string;
@@ -68,8 +212,15 @@ interface PrivateReceiptRecord {
   uploadedAt: string;
 }
 
+type PaymentStatus =
+  | 'Awaiting payment'
+  | 'Pending verification'
+  | 'Receipt correction needed'
+  | 'Paid';
+
 interface OrderRecord {
   reference: string;
+  accessToken: string;
   productId: string;
   bundleId?: string;
   productName: string;
@@ -89,7 +240,7 @@ interface OrderRecord {
     city: string;
     state: string;
   };
-  paymentStatus: 'Awaiting payment' | 'Pending verification' | 'Paid';
+  paymentStatus: PaymentStatus;
   paymentMethod?: 'tng' | 'duitnow' | 'card' | null;
   transactionReference?: string;
   privateReceipt?: PrivateReceiptRecord;
@@ -99,7 +250,13 @@ interface OrderRecord {
   paidAt?: string;
   verifiedByStaff?: boolean;
   verificationNote?: string;
+  correctionReason?: string;
   lastCardAttemptMessage?: string;
+  confirmationEmailStatus?: 'sent' | 'not_configured' | 'failed' | null;
+  confirmationEmailSentAt?: string;
+  confirmationEmailId?: string;
+  confirmationEmailError?: string;
+  confirmationEmailLastAttemptAt?: string;
   createdAt: string;
 }
 
@@ -113,24 +270,133 @@ interface PersistedStoreData {
   orders: Record<string, OrderRecord>;
   processedStripeEvents: string[];
   adminCredential?: AdminCredentialHash;
+  storeSettings?: EditableStoreSettings;
 }
 
 const ordersStore: Map<string, OrderRecord> = new Map();
 const processedStripeEvents: Set<string> = new Set();
+const inFlightConfirmationEmails: Set<string> = new Set();
 let claimedAdminCredential: AdminCredentialHash | null = null;
+let storeSettings: EditableStoreSettings = getDefaultStoreSettings();
 
 // In-memory admin sessions & login rate-limiting
 const adminSessions: Map<string, { expiresAt: number }> = new Map();
 const failedLoginTracker: Map<string, { count: number; resetAt: number }> = new Map();
+
+function mergeStoreSettings(saved?: Partial<EditableStoreSettings>): EditableStoreSettings {
+  const defaults = getDefaultStoreSettings();
+  if (!saved || typeof saved !== 'object') return defaults;
+  return {
+    logoUrl: typeof saved.logoUrl === 'string' && saved.logoUrl.trim() ? saved.logoUrl.trim() : defaults.logoUrl,
+    heroImageUrl:
+      typeof saved.heroImageUrl === 'string' && saved.heroImageUrl.trim()
+        ? saved.heroImageUrl.trim()
+        : defaults.heroImageUrl,
+    productImages: {
+      keychain:
+        typeof saved.productImages?.keychain === 'string' && saved.productImages.keychain.trim()
+          ? saved.productImages.keychain.trim()
+          : defaults.productImages.keychain,
+      magnet:
+        typeof saved.productImages?.magnet === 'string' && saved.productImages.magnet.trim()
+          ? saved.productImages.magnet.trim()
+          : defaults.productImages.magnet,
+      bundle:
+        typeof saved.productImages?.bundle === 'string' && saved.productImages.bundle.trim()
+          ? saved.productImages.bundle.trim()
+          : defaults.productImages.bundle
+    },
+    galleryItems:
+      Array.isArray(saved.galleryItems) && saved.galleryItems.length > 0
+        ? saved.galleryItems.slice(0, 6).map((item, idx) => {
+            const fallback = defaults.galleryItems[idx] || defaults.galleryItems[0];
+            return {
+              id: typeof item?.id === 'string' && item.id.trim() ? item.id.trim() : fallback.id,
+              category:
+                typeof item?.category === 'string' && item.category.trim()
+                  ? item.category.trim().slice(0, 60)
+                  : fallback.category,
+              title:
+                typeof item?.title === 'string' && item.title.trim()
+                  ? item.title.trim().slice(0, 80)
+                  : fallback.title,
+              description:
+                typeof item?.description === 'string' && item.description.trim()
+                  ? item.description.trim().slice(0, 240)
+                  : fallback.description,
+              image:
+                typeof item?.image === 'string' && item.image.trim()
+                  ? item.image.trim()
+                  : fallback.image,
+              tag:
+                typeof item?.tag === 'string' && item.tag.trim()
+                  ? item.tag.trim().slice(0, 40)
+                  : fallback.tag
+            };
+          })
+        : defaults.galleryItems,
+    deliveryRatesSen: {
+      peninsular:
+        typeof saved.deliveryRatesSen?.peninsular === 'number' &&
+        Number.isInteger(saved.deliveryRatesSen.peninsular) &&
+        saved.deliveryRatesSen.peninsular >= 0
+          ? saved.deliveryRatesSen.peninsular
+          : defaults.deliveryRatesSen.peninsular,
+      eastMalaysia:
+        typeof saved.deliveryRatesSen?.eastMalaysia === 'number' &&
+        Number.isInteger(saved.deliveryRatesSen.eastMalaysia) &&
+        saved.deliveryRatesSen.eastMalaysia >= 0
+          ? saved.deliveryRatesSen.eastMalaysia
+          : defaults.deliveryRatesSen.eastMalaysia
+    },
+    whatsappSupportNumber:
+      typeof saved.whatsappSupportNumber === 'string'
+        ? saved.whatsappSupportNumber.replace(/\D/g, '').slice(0, 20)
+        : defaults.whatsappSupportNumber,
+    qrOverrides: {
+      tng: {
+        enabled:
+          typeof saved.qrOverrides?.tng?.enabled === 'boolean' ? saved.qrOverrides.tng.enabled : null,
+        recipientName:
+          typeof saved.qrOverrides?.tng?.recipientName === 'string'
+            ? saved.qrOverrides.tng.recipientName.trim().slice(0, 140)
+            : '',
+        qrImage:
+          typeof saved.qrOverrides?.tng?.qrImage === 'string'
+            ? saved.qrOverrides.tng.qrImage.trim()
+            : ''
+      },
+      duitnow: {
+        enabled:
+          typeof saved.qrOverrides?.duitnow?.enabled === 'boolean'
+            ? saved.qrOverrides.duitnow.enabled
+            : null,
+        recipientName:
+          typeof saved.qrOverrides?.duitnow?.recipientName === 'string'
+            ? saved.qrOverrides.duitnow.recipientName.trim().slice(0, 140)
+            : '',
+        qrImage:
+          typeof saved.qrOverrides?.duitnow?.qrImage === 'string'
+            ? saved.qrOverrides.duitnow.qrImage.trim()
+            : ''
+      }
+    }
+  };
+}
 
 function loadStoreFromDisk(): void {
   try {
     if (!fs.existsSync(storeFilePath)) return;
     const raw = fs.readFileSync(storeFilePath, 'utf-8');
     const parsed = JSON.parse(raw) as Partial<PersistedStoreData>;
+    let migrated = false;
     if (parsed.orders && typeof parsed.orders === 'object') {
       for (const [ref, record] of Object.entries(parsed.orders)) {
         if (record && typeof record.reference === 'string') {
+          if (!record.accessToken || typeof record.accessToken !== 'string') {
+            record.accessToken = crypto.randomBytes(24).toString('base64url');
+            migrated = true;
+          }
           ordersStore.set(ref, record);
         }
       }
@@ -147,16 +413,27 @@ function loadStoreFromDisk(): void {
     ) {
       claimedAdminCredential = parsed.adminCredential;
     }
+    if (parsed.storeSettings) {
+      storeSettings = mergeStoreSettings(parsed.storeSettings);
+    }
+    if (migrated) {
+      saveStoreToDisk();
+    }
   } catch (err) {
     console.error('Failed to load persisted store from disk:', err);
   }
 }
 
 function saveStoreToDisk(): void {
+  const storageHealth = checkPrivateStorageHealth();
+  if (!storageHealth.configured) {
+    throw new Error(storageHealth.issue || 'Private storage is not writable.');
+  }
   const payload: PersistedStoreData = {
     orders: Object.fromEntries(ordersStore.entries()),
     processedStripeEvents: Array.from(processedStripeEvents.values()),
-    adminCredential: claimedAdminCredential ?? undefined
+    adminCredential: claimedAdminCredential ?? undefined,
+    storeSettings
   };
   const tempPath = `${storeFilePath}.${crypto.randomBytes(6).toString('hex')}.tmp`;
   fs.writeFileSync(tempPath, JSON.stringify(payload, null, 2), 'utf-8');
@@ -176,6 +453,30 @@ function safeEqualStrings(a: string, b: string): boolean {
   const bufB = Buffer.from(b, 'utf-8');
   if (bufA.length !== bufB.length) return false;
   return crypto.timingSafeEqual(bufA, bufB);
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function formatRM(sen: number): string {
+  return `RM ${(sen / 100).toFixed(2)}`;
+}
+
+function getDeliveryConfigForState(state: string): { zone: string; rateSen: number } | null {
+  const normalized = state.trim().toLowerCase();
+  if (PENINSULAR_STATES.has(normalized)) {
+    return { zone: 'Peninsular Malaysia', rateSen: storeSettings.deliveryRatesSen.peninsular };
+  }
+  if (EAST_MALAYSIA_STATES.has(normalized)) {
+    return { zone: 'Sabah & Sarawak', rateSen: storeSettings.deliveryRatesSen.eastMalaysia };
+  }
+  return null;
 }
 
 function getAdminAuthMode(): 'env' | 'claimed' | 'bootstrap_required' {
@@ -214,6 +515,7 @@ function getPaymentMethodDisplayLabel(method?: 'tng' | 'duitnow' | 'card' | null
 function toPublicOrder(order: OrderRecord) {
   return {
     reference: order.reference,
+    accessToken: order.accessToken,
     productId: order.productId,
     bundleId: order.bundleId,
     productName: order.productName,
@@ -236,16 +538,44 @@ function toPublicOrder(order: OrderRecord) {
     paidAt: order.paidAt,
     verifiedByStaff: Boolean(order.verifiedByStaff),
     verificationNote: order.verificationNote,
+    correctionReason: order.correctionReason,
     lastCardAttemptMessage: order.lastCardAttemptMessage,
+    confirmationEmailStatus: order.confirmationEmailStatus ?? null,
+    confirmationEmailSentAt: order.confirmationEmailSentAt,
     createdAt: order.createdAt
   };
 }
 
-// Validate that a QR image path is an existing local asset (/payments/, /assets/, /src/assets/) or an https:// URL
-function validateQrImageSource(qrImage: string): { valid: boolean; normalizedUrl?: string; reason?: string } {
-  const trimmed = qrImage.trim();
+// Admin order serializer: includes sanitized email delivery error details for authorised staff only
+function toAdminOrder(order: OrderRecord) {
+  return {
+    ...toPublicOrder(order),
+    confirmationEmailError: order.confirmationEmailError,
+    confirmationEmailLastAttemptAt: order.confirmationEmailLastAttemptAt
+  };
+}
+
+function extractOrderToken(req: express.Request): string {
+  const headerToken = typeof req.headers['x-order-token'] === 'string' ? req.headers['x-order-token'] : '';
+  const queryToken = typeof req.query.token === 'string' ? req.query.token : '';
+  const bodyToken = typeof req.body?.accessToken === 'string' ? req.body.accessToken : '';
+  return (headerToken || queryToken || bodyToken).trim();
+}
+
+function isOrderAuthorized(req: express.Request, order: OrderRecord): boolean {
+  const token = extractOrderToken(req);
+  if (!token || !order.accessToken) return false;
+  return safeEqualStrings(token, order.accessToken);
+}
+
+// Validate that an asset/QR image path is an existing local asset (/payments/, /uploads/, /assets/, /src/assets/) or an https:// URL
+function validateImageSource(
+  rawUrl: string,
+  allowedPrefixes: Array<'/payments/' | '/uploads/' | '/assets/' | '/src/assets/'>
+): { valid: boolean; normalizedUrl?: string; reason?: string } {
+  const trimmed = rawUrl.trim();
   if (!trimmed) {
-    return { valid: false, reason: 'QR image path is empty.' };
+    return { valid: false, reason: 'Image path is empty.' };
   }
   if (trimmed.startsWith('https://')) {
     try {
@@ -253,66 +583,64 @@ function validateQrImageSource(qrImage: string): { valid: boolean; normalizedUrl
       if (parsed.protocol === 'https:') {
         return { valid: true, normalizedUrl: trimmed };
       }
-      return { valid: false, reason: 'QR image URL must use https://.' };
+      return { valid: false, reason: 'Image URL must use https://.' };
     } catch {
-      return { valid: false, reason: 'QR image URL is not a valid URL.' };
+      return { valid: false, reason: 'Image URL is not a valid URL.' };
     }
   }
 
-  // Normalize common local public/ prefixes (e.g. "payments/..." or "/public/payments/...")
   let normalized = trimmed;
-  if (normalized.startsWith('/public/payments/')) {
-    normalized = normalized.slice('/public'.length);
-  } else if (normalized.startsWith('public/payments/')) {
-    normalized = '/' + normalized.slice('public/'.length);
-  } else if (normalized.startsWith('payments/')) {
-    normalized = '/' + normalized;
-  } else if (normalized.startsWith('/public/assets/')) {
-    normalized = normalized.slice('/public'.length);
-  } else if (normalized.startsWith('public/assets/')) {
-    normalized = '/' + normalized.slice('public/'.length);
-  } else if (normalized.startsWith('assets/')) {
-    normalized = '/' + normalized;
-  } else if (normalized.startsWith('src/assets/')) {
-    normalized = '/' + normalized;
+  if (normalized.startsWith('/public/payments/')) normalized = normalized.slice('/public'.length);
+  else if (normalized.startsWith('public/payments/')) normalized = '/' + normalized.slice('public/'.length);
+  else if (normalized.startsWith('payments/')) normalized = '/' + normalized;
+  else if (normalized.startsWith('/public/uploads/')) normalized = normalized.slice('/public'.length);
+  else if (normalized.startsWith('public/uploads/')) normalized = '/' + normalized.slice('public/'.length);
+  else if (normalized.startsWith('uploads/')) normalized = '/' + normalized;
+  else if (normalized.startsWith('/public/assets/')) normalized = normalized.slice('/public'.length);
+  else if (normalized.startsWith('public/assets/')) normalized = '/' + normalized.slice('public/'.length);
+  else if (normalized.startsWith('assets/')) normalized = '/' + normalized;
+  else if (normalized.startsWith('src/assets/')) normalized = '/' + normalized;
+
+  const prefixToDir: Record<string, string> = {
+    '/payments/': publicPaymentsDir,
+    '/uploads/': publicUploadsDir,
+    '/assets/': path.resolve(publicDir, 'assets'),
+    '/src/assets/': path.resolve(__dirname, 'src/assets')
+  };
+
+  for (const prefix of allowedPrefixes) {
+    if (normalized.startsWith(prefix)) {
+      const baseDir = prefixToDir[prefix];
+      const resolved =
+        prefix === '/src/assets/'
+          ? path.resolve(__dirname, normalized.slice(1))
+          : path.resolve(publicDir, normalized.slice(1));
+      if (!resolved.startsWith(baseDir + path.sep)) {
+        return { valid: false, reason: `Image path escapes ${prefix}.` };
+      }
+      if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
+        return { valid: false, reason: `Image file not found at ${normalized}.` };
+      }
+      return { valid: true, normalizedUrl: normalized };
+    }
   }
 
-  if (normalized.startsWith('/payments/')) {
-    const resolved = path.resolve(__dirname, 'public', normalized.slice(1));
-    if (!resolved.startsWith(publicPaymentsDir + path.sep)) {
-      return { valid: false, reason: 'QR image path escapes /payments/.' };
-    }
-    if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
-      return { valid: false, reason: `QR image file not found at ${normalized}.` };
-    }
-    return { valid: true, normalizedUrl: normalized };
-  }
-  if (normalized.startsWith('/assets/')) {
-    const resolved = path.resolve(__dirname, 'public', normalized.slice(1));
-    const allowedDir = path.resolve(__dirname, 'public/assets');
-    if (!resolved.startsWith(allowedDir + path.sep)) {
-      return { valid: false, reason: 'QR image path escapes /assets/.' };
-    }
-    if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
-      return { valid: false, reason: `QR image file not found at ${normalized}.` };
-    }
-    return { valid: true, normalizedUrl: normalized };
-  }
-  if (normalized.startsWith('/src/assets/')) {
-    const resolved = path.resolve(__dirname, normalized.slice(1));
-    const allowedDir = path.resolve(__dirname, 'src/assets');
-    if (!resolved.startsWith(allowedDir + path.sep)) {
-      return { valid: false, reason: 'QR image path escapes /src/assets/.' };
-    }
-    if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
-      return { valid: false, reason: `QR image file not found at ${normalized}.` };
-    }
-    return { valid: true, normalizedUrl: normalized };
-  }
   return {
     valid: false,
-    reason: 'QR image must be a local path under /payments/, /assets/, /src/assets/, or an https:// URL.'
+    reason: `Image must be a local path under ${allowedPrefixes.join(', ')} or an https:// URL.`
   };
+}
+
+function validateQrImageSource(qrImage: string): { valid: boolean; normalizedUrl?: string; reason?: string } {
+  return validateImageSource(qrImage, ['/payments/', '/assets/', '/src/assets/']);
+}
+
+function validateStorefrontAssetSource(imagePath: string): {
+  valid: boolean;
+  normalizedUrl?: string;
+  reason?: string;
+} {
+  return validateImageSource(imagePath, ['/uploads/', '/assets/', '/src/assets/', '/payments/']);
 }
 
 interface ConfiguredQrMethod {
@@ -347,23 +675,35 @@ function evaluateQrMethod(opts: {
   enabledEnv?: string;
   recipientEnv?: string;
   imageEnv?: string;
+  override: { enabled: boolean | null; recipientName: string; qrImage: string };
+  privateStorageReady: boolean;
+  privateStorageIssue?: string;
 }): QrMethodEvaluation {
   const issues: string[] = [];
 
-  const rawEnabled = (opts.enabledEnv ?? '').trim().toLowerCase();
   let enabled = false;
-  if (!rawEnabled) {
-    issues.push(`${opts.enabledVarName} is missing or empty. Set to true to enable.`);
-  } else if (rawEnabled === 'true' || rawEnabled === '1' || rawEnabled === 'yes') {
-    enabled = true;
-  } else if (rawEnabled === 'false' || rawEnabled === '0' || rawEnabled === 'no') {
-    issues.push(`${opts.enabledVarName} is disabled (${opts.enabledEnv?.trim()}).`);
+  if (typeof opts.override.enabled === 'boolean') {
+    enabled = opts.override.enabled;
+    if (!enabled) {
+      issues.push(`${opts.label} is disabled in Admin Settings.`);
+    }
   } else {
-    issues.push(`${opts.enabledVarName} has invalid boolean value "${opts.enabledEnv?.trim()}". Use true or false.`);
+    const rawEnabled = (opts.enabledEnv ?? '').trim().toLowerCase();
+    if (!rawEnabled) {
+      issues.push(`${opts.enabledVarName} is missing or empty. Set to true to enable.`);
+    } else if (rawEnabled === 'true' || rawEnabled === '1' || rawEnabled === 'yes') {
+      enabled = true;
+    } else if (rawEnabled === 'false' || rawEnabled === '0' || rawEnabled === 'no') {
+      issues.push(`${opts.enabledVarName} is disabled (${opts.enabledEnv?.trim()}).`);
+    } else {
+      issues.push(
+        `${opts.enabledVarName} has invalid boolean value "${opts.enabledEnv?.trim()}". Use true or false.`
+      );
+    }
   }
 
-  const recipientName = (opts.recipientEnv ?? '').trim();
-  const rawQrImage = (opts.imageEnv ?? '').trim();
+  const recipientName = (opts.override.recipientName || opts.recipientEnv || '').trim();
+  const rawQrImage = (opts.override.qrImage || opts.imageEnv || '').trim();
   let resolvedQrImage = rawQrImage;
 
   if (!recipientName) {
@@ -379,6 +719,10 @@ function evaluateQrMethod(opts: {
     } else if (imgCheck.normalizedUrl) {
       resolvedQrImage = imgCheck.normalizedUrl;
     }
+  }
+
+  if (!opts.privateStorageReady) {
+    issues.push(opts.privateStorageIssue || 'Private receipt storage is not configured.');
   }
 
   const configured = enabled && issues.length === 0;
@@ -406,22 +750,26 @@ function evaluateQrMethod(opts: {
   };
 }
 
-function getStripeConfig(): { client: Stripe | null; mode: 'test' | 'live' | 'unconfigured'; error?: string } {
+function getStripeConfig(): {
+  client: Stripe | null;
+  mode: 'test' | 'live' | 'unconfigured';
+  webhookConfigured: boolean;
+  livePaymentsEnabled: boolean;
+  error?: string;
+} {
   const secretKey = (process.env.STRIPE_SECRET_KEY || '').trim();
+  const webhookSecret = (process.env.STRIPE_WEBHOOK_SECRET || '').trim();
+  const webhookConfigured = webhookSecret.length > 0;
+  const livePaymentsEnabled = (process.env.ENABLE_LIVE_PAYMENTS || '').trim().toLowerCase() === 'true';
+  const storageHealth = checkPrivateStorageHealth();
+
   if (!secretKey) {
     return {
       client: null,
       mode: 'unconfigured',
-      error: 'Stripe test mode is not configured yet. Add STRIPE_SECRET_KEY (sk_test_...) on the server to enable card payments.'
-    };
-  }
-
-  const isProduction = process.env.NODE_ENV === 'production';
-  if (!isProduction && secretKey.startsWith('sk_live_')) {
-    return {
-      client: null,
-      mode: 'live',
-      error: 'Live Stripe keys are blocked during development. Please configure a Stripe test secret key (sk_test_...).'
+      webhookConfigured,
+      livePaymentsEnabled,
+      error: 'Add STRIPE_SECRET_KEY (sk_test_...) on the server to enable card payments.'
     };
   }
 
@@ -434,17 +782,137 @@ function getStripeConfig(): { client: Stripe | null; mode: 'test' | 'live' | 'un
     return {
       client: null,
       mode: 'unconfigured',
+      webhookConfigured,
+      livePaymentsEnabled,
       error: 'Invalid STRIPE_SECRET_KEY format configured on the server.'
     };
   }
 
-  const mode = secretKey.includes('_test_') ? 'test' : 'live';
+  const isLiveKey = secretKey.includes('_live_');
+  const mode: 'test' | 'live' = isLiveKey ? 'live' : 'test';
+
+  if (!storageHealth.configured) {
+    return {
+      client: null,
+      mode,
+      webhookConfigured,
+      livePaymentsEnabled,
+      error: storageHealth.issue || 'Private storage must be configured before enabling payments.'
+    };
+  }
+
+  if (isLiveKey) {
+    if (!livePaymentsEnabled) {
+      return {
+        client: null,
+        mode: 'live',
+        webhookConfigured,
+        livePaymentsEnabled,
+        error: 'Live Stripe payments stay disabled until ENABLE_LIVE_PAYMENTS=true is explicitly set.'
+      };
+    }
+    if (!webhookConfigured) {
+      return {
+        client: null,
+        mode: 'live',
+        webhookConfigured,
+        livePaymentsEnabled,
+        error: 'Live Stripe payments stay disabled until STRIPE_WEBHOOK_SECRET is configured.'
+      };
+    }
+  }
+
   const client = new Stripe(secretKey);
-  return { client, mode };
+  return {
+    client,
+    mode,
+    webhookConfigured,
+    livePaymentsEnabled,
+    error: !webhookConfigured
+      ? 'STRIPE_WEBHOOK_SECRET is not set yet (required for automatic webhook confirmation).'
+      : undefined
+  };
+}
+
+function isValidEmailFromHeader(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > 254 || /[\r\n]/.test(trimmed)) return false;
+  return /[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+/.test(trimmed);
+}
+
+function sanitizeEmailError(raw: unknown): string {
+  const text = String(raw || 'Email delivery failed')
+    .replace(/Bearer\s+\S+/gi, 'Bearer [REDACTED]')
+    .replace(/\bre_[A-Za-z0-9_-]{8,}\b/g, '[REDACTED_KEY]')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return (text || 'Email delivery failed').slice(0, 240);
+}
+
+function getEmailConfig(): {
+  configured: boolean;
+  provider: 'resend' | 'smtp' | 'none';
+  fromAddress: string | null;
+  issue?: string;
+} {
+  const fromAddress = (process.env.EMAIL_FROM || '').trim();
+  const hasValidFrom = isValidEmailFromHeader(fromAddress);
+  const resendKey = (process.env.RESEND_API_KEY || '').trim();
+  const explicitProvider = (process.env.EMAIL_PROVIDER || '').trim().toLowerCase();
+
+  // Primary provider: Resend API (SMTP variables are completely ignored when Resend is selected)
+  if (resendKey || explicitProvider === 'resend') {
+    if (!resendKey) {
+      return {
+        configured: false,
+        provider: 'resend',
+        fromAddress: hasValidFrom ? fromAddress : null,
+        issue: 'RESEND_API_KEY is missing on the server.'
+      };
+    }
+    if (!fromAddress) {
+      return {
+        configured: false,
+        provider: 'resend',
+        fromAddress: null,
+        issue: 'RESEND_API_KEY is set, but EMAIL_FROM is missing.'
+      };
+    }
+    if (!hasValidFrom) {
+      return {
+        configured: false,
+        provider: 'resend',
+        fromAddress: null,
+        issue: 'EMAIL_FROM must be a valid sender address (e.g. Little Pixel Keepsakes <orders@yourdomain.com>).'
+      };
+    }
+    return { configured: true, provider: 'resend', fromAddress };
+  }
+
+  // Optional legacy SMTP fallback: only used when Resend is not configured AND all SMTP vars are explicitly provided
+  const smtpHost = (process.env.SMTP_HOST || '').trim();
+  const smtpUser = (process.env.SMTP_USER || '').trim();
+  const smtpPass = (process.env.SMTP_PASS || '').trim();
+  if (smtpHost && smtpUser && smtpPass && hasValidFrom) {
+    return { configured: true, provider: 'smtp', fromAddress };
+  }
+
+  return {
+    configured: false,
+    provider: 'none',
+    fromAddress: hasValidFrom ? fromAddress : null,
+    issue: fromAddress
+      ? hasValidFrom
+        ? 'EMAIL_FROM is set, but RESEND_API_KEY is missing on the server.'
+        : 'EMAIL_FROM is invalid and RESEND_API_KEY is missing on the server.'
+      : 'Set RESEND_API_KEY and EMAIL_FROM on the server to send paid confirmation emails via Resend.'
+  };
 }
 
 function evaluateAllPaymentMethods() {
-  // 1. Touch 'n Go eWallet QR — evaluated independently from TNG_* environment variables
+  const privateStorage = checkPrivateStorageHealth();
+
+  // 1. Touch 'n Go eWallet QR — evaluated independently
   const tngEval = evaluateQrMethod({
     key: 'tng',
     label: 'Touch ’n Go eWallet QR',
@@ -454,10 +922,13 @@ function evaluateAllPaymentMethods() {
     imageVarName: 'TNG_QR_IMAGE',
     enabledEnv: process.env.TNG_ENABLED,
     recipientEnv: process.env.TNG_RECIPIENT_NAME,
-    imageEnv: process.env.TNG_QR_IMAGE
+    imageEnv: process.env.TNG_QR_IMAGE,
+    override: storeSettings.qrOverrides.tng,
+    privateStorageReady: privateStorage.configured,
+    privateStorageIssue: privateStorage.issue
   });
 
-  // 2. Public Bank QR Pay — evaluated independently from DUITNOW_* environment variables
+  // 2. Public Bank QR Pay — evaluated independently
   const duitnowEval = evaluateQrMethod({
     key: 'duitnow',
     label: 'Public Bank QR Pay',
@@ -467,11 +938,15 @@ function evaluateAllPaymentMethods() {
     imageVarName: 'DUITNOW_QR_IMAGE',
     enabledEnv: process.env.DUITNOW_ENABLED,
     recipientEnv: process.env.DUITNOW_RECIPIENT_NAME,
-    imageEnv: process.env.DUITNOW_QR_IMAGE
+    imageEnv: process.env.DUITNOW_QR_IMAGE,
+    override: storeSettings.qrOverrides.duitnow,
+    privateStorageReady: privateStorage.configured,
+    privateStorageIssue: privateStorage.issue
   });
 
   // 3. Credit or Debit Card (Stripe) — evaluated independently
   const stripeInfo = getStripeConfig();
+  const emailInfo = getEmailConfig();
 
   return {
     merchantConfig: {
@@ -488,9 +963,28 @@ function evaluateAllPaymentMethods() {
       stripe: {
         configured: Boolean(stripeInfo.client),
         mode: stripeInfo.mode,
+        webhookConfigured: stripeInfo.webhookConfigured,
+        livePaymentsEnabled: stripeInfo.livePaymentsEnabled,
         issue: stripeInfo.error
-      }
+      },
+      email: emailInfo,
+      privateStorage
     }
+  };
+}
+
+function getPublicStorefrontConfig() {
+  const digits = storeSettings.whatsappSupportNumber.replace(/\D/g, '');
+  const whatsappUrl = digits.length >= 8 ? `https://wa.me/${digits}` : null;
+  return {
+    logoUrl: storeSettings.logoUrl,
+    heroImageUrl: storeSettings.heroImageUrl,
+    productImages: storeSettings.productImages,
+    galleryItems: storeSettings.galleryItems,
+    deliveryRatesSen: storeSettings.deliveryRatesSen,
+    whatsappSupportNumber: digits,
+    whatsappUrl,
+    deliveryPromiseText: DELIVERY_PROMISE_TEXT
   };
 }
 
@@ -519,7 +1013,7 @@ function verifyMagicBytes(buffer: Buffer, mimeType: string): boolean {
   return false;
 }
 
-function resolveTrustedOrigin(req: express.Request): string {
+function resolveTrustedOrigin(req?: express.Request): string {
   const configuredAppUrl = (process.env.APP_URL || '').trim();
   if (configuredAppUrl) {
     try {
@@ -531,11 +1025,17 @@ function resolveTrustedOrigin(req: express.Request): string {
       // Fall through to request host detection
     }
   }
+  if (!req) return 'http://localhost:3000';
   const forwardedProto = (req.headers['x-forwarded-proto'] as string | undefined)?.split(',')[0]?.trim();
   const forwardedHost = (req.headers['x-forwarded-host'] as string | undefined)?.split(',')[0]?.trim();
   const rawHost = forwardedHost || req.headers.host || 'localhost:3000';
   const safeHost = /^[a-zA-Z0-9.-]+(?::\d{1,5})?$/.test(rawHost) ? rawHost : 'localhost:3000';
-  const proto = forwardedProto === 'https' || forwardedProto === 'http' ? forwardedProto : (req.protocol === 'https' ? 'https' : 'http');
+  const proto =
+    forwardedProto === 'https' || forwardedProto === 'http'
+      ? forwardedProto
+      : req.protocol === 'https'
+        ? 'https'
+        : 'http';
   return `${proto}://${safeHost}`;
 }
 
@@ -545,6 +1045,181 @@ function sanitizeDisplayFilename(raw: unknown, fallbackExt: string): string {
   }
   const base = path.basename(raw.trim()).replace(/[^a-zA-Z0-9._-]/g, '_');
   return base.slice(0, 120) || `receipt.${fallbackExt}`;
+}
+
+function buildConfirmationEmailContent(order: OrderRecord, originUrl: string) {
+  const orderLink = `${originUrl}/?order=${encodeURIComponent(order.reference)}&token=${encodeURIComponent(order.accessToken)}`;
+  const methodLabel = getPaymentMethodDisplayLabel(order.paymentMethod) || 'Confirmed payment';
+  const totalPaid = formatRM(order.totalSen);
+  const subject = `Order Confirmed — Little Pixel Keepsakes (${order.reference})`;
+
+  const text = [
+    PAID_CONFIRMATION_HEADING,
+    '',
+    `Hi ${order.customer.fullName},`,
+    '',
+    `Order Reference: ${order.reference}`,
+    `Items: ${order.productName} (Qty ${order.itemQuantity})`,
+    `Total Paid: ${totalPaid}`,
+    `Payment Method: ${methodLabel}`,
+    '',
+    DELIVERY_PROMISE_TEXT,
+    '',
+    `View your order status anytime: ${orderLink}`,
+    '',
+    'Thank you for supporting Little Pixel Keepsakes!'
+  ].join('\n');
+
+  const html = `
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: #14233C; max-width: 560px; margin: 0 auto; padding: 24px; background: #FAF6EE; border-radius: 16px;">
+      <h1 style="font-size: 22px; margin: 0 0 12px; color: #14233C;">${escapeHtml(PAID_CONFIRMATION_HEADING)}</h1>
+      <p style="font-size: 14px; line-height: 1.6; margin: 0 0 16px;">Hi ${escapeHtml(order.customer.fullName)},</p>
+      <div style="background: #FFFFFF; border: 1px solid rgba(20,35,60,0.12); border-radius: 12px; padding: 16px; margin-bottom: 16px;">
+        <p style="margin: 0 0 8px; font-size: 13px;"><strong>Order Reference:</strong> <span style="font-family: monospace;">${escapeHtml(order.reference)}</span></p>
+        <p style="margin: 0 0 8px; font-size: 13px;"><strong>Items:</strong> ${escapeHtml(order.productName)} (Qty ${order.itemQuantity})</p>
+        <p style="margin: 0 0 8px; font-size: 13px;"><strong>Total Paid:</strong> ${escapeHtml(totalPaid)}</p>
+        <p style="margin: 0; font-size: 13px;"><strong>Payment Method:</strong> ${escapeHtml(methodLabel)}</p>
+      </div>
+      <p style="font-size: 14px; line-height: 1.6; margin: 0 0 20px; font-weight: 600;">${escapeHtml(DELIVERY_PROMISE_TEXT)}</p>
+      <p style="margin: 0 0 16px;">
+        <a href="${escapeHtml(orderLink)}" style="display: inline-block; background: #14233C; color: #FFFFFF; text-decoration: none; font-weight: 700; font-size: 13px; padding: 10px 18px; border-radius: 10px;">View Order Status</a>
+      </p>
+      <p style="font-size: 12px; color: #526075; margin: 0;">Little Pixel Keepsakes · Handmade in Malaysia</p>
+    </div>
+  `.trim();
+
+  return { subject, text, html };
+}
+
+// Guaranteed at-most-once confirmation email per paid order.
+// Never mutates order.paymentStatus or blocks payment/storage availability.
+async function sendOrderConfirmationEmailOnce(
+  order: OrderRecord,
+  req?: express.Request
+): Promise<{
+  sent: boolean;
+  skipped?: boolean;
+  status: 'sent' | 'not_configured' | 'failed';
+  error?: string;
+}> {
+  if (order.paymentStatus !== 'Paid') {
+    return { sent: false, skipped: true, status: 'not_configured' };
+  }
+  if (order.confirmationEmailSentAt) {
+    return { sent: false, skipped: true, status: 'sent' };
+  }
+  if (inFlightConfirmationEmails.has(order.reference)) {
+    return { sent: false, skipped: true, status: 'sent' };
+  }
+
+  const emailCfg = getEmailConfig();
+  if (!emailCfg.configured || !emailCfg.fromAddress) {
+    const notConfiguredMsg =
+      emailCfg.issue || 'Set RESEND_API_KEY and EMAIL_FROM on the server to send confirmation emails via Resend.';
+    order.confirmationEmailStatus = 'not_configured';
+    order.confirmationEmailError = sanitizeEmailError(notConfiguredMsg);
+    order.confirmationEmailLastAttemptAt = new Date().toISOString();
+    ordersStore.set(order.reference, order);
+    saveStoreToDisk();
+    return { sent: false, status: 'not_configured', error: order.confirmationEmailError };
+  }
+
+  inFlightConfirmationEmails.add(order.reference);
+  const attemptTime = new Date().toISOString();
+  try {
+    const originUrl = resolveTrustedOrigin(req);
+    const { subject, text, html } = buildConfirmationEmailContent(order, originUrl);
+
+    if (emailCfg.provider === 'resend') {
+      const response = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${(process.env.RESEND_API_KEY || '').trim()}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          from: emailCfg.fromAddress,
+          to: [order.customer.email],
+          subject,
+          text,
+          html
+        }),
+        signal: AbortSignal.timeout(15000)
+      });
+      if (!response.ok) {
+        const rawBody = await response.text().catch(() => '');
+        let detail = rawBody;
+        try {
+          const parsedErr = JSON.parse(rawBody) as { message?: string; name?: string };
+          if (parsedErr?.message) {
+            detail = parsedErr.message;
+          }
+        } catch {
+          // Use raw response text
+        }
+        throw new Error(`Resend HTTP ${response.status}: ${detail || response.statusText || 'Request failed'}`);
+      }
+      const data = (await response.json().catch(() => ({}))) as { id?: string };
+      order.confirmationEmailStatus = 'sent';
+      order.confirmationEmailSentAt = new Date().toISOString();
+      order.confirmationEmailLastAttemptAt = attemptTime;
+      order.confirmationEmailId = data.id || `resend_${Date.now()}`;
+      order.confirmationEmailError = undefined;
+      ordersStore.set(order.reference, order);
+      saveStoreToDisk();
+      return { sent: true, status: 'sent' };
+    }
+
+    if (emailCfg.provider === 'smtp') {
+      const port = Number.parseInt((process.env.SMTP_PORT || '587').trim(), 10) || 587;
+      const secureEnv = (process.env.SMTP_SECURE || '').trim().toLowerCase();
+      const secure = secureEnv ? secureEnv === 'true' || secureEnv === '1' : port === 465;
+
+      const transporter = nodemailer.createTransport({
+        host: (process.env.SMTP_HOST || '').trim(),
+        port,
+        secure,
+        auth: {
+          user: (process.env.SMTP_USER || '').trim(),
+          pass: (process.env.SMTP_PASS || '').trim()
+        }
+      });
+
+      const info = await transporter.sendMail({
+        from: emailCfg.fromAddress,
+        to: order.customer.email,
+        subject,
+        text,
+        html
+      });
+
+      order.confirmationEmailStatus = 'sent';
+      order.confirmationEmailSentAt = new Date().toISOString();
+      order.confirmationEmailLastAttemptAt = attemptTime;
+      order.confirmationEmailId = info.messageId || `smtp_${Date.now()}`;
+      order.confirmationEmailError = undefined;
+      ordersStore.set(order.reference, order);
+      saveStoreToDisk();
+      return { sent: true, status: 'sent' };
+    }
+
+    return { sent: false, status: 'not_configured' };
+  } catch (err: any) {
+    const safeError = sanitizeEmailError(err?.message || err || 'Email delivery failed');
+    console.error(`Confirmation email failed for order ${order.reference}: ${safeError}`);
+    order.confirmationEmailStatus = 'failed';
+    order.confirmationEmailError = safeError;
+    order.confirmationEmailLastAttemptAt = attemptTime;
+    ordersStore.set(order.reference, order);
+    try {
+      saveStoreToDisk();
+    } catch (saveErr) {
+      console.error(`Failed to persist email error for order ${order.reference}:`, saveErr);
+    }
+    return { sent: false, status: 'failed', error: safeError };
+  } finally {
+    inFlightConfirmationEmails.delete(order.reference);
+  }
 }
 
 function requireAdminAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
@@ -567,7 +1242,7 @@ async function startServer() {
   const PORT = 3000;
 
   // Stripe webhook route MUST receive the raw request body before express.json()
-  app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), (req, res) => {
+  app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
     const sig = req.headers['stripe-signature'];
     const webhookSecret = (process.env.STRIPE_WEBHOOK_SECRET || '').trim();
     const stripeInfo = getStripeConfig();
@@ -611,7 +1286,7 @@ async function startServer() {
 
       const order = ordersStore.get(reference)!;
 
-      // Already confirmed paid — idempotent no-op
+      // Already confirmed paid — idempotent no-op (never sends a duplicate confirmation email)
       if (order.paymentStatus === 'Paid') {
         markEventProcessed();
         return res.json({ received: true, duplicate: true });
@@ -635,13 +1310,23 @@ async function startServer() {
         order.paymentStatus = 'Paid';
         order.paymentMethod = 'card';
         order.stripeSessionId = session.id;
-        order.stripePaymentIntentId = typeof session.payment_intent === 'string'
-          ? session.payment_intent
-          : session.payment_intent?.id;
+        order.stripePaymentIntentId =
+          typeof session.payment_intent === 'string'
+            ? session.payment_intent
+            : session.payment_intent?.id;
         order.paidAt = new Date().toISOString();
+        order.correctionReason = undefined;
         order.lastCardAttemptMessage = undefined;
         ordersStore.set(reference, order);
+        markEventProcessed();
+
+        try {
+          await sendOrderConfirmationEmailOnce(order, req);
+        } catch (emailErr) {
+          console.error(`Unexpected confirmation email error for order ${reference}:`, emailErr);
+        }
         console.log(`Order ${reference} confirmed Paid via verified Stripe webhook (${event.id}).`);
+        return res.json({ received: true });
       } else {
         console.warn(`Stripe webhook mismatch for order ${reference}`, {
           eventId: event.id,
@@ -663,7 +1348,7 @@ async function startServer() {
 
       if (reference && ordersStore.has(reference)) {
         const order = ordersStore.get(reference)!;
-        if (order.paymentStatus === 'Awaiting payment') {
+        if (order.paymentStatus === 'Awaiting payment' || order.paymentStatus === 'Receipt correction needed') {
           order.lastCardAttemptMessage =
             event.type === 'checkout.session.expired'
               ? 'Your previous card checkout session expired. You can try again below without re-uploading your photo.'
@@ -681,6 +1366,33 @@ async function startServer() {
   });
 
   app.use(express.json({ limit: '16mb' }));
+
+  // Public Storefront & Merchant Config Endpoint
+  app.get('/api/store-config', (_req, res) => {
+    const { merchantConfig, diagnostics } = evaluateAllPaymentMethods();
+    return res.json({
+      success: true,
+      storefront: getPublicStorefrontConfig(),
+      merchantConfig,
+      configIssues: {
+        tng: diagnostics.tng.issues,
+        duitnow: diagnostics.duitnow.issues
+      }
+    });
+  });
+
+  // Backwards-compatible Merchant Payment Configuration Endpoint
+  app.get('/api/merchant-config', (_req, res) => {
+    const { merchantConfig, diagnostics } = evaluateAllPaymentMethods();
+    return res.json({
+      success: true,
+      merchantConfig,
+      configIssues: {
+        tng: diagnostics.tng.issues,
+        duitnow: diagnostics.duitnow.issues
+      }
+    });
+  });
 
   // Photo Upload Endpoint
   app.post('/api/upload-photo', (req, res) => {
@@ -719,7 +1431,7 @@ async function startServer() {
     }
   });
 
-  // Validate Delivery Endpoint
+  // Validate Delivery Endpoint (uses live editable delivery rates)
   app.post('/api/validate-delivery', (req, res) => {
     try {
       const { state } = req.body || {};
@@ -727,9 +1439,7 @@ async function startServer() {
         return res.status(400).json({ error: 'State is required.' });
       }
 
-      const normalizedState = state.trim().toLowerCase();
-      const deliveryConfig = DELIVERY_RATES[normalizedState];
-
+      const deliveryConfig = getDeliveryConfigForState(state);
       if (!deliveryConfig) {
         return res.status(400).json({
           valid: false,
@@ -751,7 +1461,6 @@ async function startServer() {
         return res.status(400).json({ error: 'Missing required order details.' });
       }
 
-      // Validate uploaded photo path stays strictly inside /uploads/
       if (!/^\/uploads\/[a-zA-Z0-9._-]+\.(jpg|jpeg|png)$/.test(photoUrl)) {
         return res.status(400).json({ error: 'Invalid uploaded photo reference.' });
       }
@@ -793,7 +1502,7 @@ async function startServer() {
         return res.status(400).json({ error: 'Please complete all required customer and delivery fields.' });
       }
 
-      const deliveryConfig = DELIVERY_RATES[cleanCustomer.state.toLowerCase()];
+      const deliveryConfig = getDeliveryConfigForState(cleanCustomer.state);
       if (!deliveryConfig) {
         return res.status(400).json({ error: `Delivery rate not configured for state "${cleanCustomer.state}".` });
       }
@@ -807,9 +1516,11 @@ async function startServer() {
 
       const randomCode = crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 6);
       const reference = `LPK-${new Date().getFullYear()}-${randomCode}`;
+      const accessToken = crypto.randomBytes(24).toString('base64url');
 
       const orderRecord: OrderRecord = {
         reference,
+        accessToken,
         productId,
         bundleId: productId === 'bundle' ? bundleId : undefined,
         productName: productConfig.name,
@@ -830,26 +1541,18 @@ async function startServer() {
       ordersStore.set(reference, orderRecord);
       saveStoreToDisk();
 
-      return res.json({ success: true, reference, order: toPublicOrder(orderRecord) });
+      return res.json({
+        success: true,
+        reference,
+        accessToken,
+        order: toPublicOrder(orderRecord)
+      });
     } catch {
       return res.status(500).json({ error: 'Failed to create order.' });
     }
   });
 
-  // Get Merchant Payment Configuration Endpoint (evaluates TNG, Public Bank QR Pay, and Stripe independently)
-  app.get('/api/merchant-config', (_req, res) => {
-    const { merchantConfig, diagnostics } = evaluateAllPaymentMethods();
-    return res.json({
-      success: true,
-      merchantConfig,
-      configIssues: {
-        tng: diagnostics.tng.issues,
-        duitnow: diagnostics.duitnow.issues
-      }
-    });
-  });
-
-  // Upload Payment Receipt Endpoint (Manual QR — stores receipt PRIVATELY outside public/)
+  // Upload or Replace Payment Receipt Endpoint (Manual QR — requires secure order token, stores privately outside public/)
   app.post('/api/upload-receipt', (req, res) => {
     try {
       const { reference, paymentMethod, transactionReference, receiptBase64, filename } = req.body || {};
@@ -861,6 +1564,9 @@ async function startServer() {
       const order = ordersStore.get(reference);
       if (!order) {
         return res.status(404).json({ error: 'Order not found.' });
+      }
+      if (!isOrderAuthorized(req, order)) {
+        return res.status(403).json({ error: 'Valid secure order link token is required to submit a receipt.' });
       }
       if (order.paymentStatus === 'Paid') {
         return res.status(409).json({ error: 'This order has already been paid.' });
@@ -876,10 +1582,14 @@ async function startServer() {
       }
       const qrMethod: 'tng' | 'duitnow' = paymentMethod;
 
-      // Ensure the chosen QR method is actually configured on the server (independent of Stripe)
       const { merchantConfig } = evaluateAllPaymentMethods();
       if (!merchantConfig[qrMethod]) {
         return res.status(400).json({ error: 'Selected QR payment method is not currently configured.' });
+      }
+
+      const storageHealth = checkPrivateStorageHealth();
+      if (!storageHealth.configured) {
+        return res.status(503).json({ error: 'Private receipt storage is not configured on the server.' });
       }
 
       const cleanTxRef = typeof transactionReference === 'string' ? transactionReference.trim() : '';
@@ -913,6 +1623,18 @@ async function startServer() {
         return res.status(400).json({ error: 'Receipt file content does not match a valid JPG, PNG, or PDF file.' });
       }
 
+      // If replacing a previously rejected receipt, remove the superseded private file cleanly
+      if (order.privateReceipt?.storageFileName) {
+        const oldPath = path.resolve(privateReceiptsDir, path.basename(order.privateReceipt.storageFileName));
+        if (oldPath.startsWith(privateReceiptsDir + path.sep) && fs.existsSync(oldPath)) {
+          try {
+            fs.unlinkSync(oldPath);
+          } catch {
+            // Best-effort cleanup
+          }
+        }
+      }
+
       const receiptId = crypto.randomUUID();
       const storageFileName = `receipt_${receiptId}.${ext}`;
       const privatePath = path.resolve(privateReceiptsDir, storageFileName);
@@ -927,6 +1649,7 @@ async function startServer() {
       order.paymentMethod = qrMethod;
       order.transactionReference = cleanTxRef;
       order.lastCardAttemptMessage = undefined;
+      order.correctionReason = undefined;
       order.verificationNote = undefined;
       order.privateReceipt = {
         id: receiptId,
@@ -949,7 +1672,7 @@ async function startServer() {
     }
   });
 
-  // Create Stripe Checkout Session Endpoint (MYR, server-side saved order total)
+  // Create Stripe Checkout Session Endpoint (MYR, server-side saved order total, requires secure order token)
   app.post('/api/create-stripe-session', async (req, res) => {
     try {
       const { reference } = req.body || {};
@@ -960,6 +1683,9 @@ async function startServer() {
       const order = ordersStore.get(reference);
       if (!order) {
         return res.status(404).json({ error: 'Order not found.' });
+      }
+      if (!isOrderAuthorized(req, order)) {
+        return res.status(403).json({ error: 'Valid secure order link token is required to start card payment.' });
       }
       if (order.paymentStatus === 'Paid') {
         return res.status(409).json({ error: 'This order is already paid. A new payment session cannot be created.' });
@@ -974,11 +1700,14 @@ async function startServer() {
       if (!stripeInfo.client) {
         return res.status(503).json({
           code: 'STRIPE_NOT_CONFIGURED',
-          error: stripeInfo.error || 'Card payment is temporarily unavailable. Please use a QR payment method or configure Stripe test mode.'
+          error:
+            stripeInfo.error ||
+            'Card payment is temporarily unavailable. Please use an enabled QR payment method.'
         });
       }
 
       const baseUrl = resolveTrustedOrigin(req);
+      const tokenQuery = `&token=${encodeURIComponent(order.accessToken)}`;
 
       const lineItems: Stripe.Checkout.SessionCreateParams.LineItem[] = [
         {
@@ -987,7 +1716,7 @@ async function startServer() {
             product_data: {
               name: `Little Pixel Keepsakes — ${order.productName}`,
               description: order.savingsSen
-                ? `Order ${order.reference} · Includes bundle savings of RM ${(order.savingsSen / 100).toFixed(2)}`
+                ? `Order ${order.reference} · Includes bundle savings of ${formatRM(order.savingsSen)}`
                 : `Order ${order.reference}`
             },
             unit_amount: order.subtotalSen
@@ -1012,8 +1741,8 @@ async function startServer() {
         customer_email: order.customer.email,
         client_reference_id: order.reference,
         line_items: lineItems,
-        success_url: `${baseUrl}/?order=${encodeURIComponent(order.reference)}&payment=success`,
-        cancel_url: `${baseUrl}/?order=${encodeURIComponent(order.reference)}&payment=cancelled`,
+        success_url: `${baseUrl}/?order=${encodeURIComponent(order.reference)}${tokenQuery}&payment=success`,
+        cancel_url: `${baseUrl}/?order=${encodeURIComponent(order.reference)}${tokenQuery}&payment=cancelled`,
         metadata: {
           orderReference: order.reference
         },
@@ -1043,7 +1772,7 @@ async function startServer() {
     }
   });
 
-  // Get Saved Order Details Endpoint
+  // Get Saved Order Status Endpoint (requires secure order link token)
   app.get('/api/orders/:reference', (req, res) => {
     try {
       const { reference } = req.params;
@@ -1054,6 +1783,11 @@ async function startServer() {
       if (!order) {
         return res.status(404).json({ error: 'Order not found.' });
       }
+      if (!isOrderAuthorized(req, order)) {
+        return res.status(403).json({
+          error: 'This order requires its secure order link. Please open the full link provided when you placed your order.'
+        });
+      }
       return res.json({ success: true, order: toPublicOrder(order) });
     } catch {
       return res.status(500).json({ error: 'Failed to retrieve order.' });
@@ -1061,7 +1795,7 @@ async function startServer() {
   });
 
   // =========================================================================
-  // PROTECTED STAFF ADMIN AUTH & ORDER VERIFICATION ROUTES
+  // PROTECTED STAFF ADMIN AUTH, ORDER VERIFICATION & STORE SETTINGS ROUTES
   // =========================================================================
 
   app.get('/api/admin/auth-status', (_req, res) => {
@@ -1117,13 +1851,215 @@ async function startServer() {
     return res.json({ success: true });
   });
 
-  // Protected: List all orders & payment configuration diagnostics
+  // Protected: List all orders, payment/email/storage diagnostics & editable store settings
   app.get('/api/admin/orders', requireAdminAuth, (_req, res) => {
     const orders = Array.from(ordersStore.values())
       .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
-      .map(toPublicOrder);
+      .map(toAdminOrder);
     const { diagnostics } = evaluateAllPaymentMethods();
-    return res.json({ success: true, orders, diagnostics });
+    return res.json({ success: true, orders, diagnostics, settings: storeSettings });
+  });
+
+  // Protected: Read editable store & merchant QR settings
+  app.get('/api/admin/settings', requireAdminAuth, (_req, res) => {
+    const { merchantConfig, diagnostics } = evaluateAllPaymentMethods();
+    return res.json({
+      success: true,
+      settings: storeSettings,
+      merchantConfig,
+      diagnostics
+    });
+  });
+
+  // Protected: Update editable logo, product images, delivery rates, WhatsApp number, merchant QR images & recipient names
+  app.put('/api/admin/settings', requireAdminAuth, (req, res) => {
+    try {
+      const incoming = req.body?.settings as Partial<EditableStoreSettings> | undefined;
+      if (!incoming || typeof incoming !== 'object') {
+        return res.status(400).json({ error: 'Settings payload is required.' });
+      }
+
+      const next: EditableStoreSettings = JSON.parse(JSON.stringify(storeSettings));
+
+      if (typeof incoming.logoUrl === 'string') {
+        const check = validateStorefrontAssetSource(incoming.logoUrl);
+        if (!check.valid || !check.normalizedUrl) {
+          return res.status(400).json({ error: `Invalid logo image: ${check.reason}` });
+        }
+        next.logoUrl = check.normalizedUrl;
+      }
+
+      if (typeof incoming.heroImageUrl === 'string') {
+        const check = validateStorefrontAssetSource(incoming.heroImageUrl);
+        if (!check.valid || !check.normalizedUrl) {
+          return res.status(400).json({ error: `Invalid hero image: ${check.reason}` });
+        }
+        next.heroImageUrl = check.normalizedUrl;
+      }
+
+      if (incoming.productImages && typeof incoming.productImages === 'object') {
+        for (const key of ['keychain', 'magnet', 'bundle'] as const) {
+          const val = incoming.productImages[key];
+          if (typeof val === 'string' && val.trim()) {
+            const check = validateStorefrontAssetSource(val);
+            if (!check.valid || !check.normalizedUrl) {
+              return res.status(400).json({ error: `Invalid ${key} product image: ${check.reason}` });
+            }
+            next.productImages[key] = check.normalizedUrl;
+          }
+        }
+      }
+
+      if (Array.isArray(incoming.galleryItems) && incoming.galleryItems.length > 0) {
+        const updatedGallery: StoreGalleryImage[] = [];
+        for (const [idx, item] of incoming.galleryItems.slice(0, 6).entries()) {
+          const fallback = next.galleryItems[idx] || getDefaultStoreSettings().galleryItems[0];
+          const rawImg = typeof item?.image === 'string' ? item.image : fallback.image;
+          const imgCheck = validateStorefrontAssetSource(rawImg);
+          if (!imgCheck.valid || !imgCheck.normalizedUrl) {
+            return res
+              .status(400)
+              .json({ error: `Invalid gallery image #${idx + 1}: ${imgCheck.reason}` });
+          }
+          updatedGallery.push({
+            id: typeof item?.id === 'string' && item.id.trim() ? item.id.trim().slice(0, 40) : fallback.id,
+            category:
+              typeof item?.category === 'string' && item.category.trim()
+                ? item.category.trim().slice(0, 60)
+                : fallback.category,
+            title:
+              typeof item?.title === 'string' && item.title.trim()
+                ? item.title.trim().slice(0, 80)
+                : fallback.title,
+            description:
+              typeof item?.description === 'string' && item.description.trim()
+                ? item.description.trim().slice(0, 240)
+                : fallback.description,
+            image: imgCheck.normalizedUrl,
+            tag:
+              typeof item?.tag === 'string' && item.tag.trim()
+                ? item.tag.trim().slice(0, 40)
+                : fallback.tag
+          });
+        }
+        next.galleryItems = updatedGallery;
+      }
+
+      if (incoming.deliveryRatesSen && typeof incoming.deliveryRatesSen === 'object') {
+        const pen = incoming.deliveryRatesSen.peninsular;
+        const east = incoming.deliveryRatesSen.eastMalaysia;
+        if (typeof pen === 'number') {
+          if (!Number.isInteger(pen) || pen < 0 || pen > 100000) {
+            return res
+              .status(400)
+              .json({ error: 'Peninsular Malaysia delivery fee must be between RM 0.00 and RM 1,000.00.' });
+          }
+          next.deliveryRatesSen.peninsular = pen;
+        }
+        if (typeof east === 'number') {
+          if (!Number.isInteger(east) || east < 0 || east > 100000) {
+            return res
+              .status(400)
+              .json({ error: 'Sabah & Sarawak delivery fee must be between RM 0.00 and RM 1,000.00.' });
+          }
+          next.deliveryRatesSen.eastMalaysia = east;
+        }
+      }
+
+      if (typeof incoming.whatsappSupportNumber === 'string') {
+        const digits = incoming.whatsappSupportNumber.replace(/\D/g, '').slice(0, 20);
+        if (digits && (digits.length < 8 || digits.length > 16)) {
+          return res
+            .status(400)
+            .json({ error: 'WhatsApp support number must include country code (8–16 digits, e.g. 60123456789).' });
+        }
+        next.whatsappSupportNumber = digits;
+      }
+
+      if (incoming.qrOverrides && typeof incoming.qrOverrides === 'object') {
+        for (const key of ['tng', 'duitnow'] as const) {
+          const entry = incoming.qrOverrides[key];
+          if (!entry || typeof entry !== 'object') continue;
+          const label = key === 'tng' ? 'Touch ’n Go eWallet QR' : 'Public Bank QR Pay';
+          if (entry.enabled === null || typeof entry.enabled === 'boolean') {
+            next.qrOverrides[key].enabled = entry.enabled;
+          }
+          if (typeof entry.recipientName === 'string') {
+            next.qrOverrides[key].recipientName = entry.recipientName.trim().slice(0, 140);
+          }
+          if (typeof entry.qrImage === 'string') {
+            const trimmedImg = entry.qrImage.trim();
+            if (!trimmedImg) {
+              next.qrOverrides[key].qrImage = '';
+            } else {
+              const check = validateQrImageSource(trimmedImg);
+              if (!check.valid || !check.normalizedUrl) {
+                return res.status(400).json({ error: `Invalid ${label} image: ${check.reason}` });
+              }
+              next.qrOverrides[key].qrImage = check.normalizedUrl;
+            }
+          }
+        }
+      }
+
+      storeSettings = next;
+      saveStoreToDisk();
+
+      const { merchantConfig, diagnostics } = evaluateAllPaymentMethods();
+      return res.json({
+        success: true,
+        settings: storeSettings,
+        storefront: getPublicStorefrontConfig(),
+        merchantConfig,
+        diagnostics
+      });
+    } catch {
+      return res.status(500).json({ error: 'Failed to save store settings.' });
+    }
+  });
+
+  // Protected: Upload a logo, product/gallery image, or merchant QR image from Admin Settings
+  app.post('/api/admin/upload-asset', requireAdminAuth, (req, res) => {
+    try {
+      const { target, imageBase64 } = req.body || {};
+      if (target !== 'storefront' && target !== 'qr') {
+        return res.status(400).json({ error: 'Invalid asset target.' });
+      }
+      if (typeof imageBase64 !== 'string' || !imageBase64) {
+        return res.status(400).json({ error: 'No image data provided.' });
+      }
+
+      const matches = imageBase64.match(/^data:(image\/(?:jpeg|jpg|png));base64,([A-Za-z0-9+/=]+)$/);
+      if (!matches || matches.length !== 3) {
+        return res.status(400).json({ error: 'Please upload a valid JPG or PNG image.' });
+      }
+
+      const mimeType = matches[1].toLowerCase() === 'image/png' ? 'image/png' : 'image/jpeg';
+      const ext = mimeType === 'image/png' ? 'png' : 'jpg';
+      const buffer = Buffer.from(matches[2], 'base64');
+
+      if (buffer.length === 0 || buffer.length > MAX_UPLOAD_BYTES) {
+        return res.status(400).json({ error: 'Asset image must be smaller than 10 MB.' });
+      }
+      if (!verifyMagicBytes(buffer, mimeType)) {
+        return res.status(400).json({ error: 'Uploaded file does not match a valid JPG or PNG image.' });
+      }
+
+      const baseDir = target === 'qr' ? publicPaymentsDir : publicUploadsDir;
+      const prefix = target === 'qr' ? 'qr' : 'asset';
+      const publicPrefix = target === 'qr' ? '/payments/' : '/uploads/';
+      const uniqueName = `${prefix}_${Date.now()}_${crypto.randomBytes(6).toString('hex')}.${ext}`;
+      const filePath = path.resolve(baseDir, uniqueName);
+
+      if (!filePath.startsWith(baseDir + path.sep)) {
+        return res.status(400).json({ error: 'Invalid upload destination.' });
+      }
+
+      fs.writeFileSync(filePath, buffer);
+      return res.json({ success: true, assetUrl: `${publicPrefix}${uniqueName}` });
+    } catch {
+      return res.status(500).json({ error: 'Failed to upload image asset.' });
+    }
   });
 
   // Protected: Stream private receipt file for staff verification
@@ -1149,8 +2085,8 @@ async function startServer() {
     return res.sendFile(resolvedPath);
   });
 
-  // Protected: Staff confirms incoming TNG or Public Bank transfer and marks order Paid
-  app.post('/api/admin/orders/:reference/verify-payment', requireAdminAuth, (req, res) => {
+  // Protected: Staff confirms incoming TNG or Public Bank transfer, marks order Paid, and sends one confirmation email
+  app.post('/api/admin/orders/:reference/verify-payment', requireAdminAuth, async (req, res) => {
     const { reference } = req.params;
     if (!ORDER_REF_REGEX.test(reference)) {
       return res.status(400).json({ error: 'Invalid order reference.' });
@@ -1176,14 +2112,60 @@ async function startServer() {
     order.paymentStatus = 'Paid';
     order.paidAt = new Date().toISOString();
     order.verifiedByStaff = true;
-    order.verificationNote = note || `Verified incoming ${getPaymentMethodDisplayLabel(order.paymentMethod)} transfer.`;
+    order.correctionReason = undefined;
+    order.verificationNote =
+      note || `Verified incoming ${getPaymentMethodDisplayLabel(order.paymentMethod)} transfer.`;
     ordersStore.set(reference, order);
     saveStoreToDisk();
 
-    return res.json({ success: true, order: toPublicOrder(order) });
+    try {
+      await sendOrderConfirmationEmailOnce(order, req);
+    } catch (emailErr) {
+      console.error(`Unexpected confirmation email error for order ${reference}:`, emailErr);
+    }
+
+    return res.json({ success: true, order: toAdminOrder(order) });
   });
 
-  // Protected: Staff rejects an unverified receipt so customer can re-submit
+  // Protected: Retry sending confirmation email for a Paid order without changing its Paid status
+  app.post('/api/admin/orders/:reference/retry-email', requireAdminAuth, async (req, res) => {
+    const { reference } = req.params;
+    if (!ORDER_REF_REGEX.test(reference)) {
+      return res.status(400).json({ error: 'Invalid order reference.' });
+    }
+    const order = ordersStore.get(reference);
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found.' });
+    }
+    if (order.paymentStatus !== 'Paid') {
+      return res.status(400).json({ error: 'Only paid orders can send a confirmation email.' });
+    }
+    if (order.confirmationEmailSentAt) {
+      return res.status(409).json({
+        error: 'Confirmation email has already been sent for this order.',
+        order: toAdminOrder(order)
+      });
+    }
+
+    const result = await sendOrderConfirmationEmailOnce(order, req);
+    if (result.sent) {
+      return res.json({ success: true, order: toAdminOrder(order) });
+    }
+    if (result.skipped && result.status === 'sent') {
+      return res.status(409).json({
+        error: 'Confirmation email has already been sent or is currently being sent.',
+        order: toAdminOrder(order)
+      });
+    }
+    const statusCode = result.status === 'not_configured' ? 503 : 502;
+    return res.status(statusCode).json({
+      success: false,
+      error: result.error || 'Could not send confirmation email. Order remains Paid.',
+      order: toAdminOrder(order)
+    });
+  });
+
+  // Protected: Staff requests a corrected receipt (sets status to "Receipt correction needed")
   app.post('/api/admin/orders/:reference/reject-payment', requireAdminAuth, (req, res) => {
     const { reference } = req.params;
     if (!ORDER_REF_REGEX.test(reference)) {
@@ -1194,36 +2176,24 @@ async function startServer() {
       return res.status(404).json({ error: 'Order not found.' });
     }
     if (order.paymentStatus !== 'Pending verification') {
-      return res.status(400).json({ error: 'Only orders pending verification can be returned for resubmission.' });
+      return res
+        .status(400)
+        .json({ error: 'Only orders pending verification can request a corrected receipt.' });
     }
 
     const reason =
       typeof req.body?.reason === 'string' && req.body.reason.trim()
         ? req.body.reason.trim().slice(0, 240)
-        : 'We could not match your uploaded receipt. Please verify the recipient name and exact amount, then upload a clear receipt.';
+        : 'We could not match your uploaded receipt to an incoming transaction. Please verify the recipient name and exact amount, then upload a corrected receipt.';
 
-    // Remove rejected receipt file from private storage
-    if (order.privateReceipt?.storageFileName) {
-      const oldPath = path.resolve(privateReceiptsDir, path.basename(order.privateReceipt.storageFileName));
-      if (oldPath.startsWith(privateReceiptsDir + path.sep) && fs.existsSync(oldPath)) {
-        try {
-          fs.unlinkSync(oldPath);
-        } catch {
-          // Best-effort cleanup
-        }
-      }
-    }
-
-    order.paymentStatus = 'Awaiting payment';
-    order.paymentMethod = null;
-    order.lastCardAttemptMessage = reason;
-    order.privateReceipt = undefined;
-    order.transactionReference = undefined;
+    order.paymentStatus = 'Receipt correction needed';
+    order.correctionReason = reason;
     order.verificationNote = reason;
+    order.lastCardAttemptMessage = undefined;
     ordersStore.set(reference, order);
     saveStoreToDisk();
 
-    return res.json({ success: true, order: toPublicOrder(order) });
+    return res.json({ success: true, order: toAdminOrder(order) });
   });
 
   if (process.env.NODE_ENV !== 'production') {
@@ -1233,12 +2203,11 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.resolve(__dirname, 'dist');
-    app.use(express.static(distPath));
+    app.use(express.static(distDir));
     app.use('/uploads', express.static(publicUploadsDir));
     app.use('/payments', express.static(publicPaymentsDir));
     app.get('*', (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+      res.sendFile(path.join(distDir, 'index.html'));
     });
   }
 

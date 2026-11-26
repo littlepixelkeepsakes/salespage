@@ -14,11 +14,18 @@ import {
   Camera,
   Gift,
   ArrowLeft,
-  AlertCircle
+  AlertCircle,
+  ChevronDown,
+  MessageCircle
 } from 'lucide-react';
 import PaymentPage from './components/PaymentPage';
 import AdminPage from './components/AdminPage';
-import type { MerchantPaymentConfig, OrderPublic } from './types/order';
+import {
+  DELIVERY_PROMISE_TEXT,
+  type MerchantPaymentConfig,
+  type OrderPublic,
+  type PublicStorefrontConfig
+} from './types/order';
 
 interface ProductOption {
   id: string;
@@ -66,29 +73,48 @@ const BUNDLE_CHOICES: BundleChoice[] = [
   }
 ];
 
-const GALLERY_ITEMS = [
-  {
-    category: 'Pet Portrait',
-    title: 'Golden Retriever Buddy',
-    description: 'Turned from a smartphone portrait into a vibrant beaded keychain.',
-    image: '/src/assets/images/pet_bead_art_1795515646980.jpg',
-    tag: 'Popular'
+const DEFAULT_STOREFRONT: PublicStorefrontConfig = {
+  logoUrl: '/assets/aistudio/Beaded_heart_keepsakes_logo_4fef68e3.png',
+  heroImageUrl: '/src/assets/images/hero_bead_art_showcase_1795515646405.jpg',
+  productImages: {
+    keychain: '/src/assets/images/pet_bead_art_1795515646980.jpg',
+    magnet: '/src/assets/images/couple_bead_art_1795515653017.jpg',
+    bundle: '/src/assets/images/family_bead_art_1795515653155.jpg'
   },
-  {
-    category: 'Couple Keepsake',
-    title: 'Anniversary Memory',
-    description: 'Crafted into a charming fridge magnet with pastel cloud and heart details.',
-    image: '/src/assets/images/couple_bead_art_1795515653017.jpg',
-    tag: 'Best Seller'
+  galleryItems: [
+    {
+      id: 'pet',
+      category: 'Pet Portrait',
+      title: 'Golden Retriever Buddy',
+      description: 'Turned from a smartphone portrait into a vibrant beaded keychain.',
+      image: '/src/assets/images/pet_bead_art_1795515646980.jpg',
+      tag: 'Popular'
+    },
+    {
+      id: 'couple',
+      category: 'Couple Keepsake',
+      title: 'Anniversary Memory',
+      description: 'Crafted into a charming fridge magnet with pastel cloud and heart details.',
+      image: '/src/assets/images/couple_bead_art_1795515653017.jpg',
+      tag: 'Best Seller'
+    },
+    {
+      id: 'family',
+      category: 'Family Portrait',
+      title: 'Weekend Family Outing',
+      description: 'Detailed multi-person pixel bead art keepsake mounted in a wooden frame.',
+      image: '/src/assets/images/family_bead_art_1795515653155.jpg',
+      tag: 'Special Gift'
+    }
+  ],
+  deliveryRatesSen: {
+    peninsular: 800,
+    eastMalaysia: 1500
   },
-  {
-    category: 'Family Portrait',
-    title: 'Weekend Family Outing',
-    description: 'Detailed multi-person pixel bead art keepsake mounted in a wooden frame.',
-    image: '/src/assets/images/family_bead_art_1795515653155.jpg',
-    tag: 'Special Gift'
-  }
-];
+  whatsappSupportNumber: '',
+  whatsappUrl: null,
+  deliveryPromiseText: DELIVERY_PROMISE_TEXT
+};
 
 const MALAYSIAN_STATES = [
   'Johor', 'Kedah', 'Kelantan', 'Melaka', 'Negeri Sembilan', 
@@ -107,7 +133,7 @@ const FAQS = [
   },
   {
     question: "How long does delivery take?",
-    answer: "Delivered within 14 days after payment is confirmed and we receive a usable photo. Each piece is meticulously handcrafted bead-by-bead in our Malaysian studio."
+    answer: `${DELIVERY_PROMISE_TEXT} Each piece is meticulously handcrafted bead-by-bead in our Malaysian studio.`
   },
   {
     question: "How are the keychains and magnets made?",
@@ -153,64 +179,97 @@ export default function App() {
   const [orderLookupError, setOrderLookupError] = useState<string | null>(null);
   const [paymentReturnNotice, setPaymentReturnNotice] = useState<'success_pending' | 'cancelled' | 'failed' | null>(null);
 
+  const [storefront, setStorefront] = useState<PublicStorefrontConfig>(DEFAULT_STOREFRONT);
   const [merchantConfig, setMerchantConfig] = useState<MerchantPaymentConfig | null>(null);
   const [merchantConfigLoading, setMerchantConfigLoading] = useState<boolean>(true);
 
-  const fetchOrderByReference = useCallback(async (ref: string): Promise<OrderPublic | null> => {
-    try {
-      const res = await fetch(`/api/orders/${encodeURIComponent(ref)}`);
-      const data = await res.json();
-      if (res.ok && data.success && data.order) {
-        setCurrentOrder(data.order);
-        return data.order as OrderPublic;
+  const fetchOrderByReference = useCallback(
+    async (
+      ref: string,
+      accessToken: string
+    ): Promise<{ order: OrderPublic | null; error?: string }> => {
+      try {
+        const res = await fetch(
+          `/api/orders/${encodeURIComponent(ref)}?token=${encodeURIComponent(accessToken)}`,
+          {
+            headers: { 'x-order-token': accessToken }
+          }
+        );
+        const data = await res.json();
+        if (res.ok && data.success && data.order) {
+          setCurrentOrder(data.order);
+          return { order: data.order as OrderPublic };
+        }
+        return { order: null, error: data.error };
+      } catch {
+        return { order: null, error: 'Connection error while loading your order.' };
       }
-      return null;
-    } catch {
-      return null;
-    }
-  }, []);
+    },
+    []
+  );
 
-  // Load saved order (?order=LPK-... or ?ref=LPK-...) or staff admin (?view=admin) & fetch merchant config
+  // Load saved order (?order=LPK-...&token=...) or staff admin (?view=admin) & fetch storefront/merchant config
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const viewParam = params.get('view');
     const paymentStatusParam = params.get('payment');
     const refParam = params.get('order') || params.get('ref');
+    const tokenParam = params.get('token') || '';
 
     if (viewParam === 'admin') {
       setOrderStep('admin');
     } else if (refParam) {
       setLoadingOrderRef(true);
       setOrderLookupError(null);
-      fetchOrderByReference(refParam)
-        .then(order => {
-          if (order) {
-            if (paymentStatusParam === 'cancelled') {
-              setPaymentReturnNotice('cancelled');
-            } else if (paymentStatusParam === 'failed') {
-              setPaymentReturnNotice('failed');
-            } else if (paymentStatusParam === 'success' && order.paymentStatus === 'Awaiting payment') {
-              setPaymentReturnNotice('success_pending');
+      if (!tokenParam) {
+        setOrderLookupError(
+          `Order "${refParam}" requires its full secure order link to view status or upload receipts.`
+        );
+        setLoadingOrderRef(false);
+      } else {
+        fetchOrderByReference(refParam, tokenParam)
+          .then(({ order, error }) => {
+            if (order) {
+              if (paymentStatusParam === 'cancelled') {
+                setPaymentReturnNotice('cancelled');
+              } else if (paymentStatusParam === 'failed') {
+                setPaymentReturnNotice('failed');
+              } else if (
+                paymentStatusParam === 'success' &&
+                (order.paymentStatus === 'Awaiting payment' ||
+                  order.paymentStatus === 'Receipt correction needed')
+              ) {
+                setPaymentReturnNotice('success_pending');
+              } else {
+                setPaymentReturnNotice(null);
+              }
+              setOrderStep('payment');
             } else {
-              setPaymentReturnNotice(null);
+              setOrderLookupError(
+                error ||
+                  `We couldn’t find saved order "${refParam}". Please check that you opened your full secure order link.`
+              );
             }
-            setOrderStep('payment');
-          } else {
-            setOrderLookupError(`We couldn’t find saved order "${refParam}". It may have expired or the reference may be incorrect.`);
-          }
-        })
-        .finally(() => setLoadingOrderRef(false));
+          })
+          .finally(() => setLoadingOrderRef(false));
+      }
     }
 
-    // Fetch server-configured merchant payment options (unconfigured QR methods are omitted)
-    fetch('/api/merchant-config')
+    // Fetch editable storefront settings & independently evaluated merchant payment options
+    fetch('/api/store-config')
       .then(res => res.json())
       .then(data => {
-        if (data.success && data.merchantConfig) {
-          setMerchantConfig(data.merchantConfig);
+        if (data.success) {
+          if (data.storefront) {
+            setStorefront(data.storefront);
+            setDeliveryFeeSen(data.storefront.deliveryRatesSen.peninsular);
+          }
+          if (data.merchantConfig) {
+            setMerchantConfig(data.merchantConfig);
+          }
         }
       })
-      .catch(err => console.error('Failed to load merchant config:', err))
+      .catch(err => console.error('Failed to load store config:', err))
       .finally(() => setMerchantConfigLoading(false));
   }, [fetchOrderByReference]);
 
@@ -271,6 +330,9 @@ export default function App() {
       return;
     }
 
+    if (photoPreview && photoPreview.startsWith('blob:')) {
+      URL.revokeObjectURL(photoPreview);
+    }
     setUploadError(null);
     setPhotoFile(file);
     const localPreview = URL.createObjectURL(file);
@@ -354,7 +416,11 @@ export default function App() {
         setPaymentReturnNotice(null);
         setSubmittingOrder(false);
         setOrderStep('payment');
-        window.history.replaceState({}, '', `/?order=${encodeURIComponent(data.order.reference)}`);
+        window.history.replaceState(
+          {},
+          '',
+          `/?order=${encodeURIComponent(data.order.reference)}&token=${encodeURIComponent(data.order.accessToken)}`
+        );
         window.scrollTo({ top: 0, behavior: 'smooth' });
       } else {
         setOrderError(data.error || 'Failed to create order.');
@@ -367,9 +433,10 @@ export default function App() {
   };
 
   const handleRefreshCurrentOrder = useCallback(async () => {
-    if (!currentOrder?.reference) return null;
-    return fetchOrderByReference(currentOrder.reference);
-  }, [currentOrder?.reference, fetchOrderByReference]);
+    if (!currentOrder?.reference || !currentOrder?.accessToken) return null;
+    const { order } = await fetchOrderByReference(currentOrder.reference, currentOrder.accessToken);
+    return order;
+  }, [currentOrder?.reference, currentOrder?.accessToken, fetchOrderByReference]);
 
   const handleReturnHome = () => {
     setOrderStep('sales');
@@ -386,14 +453,18 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
-  const handleOpenOrderPaymentFromAdmin = async (reference: string) => {
+  const handleOpenOrderPaymentFromAdmin = async (reference: string, accessToken: string) => {
     setLoadingOrderRef(true);
-    const order = await fetchOrderByReference(reference);
+    const { order } = await fetchOrderByReference(reference, accessToken);
     setLoadingOrderRef(false);
     if (order) {
       setPaymentReturnNotice(null);
       setOrderStep('payment');
-      window.history.replaceState({}, '', `/?order=${encodeURIComponent(order.reference)}`);
+      window.history.replaceState(
+        {},
+        '',
+        `/?order=${encodeURIComponent(order.reference)}&token=${encodeURIComponent(order.accessToken)}`
+      );
       window.scrollTo({ top: 0, behavior: 'smooth' });
     }
   };
@@ -402,17 +473,17 @@ export default function App() {
     <div className="min-h-screen flex flex-col bg-[#FAF6EE] text-[#14233C] font-sans antialiased selection:bg-[#FF8D76]/30">
       {/* Top Notification Bar */}
       <div className="bg-[#14233C] text-[#FAF6EE] py-2 px-4 text-xs font-medium text-center flex items-center justify-center gap-2">
-        <Sparkles className="w-3.5 h-3.5 text-[#FF8D76]" />
-        <span>Handmade in Malaysia · Secure Payments · Delivered within 14 calendar days</span>
+        <Sparkles className="w-3.5 h-3.5 text-[#FF8D76] shrink-0" />
+        <span>Handmade in Malaysia · {DELIVERY_PROMISE_TEXT}</span>
       </div>
 
       {/* Header */}
       <header className="sticky top-0 z-40 bg-[#FAF6EE]/90 backdrop-blur-md border-b border-[#14233C]/10 px-4 sm:px-8 py-3.5 transition-all">
         <div className="max-w-6xl mx-auto flex items-center justify-between gap-4">
           <div className="flex items-center gap-3 cursor-pointer" onClick={handleReturnHome}>
-            <img 
-              src="/assets/aistudio/Beaded_heart_keepsakes_logo_4fef68e3.png" 
-              alt="Logo" 
+            <img
+              src={storefront.logoUrl}
+              alt="Little Pixel Keepsakes logo"
               className="w-10 h-10 object-contain rounded-xl shadow-sm"
             />
             <span className="font-bold text-lg sm:text-xl tracking-tight text-[#14233C]">
@@ -501,9 +572,9 @@ export default function App() {
                 <div className="relative mx-auto max-w-md lg:max-w-none">
                   <div className="absolute -inset-2 bg-gradient-to-tr from-[#FF8D76]/30 to-[#38BDF8]/30 rounded-3xl blur-xl opacity-70"></div>
                   <div className="relative rounded-3xl overflow-hidden shadow-2xl border-4 border-white bg-white">
-                    <img 
-                      src="/src/assets/images/hero_bead_art_showcase_1795515646405.jpg" 
-                      alt="Showcase" 
+                    <img
+                      src={storefront.heroImageUrl}
+                      alt="Little Pixel Keepsakes handmade bead art showcase"
                       className="w-full h-auto object-cover aspect-[4/3]"
                     />
                   </div>
@@ -542,6 +613,20 @@ export default function App() {
                     )}
 
                     <div className="space-y-4">
+                      <div className="rounded-2xl overflow-hidden aspect-[4/3] bg-[#FAF6EE] border border-[#14233C]/10">
+                        <img
+                          src={
+                            product.id === 'keychain'
+                              ? storefront.productImages.keychain
+                              : product.id === 'magnet'
+                                ? storefront.productImages.magnet
+                                : storefront.productImages.bundle
+                          }
+                          alt={product.name}
+                          className="w-full h-full object-cover"
+                        />
+                      </div>
+
                       <div className="flex items-center justify-between">
                         <div className={`w-10 h-10 rounded-xl flex items-center justify-center ${isSelected ? 'bg-[#14233C] text-[#FAF6EE]' : 'bg-[#14233C]/10 text-[#14233C]'}`}>
                           {product.id === 'keychain' && <Package className="w-5 h-5" />}
@@ -652,7 +737,7 @@ export default function App() {
             </div>
           </section>
 
-          {/* Gallery & FAQ Sections */}
+          {/* Gallery Section */}
           <section id="gallery" className="py-16 px-4 sm:px-8 bg-white/50 border-y border-[#14233C]/10">
             <div className="max-w-6xl mx-auto">
               <div className="text-center space-y-3 mb-12">
@@ -660,8 +745,8 @@ export default function App() {
                 <h2 className="text-3xl sm:text-4xl font-extrabold text-[#14233C]">From Photo to Bead Art</h2>
               </div>
               <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
-                {GALLERY_ITEMS.map((item, idx) => (
-                  <div key={idx} className="bg-[#FAF6EE] rounded-3xl overflow-hidden border border-[#14233C]/10 shadow-lg flex flex-col">
+                {storefront.galleryItems.map((item, idx) => (
+                  <div key={item.id || idx} className="bg-[#FAF6EE] rounded-3xl overflow-hidden border border-[#14233C]/10 shadow-lg flex flex-col">
                     <div className="relative aspect-[4/3] overflow-hidden bg-gray-100">
                       <img src={item.image} alt={item.title} className="w-full h-full object-cover" />
                     </div>
@@ -672,6 +757,42 @@ export default function App() {
                   </div>
                 ))}
               </div>
+            </div>
+          </section>
+
+          {/* FAQ Section */}
+          <section id="faq" className="py-16 px-4 sm:px-8 max-w-3xl mx-auto">
+            <div className="text-center space-y-2 mb-10">
+              <span className="text-xs font-bold uppercase tracking-widest text-[#E05A40]">FAQ</span>
+              <h2 className="text-3xl font-extrabold text-[#14233C]">Frequently Asked Questions</h2>
+            </div>
+            <div className="space-y-3">
+              {FAQS.map((faq, idx) => {
+                const isOpen = openFaq === idx;
+                return (
+                  <div
+                    key={faq.question}
+                    className="bg-white rounded-2xl border border-[#14233C]/12 overflow-hidden"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => setOpenFaq(isOpen ? null : idx)}
+                      aria-expanded={isOpen}
+                      className="w-full px-6 py-4 text-left flex items-center justify-between gap-4 font-bold text-sm text-[#14233C] hover:bg-[#FAF6EE]/60 transition-colors"
+                    >
+                      <span>{faq.question}</span>
+                      <ChevronDown
+                        className={`w-4 h-4 text-[#14233C]/60 shrink-0 transition-transform ${isOpen ? 'rotate-180' : ''}`}
+                      />
+                    </button>
+                    {isOpen && (
+                      <div className="px-6 pb-5 text-xs sm:text-sm text-[#14233C]/75 leading-relaxed border-t border-[#14233C]/10 pt-3">
+                        {faq.answer}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           </section>
         </>
@@ -695,21 +816,42 @@ export default function App() {
               </label>
             ) : (
               <div className="space-y-4">
-                <div className="rounded-2xl overflow-hidden border max-w-sm mx-auto aspect-[4/3]">
-                  <img src={photoPreview} alt="Preview" className="w-full h-full object-contain" />
+                <div className="rounded-2xl overflow-hidden border max-w-sm mx-auto aspect-[4/3] bg-[#FAF6EE]">
+                  <img src={photoPreview} alt="Uploaded photo preview" className="w-full h-full object-contain" />
                 </div>
-                <button onClick={() => { setPhotoPreview(null); setUploadedPhotoUrl(null); }} className="px-4 py-2 bg-gray-100 rounded-xl text-xs font-bold">Replace Photo</button>
+                <div className="flex flex-wrap items-center gap-3">
+                  <label className="px-4 py-2 bg-[#FAF6EE] border border-[#14233C]/20 rounded-xl text-xs font-bold cursor-pointer hover:bg-[#14233C]/5 transition-colors">
+                    <span>{uploading ? 'Uploading…' : 'Replace Photo'}</span>
+                    <input type="file" accept="image/jpeg,image/png" onChange={handleFileChange} className="hidden" />
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (photoPreview && photoPreview.startsWith('blob:')) {
+                        URL.revokeObjectURL(photoPreview);
+                      }
+                      setPhotoFile(null);
+                      setPhotoPreview(null);
+                      setUploadedPhotoUrl(null);
+                    }}
+                    className="px-4 py-2 bg-gray-100 rounded-xl text-xs font-bold text-[#14233C]/75 hover:text-[#14233C]"
+                  >
+                    Remove
+                  </button>
+                </div>
               </div>
             )}
 
             {uploadError && <p className="text-xs font-bold text-red-600">{uploadError}</p>}
+
+            <p className="text-xs text-[#14233C]/65">{DELIVERY_PROMISE_TEXT}</p>
 
             <button 
               disabled={!uploadedPhotoUrl || uploading}
               onClick={() => setOrderStep('details')}
               className={`w-full py-4 rounded-2xl font-bold text-sm ${uploadedPhotoUrl && !uploading ? 'bg-[#14233C] text-white' : 'bg-gray-200 text-gray-400 cursor-not-allowed'}`}
             >
-              Continue to Delivery Details
+              {uploading ? 'Uploading photo…' : 'Continue to Delivery Details'}
             </button>
           </div>
         </div>
@@ -775,6 +917,32 @@ export default function App() {
           </button>
           <div className="bg-white rounded-3xl p-6 sm:p-10 shadow-xl border border-[#14233C]/10 space-y-6">
             <h2 className="text-2xl font-black text-[#14233C]">Order Summary & Review</h2>
+
+            {photoPreview && (
+              <div className="flex items-center justify-between gap-4 p-4 rounded-2xl bg-[#FAF6EE]/70 border border-[#14233C]/10">
+                <div className="flex items-center gap-3 min-w-0">
+                  <img
+                    src={photoPreview}
+                    alt="Selected keepsake photo"
+                    className="w-16 h-16 rounded-xl object-cover border border-[#14233C]/10 shrink-0"
+                  />
+                  <div className="min-w-0">
+                    <p className="text-xs font-bold text-[#14233C]">Uploaded Photo Ready</p>
+                    <p className="text-[11px] text-[#14233C]/65 truncate">
+                      {photoFile?.name || 'Saved photo'}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setOrderStep('upload')}
+                  className="text-xs font-bold text-[#E05A40] hover:underline whitespace-nowrap shrink-0"
+                >
+                  Replace Photo
+                </button>
+              </div>
+            )}
+
             <div className="bg-[#FAF6EE] p-5 rounded-2xl space-y-3">
               <div className="flex justify-between font-bold">
                 <span>{currentProduct.name} {selectedProductId === 'bundle' && activeBundle ? `(${activeBundle.name})` : ''}</span>
@@ -795,6 +963,7 @@ export default function App() {
                 <span>{formatRM(activePriceSen + deliveryFeeSen)}</span>
               </div>
             </div>
+            <p className="text-xs text-[#14233C]/70 leading-relaxed">{DELIVERY_PROMISE_TEXT}</p>
             {orderError && <p className="text-xs font-bold text-red-600">{orderError}</p>}
             <button disabled={submittingOrder} onClick={handleConfirmAndCreateOrder} className="w-full bg-[#FF8D76] text-[#14233C] font-black py-4 rounded-2xl shadow-lg text-sm">
               {submittingOrder ? 'Saving Order...' : 'Continue to Payment Options'}
@@ -803,13 +972,14 @@ export default function App() {
         </div>
       )}
 
-      {/* PAYMENT PAGE (LINKED TO SAVED ORDER) */}
+      {/* PAYMENT & CUSTOMER ORDER STATUS PAGE (LINKED TO SAVED ORDER VIA SECURE TOKEN) */}
       {orderStep === 'payment' && currentOrder && (
         <div className="flex-1">
           <PaymentPage
             order={currentOrder}
             merchantConfig={merchantConfig}
             merchantConfigLoading={merchantConfigLoading}
+            whatsappUrl={storefront.whatsappUrl}
             returnNotice={paymentReturnNotice}
             onOrderUpdated={updated => {
               setCurrentOrder(updated);
@@ -827,6 +997,11 @@ export default function App() {
           <AdminPage
             onBackToShop={handleReturnHome}
             onOpenOrderPayment={handleOpenOrderPaymentFromAdmin}
+            onStorefrontUpdated={(nextStorefront, nextMerchant) => {
+              setStorefront(nextStorefront);
+              setMerchantConfig(nextMerchant);
+              setDeliveryFeeSen(nextStorefront.deliveryRatesSen.peninsular);
+            }}
           />
         </div>
       )}
@@ -835,15 +1010,28 @@ export default function App() {
       <footer className="mt-auto border-t border-[#14233C]/10 py-6 px-4 sm:px-8">
         <div className="max-w-6xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-3 text-xs text-[#14233C]/60">
           <span>© {new Date().getFullYear()} Little Pixel Keepsakes · Handmade in Malaysia</span>
-          {orderStep !== 'admin' && (
-            <button
-              type="button"
-              onClick={handleOpenAdmin}
-              className="font-semibold text-[#14233C]/65 hover:text-[#14233C] underline transition-colors"
-            >
-              Staff Admin
-            </button>
-          )}
+          <div className="flex items-center gap-4">
+            {storefront.whatsappUrl && (
+              <a
+                href={storefront.whatsappUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 font-semibold text-emerald-800 hover:text-emerald-900 underline"
+              >
+                <MessageCircle className="w-3.5 h-3.5" />
+                <span>WhatsApp Support</span>
+              </a>
+            )}
+            {orderStep !== 'admin' && (
+              <button
+                type="button"
+                onClick={handleOpenAdmin}
+                className="font-semibold text-[#14233C]/65 hover:text-[#14233C] underline transition-colors"
+              >
+                Staff Admin
+              </button>
+            )}
+          </div>
         </div>
       </footer>
     </div>

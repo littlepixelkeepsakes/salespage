@@ -8,22 +8,27 @@ import {
   CreditCard,
   Download,
   FileText,
+  Link2,
   Lock,
+  MessageCircle,
   QrCode,
   RefreshCw,
   ShieldCheck,
   Upload
 } from 'lucide-react';
-import type {
-  MerchantPaymentConfig,
-  OrderPublic,
-  PaymentMethodKey
+import {
+  DELIVERY_PROMISE_TEXT,
+  PAID_CONFIRMATION_HEADING,
+  type MerchantPaymentConfig,
+  type OrderPublic,
+  type PaymentMethodKey
 } from '../types/order';
 
 interface PaymentPageProps {
   order: OrderPublic;
   merchantConfig: MerchantPaymentConfig | null;
   merchantConfigLoading: boolean;
+  whatsappUrl: string | null;
   returnNotice: 'success_pending' | 'cancelled' | 'failed' | null;
   onOrderUpdated: (updated: OrderPublic) => void;
   onRefreshOrder: () => Promise<OrderPublic | null>;
@@ -43,6 +48,7 @@ export default function PaymentPage({
   order,
   merchantConfig,
   merchantConfigLoading,
+  whatsappUrl,
   returnNotice,
   onOrderUpdated,
   onRefreshOrder,
@@ -64,10 +70,17 @@ export default function PaymentPage({
     ) {
       return 'card';
     }
+    if (
+      order.paymentStatus === 'Receipt correction needed' &&
+      order.paymentMethod &&
+      availableMethods.includes(order.paymentMethod)
+    ) {
+      return order.paymentMethod;
+    }
     return availableMethods[0] ?? null;
   });
   const methodInitializedRef = React.useRef(false);
-  const [copiedField, setCopiedField] = useState<'ref' | 'amount' | null>(null);
+  const [copiedField, setCopiedField] = useState<'ref' | 'amount' | 'link' | null>(null);
 
   // Manual QR form state
   const [transactionRef, setTransactionRef] = useState('');
@@ -83,7 +96,9 @@ export default function PaymentPage({
 
   // Webhook confirmation polling when returning from Stripe ?payment=success
   const [waitingForWebhook, setWaitingForWebhook] = useState(
-    returnNotice === 'success_pending' && order.paymentStatus === 'Awaiting payment'
+    returnNotice === 'success_pending' &&
+      (order.paymentStatus === 'Awaiting payment' ||
+        order.paymentStatus === 'Receipt correction needed')
   );
   const [checkingStatus, setCheckingStatus] = useState(false);
   const [pollAttempts, setPollAttempts] = useState(0);
@@ -100,17 +115,35 @@ export default function PaymentPage({
         setActiveMethod('card');
         return;
       }
+      if (
+        order.paymentStatus === 'Receipt correction needed' &&
+        order.paymentMethod &&
+        availableMethods.includes(order.paymentMethod)
+      ) {
+        setActiveMethod(order.paymentMethod);
+        return;
+      }
       setActiveMethod(availableMethods[0] ?? null);
       return;
     }
     if (!activeMethod || !availableMethods.includes(activeMethod)) {
       setActiveMethod(availableMethods[0] ?? null);
     }
-  }, [merchantConfigLoading, availableMethods, activeMethod, returnNotice]);
+  }, [
+    merchantConfigLoading,
+    availableMethods,
+    activeMethod,
+    returnNotice,
+    order.paymentStatus,
+    order.paymentMethod
+  ]);
 
   // Keep polling briefly if returning from Stripe Checkout while webhook completes
   useEffect(() => {
-    if (order.paymentStatus !== 'Awaiting payment') {
+    if (
+      order.paymentStatus !== 'Awaiting payment' &&
+      order.paymentStatus !== 'Receipt correction needed'
+    ) {
       setWaitingForWebhook(false);
       return;
     }
@@ -127,7 +160,12 @@ export default function PaymentPage({
     return () => window.clearTimeout(timer);
   }, [waitingForWebhook, pollAttempts, order.paymentStatus, onRefreshOrder]);
 
-  const handleCopy = async (text: string, field: 'ref' | 'amount') => {
+  const secureOrderUrl =
+    typeof window !== 'undefined'
+      ? `${window.location.origin}/?order=${encodeURIComponent(order.reference)}&token=${encodeURIComponent(order.accessToken)}`
+      : `/?order=${encodeURIComponent(order.reference)}&token=${encodeURIComponent(order.accessToken)}`;
+
+  const handleCopy = async (text: string, field: 'ref' | 'amount' | 'link') => {
     try {
       await navigator.clipboard.writeText(text);
       setCopiedField(field);
@@ -197,9 +235,13 @@ export default function PaymentPage({
     setReceiptFile(file);
   };
 
+  const canSubmitPayment =
+    order.paymentStatus === 'Awaiting payment' ||
+    order.paymentStatus === 'Receipt correction needed';
+
   const handleManualQrSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (order.paymentStatus !== 'Awaiting payment') return;
+    if (!canSubmitPayment) return;
     if (activeMethod !== 'tng' && activeMethod !== 'duitnow') return;
 
     const cleanRef = transactionRef.trim();
@@ -224,9 +266,13 @@ export default function PaymentPage({
       try {
         const res = await fetch('/api/upload-receipt', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'x-order-token': order.accessToken
+          },
           body: JSON.stringify({
             reference: order.reference,
+            accessToken: order.accessToken,
             paymentMethod: activeMethod,
             transactionReference: cleanRef,
             receiptBase64: reader.result as string,
@@ -252,15 +298,21 @@ export default function PaymentPage({
   };
 
   const handleStartStripeCheckout = async () => {
-    if (order.paymentStatus !== 'Awaiting payment') return;
+    if (!canSubmitPayment) return;
     setCardLoading(true);
     setCardError(null);
 
     try {
       const res = await fetch('/api/create-stripe-session', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ reference: order.reference })
+        headers: {
+          'Content-Type': 'application/json',
+          'x-order-token': order.accessToken
+        },
+        body: JSON.stringify({
+          reference: order.reference,
+          accessToken: order.accessToken
+        })
       });
       const data = await res.json();
       if (res.ok && data.success && data.url) {
@@ -299,6 +351,7 @@ export default function PaymentPage({
 
   const isPaid = order.paymentStatus === 'Paid';
   const isPendingVerification = order.paymentStatus === 'Pending verification';
+  const isCorrectionNeeded = order.paymentStatus === 'Receipt correction needed';
   const isLocked = isPaid || isPendingVerification;
 
   return (
@@ -306,21 +359,55 @@ export default function PaymentPage({
       {/* Page Heading */}
       <div className="mb-8 flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4 border-b border-[#14233C]/10 pb-6">
         <div className="space-y-1.5">
-          <div className="flex items-center gap-2 text-xs font-medium text-[#14233C]/65">
-            <span>Saved Order Checkout</span>
+          <div className="flex flex-wrap items-center gap-2 text-xs font-medium text-[#14233C]/65">
+            <span>Customer Order Status</span>
             <span aria-hidden="true">·</span>
             <span className="font-mono font-semibold text-[#14233C]">{order.reference}</span>
+            <span aria-hidden="true">·</span>
+            <span
+              className={`font-bold ${
+                isPaid
+                  ? 'text-emerald-800'
+                  : isPendingVerification
+                    ? 'text-amber-800'
+                    : isCorrectionNeeded
+                      ? 'text-red-700'
+                      : 'text-[#E05A40]'
+              }`}
+            >
+              {order.paymentStatus}
+            </span>
           </div>
           <h1 className="text-3xl sm:text-4xl font-extrabold tracking-tight text-[#14233C] [text-wrap:balance]">
             {isPaid
-              ? 'Payment Confirmed'
+              ? PAID_CONFIRMATION_HEADING
               : isPendingVerification
                 ? 'Pending Verification'
-                : 'Complete Your Payment'}
+                : isCorrectionNeeded
+                  ? 'Receipt Correction Needed'
+                  : 'Complete Your Payment'}
           </h1>
         </div>
 
-        <div className="flex items-center gap-3 shrink-0">
+        <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+          <button
+            type="button"
+            onClick={() => handleCopy(secureOrderUrl, 'link')}
+            className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-semibold text-[#14233C] bg-white border border-[#14233C]/15 rounded-xl hover:border-[#14233C]/35 transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#14233C]"
+          >
+            {copiedField === 'link' ? (
+              <>
+                <Check className="w-3.5 h-3.5 text-emerald-700" />
+                <span>Order Link Copied</span>
+              </>
+            ) : (
+              <>
+                <Link2 className="w-3.5 h-3.5 text-[#14233C]/65" />
+                <span>Copy Secure Order Link</span>
+              </>
+            )}
+          </button>
+
           <button
             type="button"
             onClick={() => handleCopy(order.reference, 'ref')}
@@ -341,7 +428,7 @@ export default function PaymentPage({
         </div>
       </div>
 
-      {/* 2-Column Balanced Checkout Layout */}
+      {/* 2-Column Balanced Checkout / Status Layout */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
         {/* LEFT COLUMN: Saved Order Summary (5 cols) */}
         <aside className="lg:col-span-5 bg-white rounded-2xl border border-[#14233C]/12 p-6 sm:p-7 space-y-6">
@@ -350,14 +437,17 @@ export default function PaymentPage({
             <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-[#14233C]">
               {isPaid && <CheckCircle2 className="w-4 h-4 text-emerald-700" />}
               {isPendingVerification && <Clock className="w-4 h-4 text-amber-700" />}
-              {!isLocked && <AlertCircle className="w-4 h-4 text-[#E05A40]" />}
+              {isCorrectionNeeded && <AlertCircle className="w-4 h-4 text-red-700" />}
+              {!isLocked && !isCorrectionNeeded && <AlertCircle className="w-4 h-4 text-[#E05A40]" />}
               <span
                 className={
                   isPaid
                     ? 'text-emerald-800'
                     : isPendingVerification
                       ? 'text-amber-800'
-                      : 'text-[#14233C]'
+                      : isCorrectionNeeded
+                        ? 'text-red-700'
+                        : 'text-[#14233C]'
                 }
               >
                 {order.paymentStatus}
@@ -446,37 +536,62 @@ export default function PaymentPage({
               {order.customer.address}, {order.customer.postcode} {order.customer.city},{' '}
               {order.customer.state}
             </p>
+            <p className="pt-2 text-[11px] font-medium text-[#14233C]/70">
+              {DELIVERY_PROMISE_TEXT}
+            </p>
           </div>
+
+          {whatsappUrl && (
+            <div className="pt-4 border-t border-[#14233C]/10">
+              <a
+                href={`${whatsappUrl}?text=${encodeURIComponent(`Hi Little Pixel Keepsakes, I have a question about order ${order.reference}.`)}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-2 text-xs font-bold text-emerald-800 hover:text-emerald-900 underline"
+              >
+                <MessageCircle className="w-4 h-4 shrink-0" />
+                <span>Need help? Chat with us on WhatsApp</span>
+              </a>
+            </div>
+          )}
         </aside>
 
         {/* RIGHT COLUMN: Payment Methods or Locked Status View (7 cols) */}
         <section className="lg:col-span-7 bg-white rounded-2xl border border-[#14233C]/12 p-6 sm:p-8 space-y-6">
-          {/* STATE 1: PAID — Prevent opening another payment session */}
+          {/* STATE 1: PAID — Only shown when verified Paid by staff or Stripe webhook */}
           {isPaid && (
             <div className="space-y-6">
               <div className="flex items-start gap-4">
                 <div className="w-11 h-11 rounded-xl bg-emerald-50 text-emerald-700 flex items-center justify-center shrink-0">
                   <CheckCircle2 className="w-6 h-6" />
                 </div>
-                <div className="space-y-1.5">
-                  <h2 className="text-xl font-extrabold text-[#14233C]">
-                    Your order is paid and confirmed
+                <div className="space-y-2">
+                  <p className="text-xs font-bold text-emerald-800">Status: Paid</p>
+                  <h2 className="text-2xl font-extrabold text-[#14233C]">
+                    {PAID_CONFIRMATION_HEADING}
                   </h2>
-                  <p className="text-sm text-[#14233C]/75 leading-relaxed">
-                    Thank you! We have verified your payment of{' '}
-                    <span className="font-bold tabular-nums text-[#14233C]">
-                      {formatRM(order.totalSen)}
-                    </span>{' '}
-                    and queued your handmade keepsake for crafting. Delivery takes up to 14
-                    calendar days.
+                  <p className="text-sm text-[#14233C]/80 leading-relaxed">
+                    {DELIVERY_PROMISE_TEXT}
                   </p>
                 </div>
               </div>
 
               <dl className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-5 border-t border-[#14233C]/10 text-xs">
                 <div>
-                  <dt className="text-[#14233C]/60">Payment Status</dt>
-                  <dd className="font-bold text-emerald-800 mt-0.5">Paid</dd>
+                  <dt className="text-[#14233C]/60">Order Reference</dt>
+                  <dd className="font-mono font-bold text-[#14233C] mt-0.5">{order.reference}</dd>
+                </div>
+                <div>
+                  <dt className="text-[#14233C]/60">Items</dt>
+                  <dd className="font-bold text-[#14233C] mt-0.5">
+                    {order.productName} (Qty {order.itemQuantity})
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-[#14233C]/60">Total Paid</dt>
+                  <dd className="font-extrabold tabular-nums text-emerald-800 text-sm mt-0.5">
+                    {formatRM(order.totalSen)}
+                  </dd>
                 </div>
                 <div>
                   <dt className="text-[#14233C]/60">Payment Method</dt>
@@ -484,15 +599,19 @@ export default function PaymentPage({
                     {order.paymentMethodLabel || formatPaymentMethodLabel(order.paymentMethod)}
                   </dd>
                 </div>
-                <div>
-                  <dt className="text-[#14233C]/60">Order Reference</dt>
-                  <dd className="font-mono font-bold text-[#14233C] mt-0.5">{order.reference}</dd>
-                </div>
                 {order.paidAt && (
                   <div>
                     <dt className="text-[#14233C]/60">Confirmed At</dt>
                     <dd className="font-medium text-[#14233C] mt-0.5">
                       {new Date(order.paidAt).toLocaleString()}
+                    </dd>
+                  </div>
+                )}
+                {order.confirmationEmailStatus === 'sent' && (
+                  <div>
+                    <dt className="text-[#14233C]/60">Confirmation Email</dt>
+                    <dd className="font-medium text-emerald-800 mt-0.5">
+                      Sent to {order.customer.email}
                     </dd>
                   </div>
                 )}
@@ -626,27 +745,45 @@ export default function PaymentPage({
             </div>
           )}
 
-          {/* STATE 4: AWAITING PAYMENT — Active payment selection */}
+          {/* STATE 4: AWAITING PAYMENT OR RECEIPT CORRECTION NEEDED */}
           {!isLocked && !waitingForWebhook && (
             <div className="space-y-6">
-              {/* Inline notice when returning from cancelled/failed attempt or staff rejection */}
-              {(returnNotice === 'cancelled' ||
-                returnNotice === 'failed' ||
-                order.lastCardAttemptMessage) && (
+              {/* Prominent alert when staff requested a corrected receipt */}
+              {isCorrectionNeeded && (
                 <div
                   role="alert"
-                  className="flex items-start gap-3 p-4 rounded-xl bg-amber-50 border border-amber-200 text-amber-950 text-xs leading-relaxed"
+                  className="flex items-start gap-3 p-4 rounded-xl bg-red-50 border border-red-200 text-red-950 text-xs leading-relaxed"
                 >
-                  <AlertCircle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
-                  <div className="space-y-0.5">
-                    <p className="font-bold">Payment action needed</p>
+                  <AlertCircle className="w-4 h-4 text-red-700 shrink-0 mt-0.5" />
+                  <div className="space-y-1">
+                    <p className="font-bold">Status: Receipt correction needed</p>
                     <p>
-                      {order.lastCardAttemptMessage ||
-                        'Your saved order and uploaded photo are still linked to this reference. You can retry card checkout or switch to a QR payment below without uploading your photo again.'}
+                      {order.correctionReason ||
+                        'We could not verify your previous payment receipt. Please upload a clear replacement receipt below or choose another payment method.'}
                     </p>
                   </div>
                 </div>
               )}
+
+              {/* Inline notice when returning from cancelled/failed Stripe attempt */}
+              {!isCorrectionNeeded &&
+                (returnNotice === 'cancelled' ||
+                  returnNotice === 'failed' ||
+                  order.lastCardAttemptMessage) && (
+                  <div
+                    role="alert"
+                    className="flex items-start gap-3 p-4 rounded-xl bg-amber-50 border border-amber-200 text-amber-950 text-xs leading-relaxed"
+                  >
+                    <AlertCircle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                    <div className="space-y-0.5">
+                      <p className="font-bold">Payment action needed</p>
+                      <p>
+                        {order.lastCardAttemptMessage ||
+                          'Your saved order and uploaded photo are still linked to this reference. You can retry card checkout or switch to a QR payment below without uploading your photo again.'}
+                      </p>
+                    </div>
+                  </div>
+                )}
 
               {/* Select Payment Method — Three Independent Options */}
               <div className="space-y-2.5">
@@ -854,7 +991,9 @@ export default function PaymentPage({
                     className="pt-6 border-t border-[#14233C]/10 space-y-4"
                   >
                     <h4 className="text-sm font-bold text-[#14233C]">
-                      Submit {activeQrConfig.label} Receipt
+                      {isCorrectionNeeded
+                        ? `Upload Replacement ${activeQrConfig.label} Receipt`
+                        : `Submit ${activeQrConfig.label} Receipt`}
                     </h4>
 
                     <div>
@@ -930,7 +1069,9 @@ export default function PaymentPage({
                     >
                       {receiptSubmitting
                         ? 'Uploading receipt securely…'
-                        : `Submit ${activeQrConfig.label} Receipt`}
+                        : isCorrectionNeeded
+                          ? `Upload Replacement ${activeQrConfig.label} Receipt`
+                          : `Submit ${activeQrConfig.label} Receipt`}
                     </button>
                   </form>
                 </div>
