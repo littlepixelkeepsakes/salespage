@@ -215,6 +215,7 @@ function mapStoreSettingsRow(row?: StoreSettingsRow | null): EditableStoreSettin
 
 // Transient in-memory locks & short-lived session caches (all persistent records live in Supabase)
 const inFlightConfirmationEmails: Set<string> = new Set();
+const inFlightStripeEvents: Set<string> = new Set();
 
 interface AdminSessionRecord {
   staffId: string | null;
@@ -761,9 +762,9 @@ function getEmailConfig(): {
   fromAddress: string | null;
   issue?: string;
 } {
-  const fromAddress = (process.env.EMAIL_FROM || '').trim();
+  const fromAddress = stripWrappingQuotes(process.env.EMAIL_FROM || '');
   const hasValidFrom = isValidEmailFromHeader(fromAddress);
-  const resendKey = (process.env.RESEND_API_KEY || '').trim();
+  const resendKey = stripWrappingQuotes(process.env.RESEND_API_KEY || '');
 
   if (resendKey) {
     if (!fromAddress) {
@@ -1100,7 +1101,7 @@ async function sendOrderConfirmationEmailOnce(
     const response = await fetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${(process.env.RESEND_API_KEY || '').trim()}`,
+        Authorization: `Bearer ${stripWrappingQuotes(process.env.RESEND_API_KEY || '')}`,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
@@ -1242,7 +1243,7 @@ async function startServer() {
   // ============================================================================
   app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
     const sig = req.headers['stripe-signature'];
-    const webhookSecret = (process.env.STRIPE_WEBHOOK_SECRET || '').trim();
+    const webhookSecret = stripWrappingQuotes(process.env.STRIPE_WEBHOOK_SECRET || '');
     const supabaseHealth = await checkSupabaseHealth();
 
     if (!supabaseHealth.configured) {
@@ -1254,26 +1255,52 @@ async function startServer() {
 
     const stripeInfo = getStripeConfig(supabaseHealth);
     if (!stripeInfo.client) {
-      return res.status(503).json({ error: 'Stripe is not configured on this server.' });
+      return res.status(503).json({
+        error: 'Stripe is not configured on this server.',
+        code: 'STRIPE_UNAVAILABLE'
+      });
     }
     if (!webhookSecret) {
-      return res.status(500).json({ error: 'Stripe webhook signing secret is not configured on the server.' });
+      return res.status(500).json({
+        error: 'Stripe webhook signing secret is not configured on the server.',
+        code: 'STRIPE_WEBHOOK_SECRET_MISSING'
+      });
     }
     if (!sig || typeof sig !== 'string') {
-      return res.status(400).json({ error: 'Missing Stripe-Signature header.' });
+      return res.status(400).json({
+        error: 'Missing Stripe-Signature header.',
+        code: 'MISSING_WEBHOOK_SIGNATURE'
+      });
     }
 
     let event: Stripe.Event;
     try {
       event = stripeInfo.client.webhooks.constructEvent(req.body, sig, webhookSecret);
     } catch (err: any) {
-      console.error('Webhook signature verification failed:', err.message);
-      return res.status(400).send(`Webhook Error: ${err.message}`);
+      console.error('Webhook signature verification failed:', sanitizeSensitiveText(err?.message || err));
+      return res.status(400).json({
+        error: 'Webhook signature verification failed.',
+        code: 'INVALID_WEBHOOK_SIGNATURE'
+      });
     }
+
+    if (inFlightStripeEvents.has(event.id)) {
+      return res.json({ received: true, duplicate: true });
+    }
+    inFlightStripeEvents.add(event.id);
 
     try {
       if (await hasProcessedStripeEvent(event.id)) {
         return res.json({ received: true, duplicate: true });
+      }
+
+      const expectedLivemode = stripeInfo.mode === 'live';
+      if (Boolean(event.livemode) !== expectedLivemode) {
+        console.warn(`Stripe webhook livemode mismatch for event ${event.id}`, {
+          expectedLivemode,
+          receivedLivemode: Boolean(event.livemode)
+        });
+        return res.json({ received: true, ignored: 'mode_mismatch' });
       }
 
       if (
@@ -1300,7 +1327,16 @@ async function startServer() {
 
         // Strictly verify this Stripe session was created by this server for this exact order
         const paymentRow = await fetchPaymentByStripeSessionId(session.id);
-        const sessionMatchesOrder = Boolean(paymentRow && paymentRow.order_id === order.id);
+        const sessionMatchesOrder = Boolean(
+          paymentRow &&
+            paymentRow.order_id === order.id &&
+            paymentRow.payment_method === 'card' &&
+            paymentRow.amount_sen === order.total_sen
+        );
+
+        if (paymentRow?.status === 'paid') {
+          return res.json({ received: true, duplicate: true });
+        }
 
         const amountTotal = session.amount_total;
         const currency = (session.currency || '').toLowerCase();
@@ -1351,9 +1387,8 @@ async function startServer() {
             receivedCurrency: currency,
             paymentStatus
           });
+          return res.json({ received: true, ignored: 'validation_mismatch' });
         }
-
-        return res.json({ received: true });
       }
 
       if (event.type === 'checkout.session.expired' || event.type === 'checkout.session.async_payment_failed') {
@@ -1391,6 +1426,8 @@ async function startServer() {
     } catch (err) {
       console.error('Stripe webhook processing error:', sanitizeSupabaseError(err));
       return res.status(500).json({ error: 'Failed to persist Stripe webhook state.' });
+    } finally {
+      inFlightStripeEvents.delete(event.id);
     }
   });
 
@@ -2718,6 +2755,8 @@ async function startServer() {
         if (
           order.payment_status !== 'Pending verification' ||
           !latestReceiptPayment?.receipt_storage_path ||
+          latestReceiptPayment.status !== 'pending_verification' ||
+          latestReceiptPayment.payment_method !== order.payment_method ||
           (order.payment_method !== 'tng' && order.payment_method !== 'duitnow')
         ) {
           return res.status(400).json({
@@ -2878,6 +2917,11 @@ async function startServer() {
       }
     }
   );
+
+  // Explicitly block legacy /uploads/* paths from ever being served publicly
+  app.use('/uploads', (_req, res) => {
+    return res.status(404).json({ error: 'Not found.' });
+  });
 
   // Ensure unmatched /api/* routes always return JSON (never Vite or SPA HTML)
   app.use('/api', (_req, res) => {
