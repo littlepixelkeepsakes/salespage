@@ -437,6 +437,21 @@ export async function createShortLivedSignedUrl(
   }
 }
 
+export async function createSignedPrivateUploadUrl(
+  bucket: string,
+  storagePath: string
+): Promise<{ signedUrl: string; path: string }> {
+  const client = getSupabaseAdminClient();
+  const { data, error } = await client.storage.from(bucket).createSignedUploadUrl(storagePath);
+  if (error || !data?.signedUrl) {
+    throw new Error(`Signed upload URL creation failed (${bucket}): ${sanitizeSupabaseError(error || 'No signed URL returned')}`);
+  }
+  return {
+    signedUrl: data.signedUrl,
+    path: data.path || storagePath
+  };
+}
+
 // ============================================================================
 // STORE SETTINGS REPOSITORY
 // ============================================================================

@@ -18,6 +18,7 @@ import {
   clearSupabaseHealthCache,
   createBootstrapStaffAccount,
   createShortLivedSignedUrl,
+  createSignedPrivateUploadUrl,
   downloadPrivateFile,
   fetchHydratedOrderByReference,
   fetchOrderByReference,
@@ -233,6 +234,9 @@ interface PhotoUploadSessionRecord {
   photoOriginalFilename: string | null;
   photoMimeType: 'image/jpeg' | 'image/png' | null;
   photoSizeBytes: number | null;
+  pendingSignedUploadPath: string | null;
+  pendingSignedUploadMime: 'image/jpeg' | 'image/png' | null;
+  pendingSignedUploadFilename: string | null;
 }
 const photoUploadSessions: Map<string, PhotoUploadSessionRecord> = new Map();
 const uploadSessionRateTracker: Map<string, { count: number; resetAt: number }> = new Map();
@@ -242,10 +246,16 @@ function pruneExpiredUploadSessions(): void {
   for (const [token, session] of photoUploadSessions.entries()) {
     if (session.expiresAt < now) {
       photoUploadSessions.delete(token);
-      if (session.photoStoragePath) {
-        const cfg = getSupabaseEnvConfig();
-        if (cfg.valid) {
+      const cfg = getSupabaseEnvConfig();
+      if (cfg.valid) {
+        if (session.photoStoragePath) {
           void removePrivateFile(cfg.photosBucket, session.photoStoragePath);
+        }
+        if (
+          session.pendingSignedUploadPath &&
+          session.pendingSignedUploadPath !== session.photoStoragePath
+        ) {
+          void removePrivateFile(cfg.photosBucket, session.pendingSignedUploadPath);
         }
       }
     }
@@ -1459,42 +1469,55 @@ async function startServer() {
     const health = await requireSupabaseReady(res);
     if (!health) return;
 
-    pruneExpiredUploadSessions();
+    try {
+      pruneExpiredUploadSessions();
 
-    const ip = req.ip || 'unknown';
-    const tracker = uploadSessionRateTracker.get(ip);
-    if (tracker && tracker.resetAt > Date.now() && tracker.count >= MAX_UPLOAD_SESSIONS_PER_WINDOW) {
-      return res.status(429).json({
-        error: 'Too many photo upload sessions started recently. Please wait a few minutes and try again.'
+      const ip = req.ip || 'unknown';
+      const tracker = uploadSessionRateTracker.get(ip);
+      if (tracker && tracker.resetAt > Date.now() && tracker.count >= MAX_UPLOAD_SESSIONS_PER_WINDOW) {
+        return res.status(429).json({
+          error: 'Too many photo upload sessions started recently. Please wait a few minutes and try again.',
+          code: 'UPLOAD_SESSION_RATE_LIMITED'
+        });
+      }
+      const nextCount = tracker && tracker.resetAt > Date.now() ? tracker.count + 1 : 1;
+      uploadSessionRateTracker.set(ip, { count: nextCount, resetAt: Date.now() + LOGIN_WINDOW_MS });
+
+      const sessionId = crypto.randomBytes(16).toString('hex');
+      const token = crypto.randomBytes(32).toString('base64url');
+      const expiresAt = Date.now() + PHOTO_UPLOAD_SESSION_TTL_MS;
+
+      photoUploadSessions.set(token, {
+        sessionId,
+        token,
+        expiresAt,
+        photoStoragePath: null,
+        photoOriginalFilename: null,
+        photoMimeType: null,
+        photoSizeBytes: null,
+        pendingSignedUploadPath: null,
+        pendingSignedUploadMime: null,
+        pendingSignedUploadFilename: null
+      });
+
+      return res.json({
+        success: true,
+        uploadSessionToken: token,
+        expiresAt: new Date(expiresAt).toISOString(),
+        maxFileSizeBytes: MAX_UPLOAD_BYTES,
+        allowedMimeTypes: ['image/jpeg', 'image/png']
+      });
+    } catch (err) {
+      console.error('Photo upload session creation error:', sanitizeSensitiveText(err));
+      return res.status(500).json({
+        error: 'Unable to start a secure photo upload session. Please try again.',
+        code: 'UPLOAD_SESSION_CREATE_FAILED'
       });
     }
-    const nextCount = tracker && tracker.resetAt > Date.now() ? tracker.count + 1 : 1;
-    uploadSessionRateTracker.set(ip, { count: nextCount, resetAt: Date.now() + LOGIN_WINDOW_MS });
-
-    const sessionId = crypto.randomBytes(16).toString('hex');
-    const token = crypto.randomBytes(32).toString('base64url');
-    const expiresAt = Date.now() + PHOTO_UPLOAD_SESSION_TTL_MS;
-
-    photoUploadSessions.set(token, {
-      sessionId,
-      token,
-      expiresAt,
-      photoStoragePath: null,
-      photoOriginalFilename: null,
-      photoMimeType: null,
-      photoSizeBytes: null
-    });
-
-    return res.json({
-      success: true,
-      uploadSessionToken: token,
-      expiresAt: new Date(expiresAt).toISOString(),
-      maxFileSizeBytes: MAX_UPLOAD_BYTES,
-      allowedMimeTypes: ['image/jpeg', 'image/png']
-    });
   });
 
-  app.post('/api/upload-photo', async (req, res) => {
+  // Step 1 (Direct Signed Upload): Issue a short-lived signed upload URL scoped to the private customer-photos bucket
+  app.post('/api/upload-photo-url', async (req, res) => {
     const health = await requireSupabaseReady(res);
     if (!health) return;
 
@@ -1507,80 +1530,365 @@ async function startServer() {
     const uploadSessionToken = headerSession || bodySession;
 
     if (!uploadSessionToken) {
-      return res.status(401).json({ error: 'A valid secure photo upload session is required.' });
+      return res.status(401).json({
+        error: 'A valid secure photo upload session is required.',
+        code: 'UPLOAD_SESSION_REQUIRED'
+      });
     }
 
     const session = photoUploadSessions.get(uploadSessionToken);
     if (!session || session.expiresAt < Date.now()) {
       if (session) photoUploadSessions.delete(uploadSessionToken);
       return res.status(401).json({
-        error: 'Your photo upload session has expired. Please refresh or re-select your photo.'
+        error: 'Your photo upload session has expired. Please retry your upload.',
+        code: 'UPLOAD_SESSION_EXPIRED'
       });
     }
 
     try {
-      const { imageBase64, filename } = req.body || {};
-      if (typeof imageBase64 !== 'string' || !imageBase64) {
-        return res.status(400).json({ error: 'No image data provided.' });
+      const { filename, mimeType, sizeBytes } = req.body || {};
+      const normalizedRawMime = typeof mimeType === 'string' ? mimeType.trim().toLowerCase() : '';
+      if (
+        normalizedRawMime !== 'image/jpeg' &&
+        normalizedRawMime !== 'image/jpg' &&
+        normalizedRawMime !== 'image/png'
+      ) {
+        return res.status(400).json({
+          error: 'Please upload a clear JPG or PNG image.',
+          code: 'INVALID_IMAGE_TYPE'
+        });
       }
+      const resolvedMime: 'image/jpeg' | 'image/png' =
+        normalizedRawMime === 'image/png' ? 'image/png' : 'image/jpeg';
 
-      const matches = imageBase64.match(/^data:(image\/(?:jpeg|jpg|png));base64,([A-Za-z0-9+/=]+)$/);
-      if (!matches || matches.length !== 3) {
-        return res.status(400).json({ error: 'Please upload a clear JPG or PNG image.' });
+      if (typeof sizeBytes !== 'number' || !Number.isFinite(sizeBytes) || sizeBytes <= 0) {
+        return res.status(400).json({
+          error: 'Selected photo file is empty or unreadable.',
+          code: 'INVALID_IMAGE_SIZE'
+        });
       }
-
-      const mimeType: 'image/jpeg' | 'image/png' =
-        matches[1].toLowerCase() === 'image/png' ? 'image/png' : 'image/jpeg';
-      const ext = mimeType === 'image/png' ? 'png' : 'jpg';
-      const buffer = Buffer.from(matches[2], 'base64');
-
-      if (buffer.length === 0 || buffer.length > MAX_UPLOAD_BYTES) {
-        return res.status(400).json({ error: 'Photo must be smaller than 10 MB.' });
-      }
-      if (!verifyMagicBytes(buffer, mimeType)) {
-        return res.status(400).json({ error: 'Uploaded file does not match a valid JPG or PNG image.' });
+      if (sizeBytes > MAX_UPLOAD_BYTES) {
+        return res.status(413).json({
+          error: 'Photo must be smaller than 10 MB.',
+          code: 'FILE_TOO_LARGE'
+        });
       }
 
       const cfg = getSupabaseEnvConfig();
-      const previousPath = session.photoStoragePath;
+      const ext = resolvedMime === 'image/png' ? 'png' : 'jpg';
       const storagePath = `pending/${session.sessionId}/${Date.now()}_${crypto.randomBytes(6).toString('hex')}.${ext}`;
       const originalFilename = sanitizeDisplayFilename(filename, 'customer_photo', ext);
 
-      await uploadPrivateFile({
-        bucket: cfg.photosBucket,
-        storagePath,
-        buffer,
-        contentType: mimeType
-      });
-
-      if (previousPath && previousPath !== storagePath) {
-        void removePrivateFile(cfg.photosBucket, previousPath);
+      // Clean up any abandoned previous signed upload target before issuing a new one
+      if (
+        session.pendingSignedUploadPath &&
+        session.pendingSignedUploadPath !== session.photoStoragePath
+      ) {
+        void removePrivateFile(cfg.photosBucket, session.pendingSignedUploadPath);
       }
 
-      session.photoStoragePath = storagePath;
-      session.photoOriginalFilename = originalFilename;
-      session.photoMimeType = mimeType;
-      session.photoSizeBytes = buffer.length;
-      session.expiresAt = Date.now() + PHOTO_UPLOAD_SESSION_TTL_MS;
+      const signed = await createSignedPrivateUploadUrl(cfg.photosBucket, storagePath);
 
-      const signedPreviewUrl = await createShortLivedSignedUrl(cfg.photosBucket, storagePath, 900);
+      session.pendingSignedUploadPath = storagePath;
+      session.pendingSignedUploadMime = resolvedMime;
+      session.pendingSignedUploadFilename = originalFilename;
+      session.expiresAt = Date.now() + PHOTO_UPLOAD_SESSION_TTL_MS;
 
       return res.json({
         success: true,
         uploadSessionToken,
+        signedUploadUrl: signed.signedUrl,
         photoStoragePath: storagePath,
-        photoUrl: signedPreviewUrl || '',
+        mimeType: resolvedMime,
         fileName: originalFilename,
-        mimeType,
-        sizeBytes: buffer.length
+        maxFileSizeBytes: MAX_UPLOAD_BYTES
       });
     } catch (err) {
-      console.error('Private customer photo upload error:', sanitizeSupabaseError(err));
+      console.error('Signed photo upload URL error:', sanitizeSupabaseError(err));
+      clearSupabaseHealthCache();
       return res.status(502).json({
-        error: 'Could not upload your photo to private storage. Please try again.'
+        error: 'Could not authorize secure storage upload right now. Please try again.',
+        code: 'SIGNED_UPLOAD_URL_FAILED'
       });
     }
   });
+
+  // Step 2 (Direct Signed Upload): Verify uploaded private object size & magic bytes before binding to session
+  app.post('/api/upload-photo/confirm', async (req, res) => {
+    const health = await requireSupabaseReady(res);
+    if (!health) return;
+
+    pruneExpiredUploadSessions();
+
+    const headerSession =
+      typeof req.headers['x-upload-session'] === 'string' ? req.headers['x-upload-session'].trim() : '';
+    const bodySession =
+      typeof req.body?.uploadSessionToken === 'string' ? req.body.uploadSessionToken.trim() : '';
+    const uploadSessionToken = headerSession || bodySession;
+
+    if (!uploadSessionToken) {
+      return res.status(401).json({
+        error: 'A valid secure photo upload session is required.',
+        code: 'UPLOAD_SESSION_REQUIRED'
+      });
+    }
+
+    const session = photoUploadSessions.get(uploadSessionToken);
+    if (!session || session.expiresAt < Date.now()) {
+      if (session) photoUploadSessions.delete(uploadSessionToken);
+      return res.status(401).json({
+        error: 'Your photo upload session has expired. Please retry your upload.',
+        code: 'UPLOAD_SESSION_EXPIRED'
+      });
+    }
+
+    const { photoStoragePath } = req.body || {};
+    if (
+      typeof photoStoragePath !== 'string' ||
+      !photoStoragePath.trim() ||
+      !session.pendingSignedUploadPath ||
+      !safeEqualStrings(photoStoragePath.trim(), session.pendingSignedUploadPath)
+    ) {
+      return res.status(400).json({
+        error: 'Uploaded photo reference does not match your active upload session.',
+        code: 'UPLOAD_PATH_MISMATCH'
+      });
+    }
+
+    const cfg = getSupabaseEnvConfig();
+    const targetPath = session.pendingSignedUploadPath;
+    const expectedMime = session.pendingSignedUploadMime || 'image/jpeg';
+    const ext = expectedMime === 'image/png' ? 'png' : 'jpg';
+    const originalFilename = session.pendingSignedUploadFilename || `customer_photo.${ext}`;
+
+    try {
+      const { buffer } = await downloadPrivateFile(cfg.photosBucket, targetPath);
+
+      if (buffer.length === 0 || buffer.length > MAX_UPLOAD_BYTES) {
+        void removePrivateFile(cfg.photosBucket, targetPath);
+        session.pendingSignedUploadPath = null;
+        return res.status(400).json({
+          error: 'Photo must be a valid image smaller than 10 MB.',
+          code: 'INVALID_IMAGE_SIZE'
+        });
+      }
+
+      if (!verifyMagicBytes(buffer, expectedMime)) {
+        void removePrivateFile(cfg.photosBucket, targetPath);
+        session.pendingSignedUploadPath = null;
+        return res.status(400).json({
+          error: 'Uploaded file does not match a valid JPG or PNG image.',
+          code: 'INVALID_IMAGE_CONTENT'
+        });
+      }
+
+      const previousPath = session.photoStoragePath;
+      if (previousPath && previousPath !== targetPath) {
+        void removePrivateFile(cfg.photosBucket, previousPath);
+      }
+
+      session.photoStoragePath = targetPath;
+      session.photoOriginalFilename = originalFilename;
+      session.photoMimeType = expectedMime;
+      session.photoSizeBytes = buffer.length;
+      session.pendingSignedUploadPath = null;
+      session.pendingSignedUploadMime = null;
+      session.pendingSignedUploadFilename = null;
+      session.expiresAt = Date.now() + PHOTO_UPLOAD_SESSION_TTL_MS;
+
+      const signedPreviewUrl = await createShortLivedSignedUrl(cfg.photosBucket, targetPath, 900);
+
+      return res.json({
+        success: true,
+        uploadSessionToken,
+        photoStoragePath: targetPath,
+        photoUrl: signedPreviewUrl || '',
+        fileName: originalFilename,
+        mimeType: expectedMime,
+        sizeBytes: buffer.length
+      });
+    } catch (err) {
+      console.error('Private photo upload verification error:', sanitizeSupabaseError(err));
+      return res.status(502).json({
+        error: 'Could not verify your uploaded photo in private storage. Please try again.',
+        code: 'UPLOAD_VERIFICATION_FAILED'
+      });
+    }
+  });
+
+  // Direct backend photo upload (supports zero-overhead raw binary image/jpeg & image/png as well as legacy JSON Base64)
+  app.post(
+    '/api/upload-photo',
+    express.raw({ type: ['image/jpeg', 'image/jpg', 'image/png'], limit: '11mb' }),
+    async (req, res) => {
+      const health = await requireSupabaseReady(res);
+      if (!health) return;
+
+      pruneExpiredUploadSessions();
+
+      const contentTypeHeader = (req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+      const isRawBinary =
+        contentTypeHeader === 'image/jpeg' ||
+        contentTypeHeader === 'image/jpg' ||
+        contentTypeHeader === 'image/png';
+
+      const headerSession =
+        typeof req.headers['x-upload-session'] === 'string' ? req.headers['x-upload-session'].trim() : '';
+      const bodySession =
+        !isRawBinary && typeof req.body?.uploadSessionToken === 'string'
+          ? req.body.uploadSessionToken.trim()
+          : '';
+      const uploadSessionToken = headerSession || bodySession;
+
+      if (!uploadSessionToken) {
+        return res.status(401).json({
+          error: 'A valid secure photo upload session is required.',
+          code: 'UPLOAD_SESSION_REQUIRED'
+        });
+      }
+
+      const session = photoUploadSessions.get(uploadSessionToken);
+      if (!session || session.expiresAt < Date.now()) {
+        if (session) photoUploadSessions.delete(uploadSessionToken);
+        return res.status(401).json({
+          error: 'Your photo upload session has expired. Please retry your upload.',
+          code: 'UPLOAD_SESSION_EXPIRED'
+        });
+      }
+
+      try {
+        let mimeType: 'image/jpeg' | 'image/png';
+        let buffer: Buffer;
+        let rawFilename: unknown;
+
+        if (isRawBinary) {
+          if (!Buffer.isBuffer(req.body)) {
+            return res.status(400).json({
+              error: 'No binary image data received.',
+              code: 'NO_IMAGE_DATA'
+            });
+          }
+          mimeType = contentTypeHeader === 'image/png' ? 'image/png' : 'image/jpeg';
+          buffer = req.body;
+          const rawHeaderName = req.headers['x-file-name'];
+          if (typeof rawHeaderName === 'string' && rawHeaderName.trim()) {
+            try {
+              rawFilename = decodeURIComponent(rawHeaderName.trim());
+            } catch {
+              rawFilename = rawHeaderName.trim();
+            }
+          }
+        } else {
+          const { imageBase64, filename } = req.body || {};
+          if (typeof imageBase64 !== 'string' || !imageBase64) {
+            return res.status(400).json({
+              error: 'No image data provided.',
+              code: 'NO_IMAGE_DATA'
+            });
+          }
+
+          const commaIdx = imageBase64.indexOf(',');
+          if (commaIdx <= 0) {
+            return res.status(400).json({
+              error: 'Please upload a clear JPG or PNG image.',
+              code: 'INVALID_IMAGE_TYPE'
+            });
+          }
+          const prefix = imageBase64.slice(0, commaIdx).toLowerCase();
+          if (
+            prefix !== 'data:image/jpeg;base64' &&
+            prefix !== 'data:image/jpg;base64' &&
+            prefix !== 'data:image/png;base64'
+          ) {
+            return res.status(400).json({
+              error: 'Please upload a clear JPG or PNG image.',
+              code: 'INVALID_IMAGE_TYPE'
+            });
+          }
+          mimeType = prefix === 'data:image/png;base64' ? 'image/png' : 'image/jpeg';
+          const base64Body = imageBase64.slice(commaIdx + 1).trim();
+          if (!base64Body) {
+            return res.status(400).json({
+              error: 'No image data provided.',
+              code: 'NO_IMAGE_DATA'
+            });
+          }
+          buffer = Buffer.from(base64Body, 'base64');
+          rawFilename = filename;
+        }
+
+        const ext = mimeType === 'image/png' ? 'png' : 'jpg';
+
+        if (buffer.length === 0) {
+          return res.status(400).json({
+            error: 'Uploaded photo file is empty.',
+            code: 'INVALID_IMAGE_SIZE'
+          });
+        }
+        if (buffer.length > MAX_UPLOAD_BYTES) {
+          return res.status(413).json({
+            error: 'Photo must be smaller than 10 MB.',
+            code: 'FILE_TOO_LARGE'
+          });
+        }
+        if (!verifyMagicBytes(buffer, mimeType)) {
+          return res.status(400).json({
+            error: 'Uploaded file does not match a valid JPG or PNG image.',
+            code: 'INVALID_IMAGE_CONTENT'
+          });
+        }
+
+        const cfg = getSupabaseEnvConfig();
+        const previousPath = session.photoStoragePath;
+        const storagePath = `pending/${session.sessionId}/${Date.now()}_${crypto.randomBytes(6).toString('hex')}.${ext}`;
+        const originalFilename = sanitizeDisplayFilename(rawFilename, 'customer_photo', ext);
+
+        await uploadPrivateFile({
+          bucket: cfg.photosBucket,
+          storagePath,
+          buffer,
+          contentType: mimeType
+        });
+
+        if (previousPath && previousPath !== storagePath) {
+          void removePrivateFile(cfg.photosBucket, previousPath);
+        }
+        if (
+          session.pendingSignedUploadPath &&
+          session.pendingSignedUploadPath !== storagePath
+        ) {
+          void removePrivateFile(cfg.photosBucket, session.pendingSignedUploadPath);
+        }
+
+        session.photoStoragePath = storagePath;
+        session.photoOriginalFilename = originalFilename;
+        session.photoMimeType = mimeType;
+        session.photoSizeBytes = buffer.length;
+        session.pendingSignedUploadPath = null;
+        session.pendingSignedUploadMime = null;
+        session.pendingSignedUploadFilename = null;
+        session.expiresAt = Date.now() + PHOTO_UPLOAD_SESSION_TTL_MS;
+
+        const signedPreviewUrl = await createShortLivedSignedUrl(cfg.photosBucket, storagePath, 900);
+
+        return res.json({
+          success: true,
+          uploadSessionToken,
+          photoStoragePath: storagePath,
+          photoUrl: signedPreviewUrl || '',
+          fileName: originalFilename,
+          mimeType,
+          sizeBytes: buffer.length
+        });
+      } catch (err) {
+        console.error('Private customer photo upload error:', sanitizeSupabaseError(err));
+        return res.status(502).json({
+          error: 'Could not upload your photo to private storage. Please try again.',
+          code: 'STORAGE_UPLOAD_FAILED'
+        });
+      }
+    }
+  );
 
   // ============================================================================
   // DELIVERY VALIDATION & ORDER CREATION
@@ -2931,7 +3239,7 @@ async function startServer() {
     });
   });
 
-  // Global JSON error handler for /api/* (e.g., invalid JSON body or unexpected middleware errors)
+  // Global JSON error handler for /api/* (e.g., payload too large, invalid JSON body, or unexpected middleware errors)
   app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
     if (!req.path.startsWith('/api')) {
       return next(err);
@@ -2939,20 +3247,29 @@ async function startServer() {
     if (res.headersSent) {
       return next(err);
     }
-    const isBodyParseError = err?.type === 'entity.parse.failed' || err instanceof SyntaxError;
-    const status = isBodyParseError
-      ? 400
-      : typeof err?.status === 'number' && err.status >= 400 && err.status < 600
-        ? err.status
-        : typeof err?.statusCode === 'number' && err.statusCode >= 400 && err.statusCode < 600
-          ? err.statusCode
-          : 500;
+    const isPayloadTooLarge = err?.type === 'entity.too.large' || err?.status === 413 || err?.statusCode === 413;
+    const isBodyParseError = !isPayloadTooLarge && (err?.type === 'entity.parse.failed' || err instanceof SyntaxError);
+    const status = isPayloadTooLarge
+      ? 413
+      : isBodyParseError
+        ? 400
+        : typeof err?.status === 'number' && err.status >= 400 && err.status < 600
+          ? err.status
+          : typeof err?.statusCode === 'number' && err.statusCode >= 400 && err.statusCode < 600
+            ? err.statusCode
+            : 500;
     console.error(`API error on ${req.method} ${req.path}:`, sanitizeSensitiveText(err?.message || err));
     return res.status(status).json({
-      error: isBodyParseError
-        ? 'Invalid JSON request payload.'
-        : 'An unexpected server error occurred. Please try again.',
-      code: isBodyParseError ? 'INVALID_JSON_BODY' : 'INTERNAL_SERVER_ERROR'
+      error: isPayloadTooLarge
+        ? 'Uploaded file exceeds the maximum 10 MB size limit. Please choose a smaller JPG or PNG image.'
+        : isBodyParseError
+          ? 'Invalid JSON request payload.'
+          : 'An unexpected server error occurred. Please try again.',
+      code: isPayloadTooLarge
+        ? 'PAYLOAD_TOO_LARGE'
+        : isBodyParseError
+          ? 'INVALID_JSON_BODY'
+          : 'INTERNAL_SERVER_ERROR'
     });
   });
 

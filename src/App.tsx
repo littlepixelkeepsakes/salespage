@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Sparkles,
   Heart,
@@ -11,12 +11,16 @@ import {
   ShieldCheck,
   ArrowRight,
   Check,
+  CheckCircle2,
   Camera,
   Gift,
   ArrowLeft,
   AlertCircle,
   ChevronDown,
-  MessageCircle
+  MessageCircle,
+  RefreshCw,
+  Trash2,
+  UploadCloud
 } from 'lucide-react';
 import PaymentPage from './components/PaymentPage';
 import AdminPage from './components/AdminPage';
@@ -141,6 +145,233 @@ const FAQS = [
   }
 ];
 
+const MAX_PHOTO_SIZE_BYTES = 10 * 1024 * 1024;
+const PHOTO_UPLOAD_TIMEOUT_MS = 90_000;
+
+type PhotoUploadStatus = 'idle' | 'uploading' | 'success' | 'error';
+
+interface ParsedApiResult<T> {
+  ok: boolean;
+  status: number;
+  data: T | null;
+  error: string | null;
+  code?: string;
+}
+
+function formatFileSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 KB';
+  if (bytes >= 1024 * 1024) {
+    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  }
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+
+function resolvePhotoMimeType(file: File): 'image/jpeg' | 'image/png' | null {
+  const type = (file.type || '').trim().toLowerCase();
+  if (type === 'image/jpeg' || type === 'image/jpg') return 'image/jpeg';
+  if (type === 'image/png') return 'image/png';
+  const name = (file.name || '').trim().toLowerCase();
+  if (name.endsWith('.jpg') || name.endsWith('.jpeg')) return 'image/jpeg';
+  if (name.endsWith('.png')) return 'image/png';
+  return null;
+}
+
+function isSafeHttpsUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function getHttpStatusFallbackError(status: number, fallbackError: string): string {
+  if (status === 413) {
+    return 'Photo exceeds the 10 MB upload limit. Please choose a smaller JPG or PNG image.';
+  }
+  if (status === 429) {
+    return 'Too many upload attempts right now. Please wait a moment and try again.';
+  }
+  if (status === 502 || status === 503 || status === 504) {
+    return 'The upload service is temporarily unavailable or timed out. Please retry your upload.';
+  }
+  return fallbackError;
+}
+
+function parseRawApiJson<T extends Record<string, any>>(
+  status: number,
+  contentType: string,
+  rawText: string,
+  fallbackError: string
+): ParsedApiResult<T> {
+  const trimmed = rawText.trim();
+  const normalizedCt = (contentType || '').toLowerCase();
+
+  if (!trimmed) {
+    return {
+      ok: false,
+      status,
+      data: null,
+      error: getHttpStatusFallbackError(
+        status,
+        'The server returned an empty response while processing your photo. Please try again.'
+      )
+    };
+  }
+
+  if (
+    normalizedCt.includes('text/html') ||
+    trimmed.startsWith('<!DOCTYPE') ||
+    trimmed.startsWith('<html') ||
+    trimmed.startsWith('<HTML')
+  ) {
+    return {
+      ok: false,
+      status,
+      data: null,
+      error: getHttpStatusFallbackError(
+        status,
+        'The server returned an unexpected page response instead of upload data. Please try again.'
+      )
+    };
+  }
+
+  let parsed: T | null = null;
+  try {
+    parsed = JSON.parse(trimmed) as T;
+  } catch {
+    return {
+      ok: false,
+      status,
+      data: null,
+      error: getHttpStatusFallbackError(
+        status,
+        'The server returned an incomplete response. Please check your connection and retry.'
+      )
+    };
+  }
+
+  const ok = status >= 200 && status < 300;
+  if (!ok) {
+    const serverMessage =
+      parsed && typeof parsed.error === 'string' && parsed.error.trim()
+        ? parsed.error.trim()
+        : getHttpStatusFallbackError(status, fallbackError);
+    return {
+      ok: false,
+      status,
+      data: parsed,
+      error: serverMessage,
+      code: typeof parsed?.code === 'string' ? parsed.code : undefined
+    };
+  }
+
+  return {
+    ok: true,
+    status,
+    data: parsed,
+    error: null,
+    code: typeof parsed?.code === 'string' ? parsed.code : undefined
+  };
+}
+
+async function parseApiJsonResponse<T extends Record<string, any>>(
+  res: Response,
+  fallbackError: string
+): Promise<ParsedApiResult<T>> {
+  let rawText = '';
+  try {
+    rawText = await res.text();
+  } catch {
+    return {
+      ok: false,
+      status: res.status,
+      data: null,
+      error: 'Could not read the server response. Please check your internet connection and try again.'
+    };
+  }
+  return parseRawApiJson<T>(
+    res.status,
+    res.headers.get('content-type') || '',
+    rawText,
+    fallbackError
+  );
+}
+
+interface BinaryUploadResult {
+  status: number;
+  responseText: string;
+  contentType: string;
+  networkError?: 'network' | 'timeout' | 'aborted';
+}
+
+function uploadBinaryWithProgress(params: {
+  method: 'PUT' | 'POST';
+  url: string;
+  file: File;
+  contentType: string;
+  headers?: Record<string, string>;
+  onProgress?: (percent: number) => void;
+  timeoutMs?: number;
+}): Promise<BinaryUploadResult> {
+  return new Promise(resolve => {
+    const xhr = new XMLHttpRequest();
+    xhr.open(params.method, params.url, true);
+    xhr.timeout = params.timeoutMs ?? PHOTO_UPLOAD_TIMEOUT_MS;
+    xhr.setRequestHeader('Content-Type', params.contentType);
+
+    if (params.headers) {
+      for (const [key, value] of Object.entries(params.headers)) {
+        xhr.setRequestHeader(key, value);
+      }
+    }
+
+    xhr.upload.onprogress = event => {
+      if (event.lengthComputable && event.total > 0 && params.onProgress) {
+        const pct = Math.min(100, Math.max(0, Math.round((event.loaded / event.total) * 100)));
+        params.onProgress(pct);
+      }
+    };
+
+    xhr.onload = () => {
+      resolve({
+        status: xhr.status,
+        responseText: typeof xhr.responseText === 'string' ? xhr.responseText : '',
+        contentType: xhr.getResponseHeader('content-type') || ''
+      });
+    };
+
+    xhr.onerror = () => {
+      resolve({
+        status: 0,
+        responseText: '',
+        contentType: '',
+        networkError: 'network'
+      });
+    };
+
+    xhr.ontimeout = () => {
+      resolve({
+        status: 0,
+        responseText: '',
+        contentType: '',
+        networkError: 'timeout'
+      });
+    };
+
+    xhr.onabort = () => {
+      resolve({
+        status: 0,
+        responseText: '',
+        contentType: '',
+        networkError: 'aborted'
+      });
+    };
+
+    xhr.send(params.file);
+  });
+}
+
 export default function App() {
   const [selectedProductId, setSelectedProductId] = useState<string>('keychain');
   const [selectedBundleId, setSelectedBundleId] = useState<string>('bundle_kc_magnet');
@@ -155,7 +386,12 @@ export default function App() {
   const [uploadSessionToken, setUploadSessionToken] = useState<string | null>(null);
   const [uploadedPhotoStoragePath, setUploadedPhotoStoragePath] = useState<string | null>(null);
   const [uploading, setUploading] = useState<boolean>(false);
+  const [uploadStatus, setUploadStatus] = useState<PhotoUploadStatus>('idle');
+  const [uploadProgress, setUploadProgress] = useState<number>(0);
+  const [uploadStageLabel, setUploadStageLabel] = useState<string>('');
+  const [uploadedFileInfo, setUploadedFileInfo] = useState<{ name: string; sizeBytes: number } | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const activeUploadIdRef = useRef<number>(0);
 
   // Customer Details State
   const [customer, setCustomer] = useState({
@@ -198,12 +434,15 @@ export default function App() {
             headers: { 'x-order-token': accessToken }
           }
         );
-        const data = await res.json();
-        if (res.ok && data.success && data.order) {
-          setCurrentOrder(data.order);
-          return { order: data.order as OrderPublic };
+        const parsed = await parseApiJsonResponse<{ success?: boolean; order?: OrderPublic; error?: string }>(
+          res,
+          'Could not load your saved order.'
+        );
+        if (parsed.ok && parsed.data?.success && parsed.data.order) {
+          setCurrentOrder(parsed.data.order);
+          return { order: parsed.data.order };
         }
-        return { order: null, error: data.error };
+        return { order: null, error: parsed.error || 'Could not load your saved order.' };
       } catch {
         return { order: null, error: 'Connection error while loading your order.' };
       }
@@ -260,9 +499,18 @@ export default function App() {
 
     // Fetch editable storefront settings, Supabase readiness & merchant payment options
     fetch('/api/store-config')
-      .then(res => res.json())
-      .then(data => {
-        if (data.success) {
+      .then(res =>
+        parseApiJsonResponse<{
+          success?: boolean;
+          supabaseReady?: boolean;
+          supabaseError?: string | null;
+          storefront?: PublicStorefrontConfig;
+          merchantConfig?: MerchantPaymentConfig;
+        }>(res, 'Failed to load store configuration.')
+      )
+      .then(parsed => {
+        const data = parsed.data;
+        if (parsed.ok && data?.success) {
           if (typeof data.supabaseReady === 'boolean') {
             setSupabaseReady(data.supabaseReady);
           }
@@ -327,27 +575,280 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
-  const ensureUploadSession = async (forceNew = false): Promise<string | null> => {
+  const ensureUploadSession = async (forceNew = false): Promise<string> => {
     if (!forceNew && uploadSessionToken) return uploadSessionToken;
-    const res = await fetch('/api/photo-upload-session', { method: 'POST' });
-    const data = await res.json();
-    if (res.ok && data.success && data.uploadSessionToken) {
-      setUploadSessionToken(data.uploadSessionToken);
-      return data.uploadSessionToken as string;
+    let res: Response;
+    try {
+      res = await fetch('/api/photo-upload-session', { method: 'POST' });
+    } catch {
+      throw new Error('Could not reach the server to start your photo upload. Please check your connection and try again.');
     }
-    throw new Error(data.error || 'Could not start a secure photo upload session.');
+    const parsed = await parseApiJsonResponse<{
+      success?: boolean;
+      uploadSessionToken?: string;
+      error?: string;
+    }>(res, 'Could not start a secure photo upload session.');
+
+    if (parsed.ok && parsed.data?.success && parsed.data.uploadSessionToken) {
+      setUploadSessionToken(parsed.data.uploadSessionToken);
+      return parsed.data.uploadSessionToken;
+    }
+    throw new Error(parsed.error || 'Could not start a secure photo upload session.');
   };
 
-  // Handle Photo File Upload into private Supabase customer-photos bucket
-  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const uploadSelectedPhoto = async (file: File) => {
+    const uploadId = activeUploadIdRef.current + 1;
+    activeUploadIdRef.current = uploadId;
+    const isCurrent = () => activeUploadIdRef.current === uploadId;
+
+    const mimeType = resolvePhotoMimeType(file);
+    if (!mimeType) {
+      setUploadedPhotoStoragePath(null);
+      setUploadedFileInfo(null);
+      setUploadStatus('error');
+      setUploadProgress(0);
+      setUploadError('Please upload a clear JPG or PNG image.');
+      setUploading(false);
+      return;
+    }
+
+    if (file.size <= 0) {
+      setUploadedPhotoStoragePath(null);
+      setUploadedFileInfo(null);
+      setUploadStatus('error');
+      setUploadProgress(0);
+      setUploadError('The selected photo file appears to be empty. Please choose another JPG or PNG image.');
+      setUploading(false);
+      return;
+    }
+
+    if (file.size > MAX_PHOTO_SIZE_BYTES) {
+      setUploadedPhotoStoragePath(null);
+      setUploadedFileInfo(null);
+      setUploadStatus('error');
+      setUploadProgress(0);
+      setUploadError('Photo must be smaller than 10 MB.');
+      setUploading(false);
+      return;
+    }
+
+    setUploading(true);
+    setUploadStatus('uploading');
+    setUploadProgress(5);
+    setUploadStageLabel('Starting secure upload…');
+    setUploadError(null);
+    setUploadedPhotoStoragePath(null);
+    setUploadedFileInfo(null);
+
+    try {
+      let sessionTok = await ensureUploadSession(false);
+      if (!isCurrent()) return;
+      setUploadProgress(12);
+      setUploadStageLabel('Authorising private storage upload…');
+
+      // Step 1: Request a short-lived backend-authorised Supabase signed upload URL
+      const requestSignedUrl = async (tok: string) => {
+        const res = await fetch('/api/upload-photo-url', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-upload-session': tok
+          },
+          body: JSON.stringify({
+            uploadSessionToken: tok,
+            filename: file.name,
+            mimeType,
+            sizeBytes: file.size
+          })
+        });
+        return parseApiJsonResponse<{
+          success?: boolean;
+          signedUploadUrl?: string;
+          photoStoragePath?: string;
+          fileName?: string;
+          error?: string;
+          code?: string;
+        }>(res, 'Could not authorise secure photo upload.');
+      };
+
+      let signedResult = await requestSignedUrl(sessionTok);
+      if (!isCurrent()) return;
+
+      if (signedResult.status === 401) {
+        sessionTok = await ensureUploadSession(true);
+        if (!isCurrent()) return;
+        signedResult = await requestSignedUrl(sessionTok);
+        if (!isCurrent()) return;
+      }
+
+      // Immediately surface deterministic client validation errors (type / size / rate limit)
+      if (
+        !signedResult.ok &&
+        signedResult.status >= 400 &&
+        signedResult.status < 500 &&
+        signedResult.status !== 404
+      ) {
+        throw new Error(signedResult.error || 'Photo upload was rejected.');
+      }
+
+      let directUploadSucceeded = false;
+
+      if (
+        signedResult.ok &&
+        signedResult.data?.success &&
+        signedResult.data.signedUploadUrl &&
+        signedResult.data.photoStoragePath &&
+        isSafeHttpsUrl(signedResult.data.signedUploadUrl)
+      ) {
+        setUploadStageLabel('Uploading photo…');
+        setUploadProgress(15);
+
+        const putResult = await uploadBinaryWithProgress({
+          method: 'PUT',
+          url: signedResult.data.signedUploadUrl,
+          file,
+          contentType: mimeType,
+          onProgress: pct => {
+            if (!isCurrent()) return;
+            setUploadProgress(Math.min(88, 15 + Math.round(pct * 0.73)));
+          }
+        });
+        if (!isCurrent()) return;
+
+        if (!putResult.networkError && putResult.status >= 200 && putResult.status < 300) {
+          setUploadStageLabel('Verifying photo…');
+          setUploadProgress(92);
+
+          const confirmRes = await fetch('/api/upload-photo/confirm', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-upload-session': sessionTok
+            },
+            body: JSON.stringify({
+              uploadSessionToken: sessionTok,
+              photoStoragePath: signedResult.data.photoStoragePath
+            })
+          });
+          const confirmParsed = await parseApiJsonResponse<{
+            success?: boolean;
+            photoStoragePath?: string;
+            fileName?: string;
+            sizeBytes?: number;
+            error?: string;
+          }>(confirmRes, 'Could not verify your uploaded photo.');
+          if (!isCurrent()) return;
+
+          if (confirmParsed.ok && confirmParsed.data?.success && confirmParsed.data.photoStoragePath) {
+            setUploadedPhotoStoragePath(confirmParsed.data.photoStoragePath);
+            setUploadedFileInfo({
+              name: confirmParsed.data.fileName || file.name,
+              sizeBytes: confirmParsed.data.sizeBytes || file.size
+            });
+            setUploadProgress(100);
+            setUploadStageLabel('Photo uploaded securely');
+            setUploadStatus('success');
+            setUploading(false);
+            directUploadSucceeded = true;
+          } else if (confirmParsed.status >= 400 && confirmParsed.status < 500) {
+            throw new Error(confirmParsed.error || 'Uploaded file could not be verified as a valid JPG or PNG image.');
+          }
+        }
+      }
+
+      if (directUploadSucceeded) return;
+
+      // Fallback: zero-overhead same-origin raw binary upload to /api/upload-photo
+      setUploadStageLabel('Uploading photo securely…');
+      setUploadProgress(18);
+
+      const postBinaryFallback = async (tok: string) =>
+        uploadBinaryWithProgress({
+          method: 'POST',
+          url: '/api/upload-photo',
+          file,
+          contentType: mimeType,
+          headers: {
+            'x-upload-session': tok,
+            'x-file-name': encodeURIComponent(file.name)
+          },
+          onProgress: pct => {
+            if (!isCurrent()) return;
+            setUploadProgress(Math.min(95, 18 + Math.round(pct * 0.77)));
+          }
+        });
+
+      let binaryRes = await postBinaryFallback(sessionTok);
+      if (!isCurrent()) return;
+
+      if (binaryRes.status === 401) {
+        sessionTok = await ensureUploadSession(true);
+        if (!isCurrent()) return;
+        binaryRes = await postBinaryFallback(sessionTok);
+        if (!isCurrent()) return;
+      }
+
+      if (binaryRes.networkError === 'timeout') {
+        throw new Error('The upload timed out before completing. Please check your connection and tap Retry Upload.');
+      }
+      if (binaryRes.networkError) {
+        throw new Error('Network error while uploading your photo. Please check your connection and tap Retry Upload.');
+      }
+
+      const fallbackParsed = parseRawApiJson<{
+        success?: boolean;
+        photoStoragePath?: string;
+        fileName?: string;
+        sizeBytes?: number;
+        error?: string;
+      }>(binaryRes.status, binaryRes.contentType, binaryRes.responseText, 'Photo upload failed. Please try again.');
+
+      if (fallbackParsed.ok && fallbackParsed.data?.success && fallbackParsed.data.photoStoragePath) {
+        setUploadedPhotoStoragePath(fallbackParsed.data.photoStoragePath);
+        setUploadedFileInfo({
+          name: fallbackParsed.data.fileName || file.name,
+          sizeBytes: fallbackParsed.data.sizeBytes || file.size
+        });
+        setUploadProgress(100);
+        setUploadStageLabel('Photo uploaded securely');
+        setUploadStatus('success');
+        setUploading(false);
+      } else {
+        throw new Error(fallbackParsed.error || 'Photo upload failed. Please try again.');
+      }
+    } catch (err: any) {
+      if (!isCurrent()) return;
+      setUploadedPhotoStoragePath(null);
+      setUploadedFileInfo(null);
+      setUploadStatus('error');
+      setUploadProgress(0);
+      setUploadStageLabel('');
+      setUploadError(
+        err instanceof Error && err.message
+          ? err.message
+          : 'Could not upload your photo right now. Please tap Retry Upload.'
+      );
+      setUploading(false);
+    }
+  };
+
+  // Handle Photo File Selection & Upload into private Supabase customer-photos bucket
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    // Reset input value so re-selecting the same photo always triggers onChange
+    e.target.value = '';
     if (!file) return;
 
-    if (!['image/jpeg', 'image/png'].includes(file.type)) {
+    const mimeType = resolvePhotoMimeType(file);
+    if (!mimeType) {
       setUploadError('Please upload a clear JPG or PNG image.');
       return;
     }
-    if (file.size > 10 * 1024 * 1024) {
+    if (file.size <= 0) {
+      setUploadError('The selected photo file appears to be empty. Please choose another image.');
+      return;
+    }
+    if (file.size > MAX_PHOTO_SIZE_BYTES) {
       setUploadError('Photo must be smaller than 10 MB.');
       return;
     }
@@ -359,54 +860,28 @@ export default function App() {
     setPhotoFile(file);
     const localPreview = URL.createObjectURL(file);
     setPhotoPreview(localPreview);
+    void uploadSelectedPhoto(file);
+  };
 
-    setUploading(true);
-    const reader = new FileReader();
-    reader.onerror = () => {
-      setUploadError('Unable to read the selected photo. Please try again.');
-      setUploading(false);
-    };
-    reader.onload = async () => {
-      try {
-        const base64Data = reader.result as string;
-        let sessionTok = await ensureUploadSession(false);
+  const handleRetryUpload = () => {
+    if (!photoFile || uploading) return;
+    void uploadSelectedPhoto(photoFile);
+  };
 
-        const postUpload = async (tok: string) =>
-          fetch('/api/upload-photo', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'x-upload-session': tok
-            },
-            body: JSON.stringify({
-              uploadSessionToken: tok,
-              imageBase64: base64Data,
-              filename: file.name
-            })
-          });
-
-        let res = await postUpload(sessionTok!);
-        if (res.status === 401) {
-          sessionTok = await ensureUploadSession(true);
-          res = await postUpload(sessionTok!);
-        }
-
-        const data = await res.json();
-        if (res.ok && data.success && data.photoStoragePath) {
-          setUploadedPhotoStoragePath(data.photoStoragePath);
-          setUploading(false);
-        } else {
-          setUploadedPhotoStoragePath(null);
-          setUploadError(data.error || 'Upload failed.');
-          setUploading(false);
-        }
-      } catch (err: any) {
-        setUploadedPhotoStoragePath(null);
-        setUploadError(err?.message || 'Server connection failed during upload.');
-        setUploading(false);
-      }
-    };
-    reader.readAsDataURL(file);
+  const handleRemovePhoto = () => {
+    activeUploadIdRef.current += 1;
+    if (photoPreview && photoPreview.startsWith('blob:')) {
+      URL.revokeObjectURL(photoPreview);
+    }
+    setPhotoFile(null);
+    setPhotoPreview(null);
+    setUploadedPhotoStoragePath(null);
+    setUploadedFileInfo(null);
+    setUploading(false);
+    setUploadStatus('idle');
+    setUploadProgress(0);
+    setUploadStageLabel('');
+    setUploadError(null);
   };
 
   // Validate Delivery & Proceed to Review
@@ -421,18 +896,22 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ state: customer.state })
       });
-      const data = await res.json();
+      const parsed = await parseApiJsonResponse<{
+        valid?: boolean;
+        deliveryFeeSen?: number;
+        error?: string;
+      }>(res, 'Failed to validate delivery rate.');
 
-      if (data.valid) {
-        setDeliveryFeeSen(data.deliveryFeeSen);
+      if (parsed.ok && parsed.data?.valid && typeof parsed.data.deliveryFeeSen === 'number') {
+        setDeliveryFeeSen(parsed.data.deliveryFeeSen);
         setCalculatingDelivery(false);
         setOrderStep('review');
         window.scrollTo({ top: 0, behavior: 'smooth' });
       } else {
-        setDeliveryError(data.error || 'Invalid delivery state.');
+        setDeliveryError(parsed.error || 'Invalid delivery state.');
         setCalculatingDelivery(false);
       }
-    } catch (err) {
+    } catch {
       setDeliveryError('Failed to validate delivery rate.');
       setCalculatingDelivery(false);
     }
@@ -455,23 +934,32 @@ export default function App() {
           customer
         })
       });
-      const data = await res.json();
+      const parsed = await parseApiJsonResponse<{
+        success?: boolean;
+        order?: OrderPublic;
+        error?: string;
+      }>(res, 'Failed to create order.');
 
-      if (res.ok && data.success && data.order) {
-        setCurrentOrder(data.order);
+      if (parsed.ok && parsed.data?.success && parsed.data.order) {
+        const createdOrder = parsed.data.order;
+        setCurrentOrder(createdOrder);
         setPaymentReturnNotice(null);
         setUploadSessionToken(null);
         setUploadedPhotoStoragePath(null);
+        setUploadedFileInfo(null);
+        setUploadStatus('idle');
+        setUploadProgress(0);
+        setUploadStageLabel('');
         setSubmittingOrder(false);
         setOrderStep('payment');
         window.history.replaceState(
           {},
           '',
-          `/?order=${encodeURIComponent(data.order.reference)}&token=${encodeURIComponent(data.order.accessToken)}`
+          `/?order=${encodeURIComponent(createdOrder.reference)}&token=${encodeURIComponent(createdOrder.accessToken)}`
         );
         window.scrollTo({ top: 0, behavior: 'smooth' });
       } else {
-        setOrderError(data.error || 'Failed to create order.');
+        setOrderError(parsed.error || 'Failed to create order.');
         setSubmittingOrder(false);
       }
     } catch {
@@ -865,57 +1353,166 @@ export default function App() {
       {/* CHECKOUT FLOW: UPLOAD */}
       {orderStep === 'upload' && (
         <div className="py-12 px-4 sm:px-8 max-w-2xl mx-auto space-y-8 animate-fadeIn">
-          <button onClick={() => setOrderStep('sales')} className="text-xs font-bold text-[#14233C] flex items-center gap-1.5 hover:text-[#E05A40]">
+          <button
+            type="button"
+            onClick={() => setOrderStep('sales')}
+            className="text-xs font-bold text-[#14233C] flex items-center gap-1.5 hover:text-[#E05A40]"
+          >
             <ArrowLeft className="w-4 h-4" /><span>Back to Keepsakes</span>
           </button>
           <div className="bg-white rounded-3xl p-6 sm:p-10 shadow-xl border border-[#14233C]/10 space-y-6">
-            <h2 className="text-2xl font-black text-[#14233C]">Upload Your Photo</h2>
-            <p className="text-sm text-[#14233C]/70">Upload 1 clear HD photo in JPG or PNG. Both items in a bundle use the same photo.</p>
+            <div className="space-y-1.5">
+              <h2 className="text-2xl font-black text-[#14233C]">Upload Your Photo</h2>
+              <p className="text-sm text-[#14233C]/70">
+                Upload 1 clear JPG or PNG photo (up to 10 MB). Both items in a bundle use the same photo.
+              </p>
+            </div>
 
             {!photoPreview ? (
-              <label className="border-2 border-dashed border-[#14233C]/30 rounded-3xl p-8 flex flex-col items-center justify-center cursor-pointer bg-[#FAF6EE]/50">
-                <Camera className="w-8 h-8 text-[#E05A40] mb-2" />
-                <span className="font-bold text-sm">Click to upload photo (JPG or PNG)</span>
-                <input type="file" accept="image/jpeg,image/png" onChange={handleFileChange} className="hidden" />
+              <label className="border-2 border-dashed border-[#14233C]/25 hover:border-[#E05A40]/60 transition-colors rounded-3xl p-8 sm:p-10 flex flex-col items-center justify-center text-center cursor-pointer bg-[#FAF6EE]/60">
+                <div className="w-12 h-12 rounded-2xl bg-[#FF8D76]/15 flex items-center justify-center mb-3">
+                  <UploadCloud className="w-6 h-6 text-[#E05A40]" />
+                </div>
+                <span className="font-bold text-sm text-[#14233C]">Click to choose a photo</span>
+                <span className="text-xs text-[#14233C]/60 mt-1">JPG or PNG · Maximum 10 MB · Stored privately</span>
+                <input
+                  type="file"
+                  accept="image/jpeg,image/png,.jpg,.jpeg,.png"
+                  onChange={handleFileChange}
+                  className="hidden"
+                />
               </label>
             ) : (
               <div className="space-y-4">
-                <div className="rounded-2xl overflow-hidden border max-w-sm mx-auto aspect-[4/3] bg-[#FAF6EE]">
-                  <img src={photoPreview} alt="Uploaded photo preview" className="w-full h-full object-contain" />
+                <div className="rounded-2xl overflow-hidden border border-[#14233C]/12 max-w-sm mx-auto aspect-[4/3] bg-[#FAF6EE] relative">
+                  <img
+                    src={photoPreview}
+                    alt="Uploaded photo preview"
+                    className="w-full h-full object-contain"
+                  />
+                  {uploading && (
+                    <div className="absolute inset-0 bg-[#14233C]/35 backdrop-blur-[1px] flex items-center justify-center">
+                      <div className="bg-white/95 px-4 py-2 rounded-xl shadow-md text-xs font-bold text-[#14233C]">
+                        Uploading {uploadProgress}%
+                      </div>
+                    </div>
+                  )}
                 </div>
+
+                {photoFile && (
+                  <div className="flex items-center justify-between gap-3 px-4 py-2.5 rounded-xl bg-[#FAF6EE]/80 border border-[#14233C]/10 text-xs">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <Camera className="w-4 h-4 text-[#E05A40] shrink-0" />
+                      <span className="font-semibold text-[#14233C] truncate">
+                        {uploadedFileInfo?.name || photoFile.name}
+                      </span>
+                    </div>
+                    <span className="text-[#14233C]/65 font-medium shrink-0">
+                      {formatFileSize(uploadedFileInfo?.sizeBytes || photoFile.size)}
+                    </span>
+                  </div>
+                )}
+
+                {/* Live Upload Progress Bar */}
+                {uploadStatus === 'uploading' && (
+                  <div className="space-y-2 p-4 rounded-2xl bg-[#FAF6EE] border border-[#14233C]/10" aria-live="polite">
+                    <div className="flex items-center justify-between text-xs font-bold text-[#14233C]">
+                      <span>{uploadStageLabel || 'Uploading photo…'}</span>
+                      <span>{uploadProgress}%</span>
+                    </div>
+                    <progress
+                      value={Math.max(5, Math.min(100, uploadProgress))}
+                      max={100}
+                      aria-label={uploadStageLabel || 'Uploading photo'}
+                      className="block w-full h-2.5 overflow-hidden rounded-full appearance-none bg-[#14233C]/10 [&::-webkit-progress-bar]:bg-[#14233C]/10 [&::-webkit-progress-bar]:rounded-full [&::-webkit-progress-value]:bg-[#E05A40] [&::-webkit-progress-value]:rounded-full [&::-webkit-progress-value]:transition-all [&::-moz-progress-bar]:bg-[#E05A40] [&::-moz-progress-bar]:rounded-full"
+                    />
+                  </div>
+                )}
+
+                {/* Upload Success Confirmation */}
+                {uploadStatus === 'success' && uploadedPhotoStoragePath && !uploading && (
+                  <div
+                    className="flex items-start gap-2.5 p-3.5 rounded-2xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-xs"
+                    role="status"
+                  >
+                    <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                    <div>
+                      <p className="font-bold">Photo uploaded securely</p>
+                      <p className="text-emerald-800/80 mt-0.5">
+                        Your photo is saved privately and ready for your keepsake order.
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {/* Action Buttons: Retry (on failure), Replace Photo, Remove */}
                 <div className="flex flex-wrap items-center gap-3">
-                  <label className="px-4 py-2 bg-[#FAF6EE] border border-[#14233C]/20 rounded-xl text-xs font-bold cursor-pointer hover:bg-[#14233C]/5 transition-colors">
+                  {photoFile && uploadStatus === 'error' && !uploading && (
+                    <button
+                      type="button"
+                      onClick={handleRetryUpload}
+                      className="inline-flex items-center gap-1.5 px-4 py-2 bg-[#E05A40] text-white rounded-xl text-xs font-bold hover:bg-[#c94c34] transition-colors"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                      <span>Retry Upload</span>
+                    </button>
+                  )}
+                  <label
+                    className={`inline-flex items-center gap-1.5 px-4 py-2 bg-[#FAF6EE] border border-[#14233C]/20 rounded-xl text-xs font-bold transition-colors ${
+                      uploading ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer hover:bg-[#14233C]/5'
+                    }`}
+                  >
+                    <Camera className="w-3.5 h-3.5 text-[#14233C]/75" />
                     <span>{uploading ? 'Uploading…' : 'Replace Photo'}</span>
-                    <input type="file" accept="image/jpeg,image/png" onChange={handleFileChange} className="hidden" />
+                    <input
+                      type="file"
+                      accept="image/jpeg,image/png,.jpg,.jpeg,.png"
+                      disabled={uploading}
+                      onChange={handleFileChange}
+                      className="hidden"
+                    />
                   </label>
                   <button
                     type="button"
-                    onClick={() => {
-                      if (photoPreview && photoPreview.startsWith('blob:')) {
-                        URL.revokeObjectURL(photoPreview);
-                      }
-                      setPhotoFile(null);
-                      setPhotoPreview(null);
-                      setUploadedPhotoStoragePath(null);
-                    }}
-                    className="px-4 py-2 bg-gray-100 rounded-xl text-xs font-bold text-[#14233C]/75 hover:text-[#14233C]"
+                    onClick={handleRemovePhoto}
+                    className="inline-flex items-center gap-1.5 px-4 py-2 bg-gray-100 rounded-xl text-xs font-bold text-[#14233C]/75 hover:text-[#14233C] hover:bg-gray-200/70 transition-colors"
                   >
-                    Remove
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>Remove</span>
                   </button>
                 </div>
               </div>
             )}
 
-            {uploadError && <p className="text-xs font-bold text-red-600">{uploadError}</p>}
+            {/* Clear Failure Alert */}
+            {uploadError && (
+              <div
+                role="alert"
+                className="flex items-start gap-2.5 p-3.5 rounded-2xl bg-red-50 border border-red-200 text-red-800 text-xs"
+              >
+                <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                <div className="space-y-1">
+                  <p className="font-bold">Photo upload could not be completed</p>
+                  <p className="text-red-700 leading-relaxed">{uploadError}</p>
+                </div>
+              </div>
+            )}
 
             <p className="text-xs text-[#14233C]/65">{DELIVERY_PROMISE_TEXT}</p>
 
-            <button 
+            <button
+              type="button"
               disabled={!uploadedPhotoStoragePath || uploading}
               onClick={() => setOrderStep('details')}
-              className={`w-full py-4 rounded-2xl font-bold text-sm ${uploadedPhotoStoragePath && !uploading ? 'bg-[#14233C] text-white' : 'bg-gray-200 text-gray-400 cursor-not-allowed'}`}
+              className={`w-full py-4 rounded-2xl font-bold text-sm transition-colors ${
+                uploadedPhotoStoragePath && !uploading
+                  ? 'bg-[#14233C] text-white hover:bg-[#1c3154]'
+                  : 'bg-gray-200 text-gray-400 cursor-not-allowed'
+              }`}
             >
-              {uploading ? 'Uploading photo…' : 'Continue to Delivery Details'}
+              {uploading
+                ? `Uploading photo (${uploadProgress}%)…`
+                : 'Continue to Delivery Details'}
             </button>
           </div>
         </div>
