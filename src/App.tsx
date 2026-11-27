@@ -24,6 +24,7 @@ import {
 } from 'lucide-react';
 import PaymentPage from './components/PaymentPage';
 import AdminPage from './components/AdminPage';
+import HowItWorksSection from './components/HowItWorksSection';
 import {
   DELIVERY_PROMISE_TEXT,
   type MerchantPaymentConfig,
@@ -79,11 +80,11 @@ const BUNDLE_CHOICES: BundleChoice[] = [
 
 const DEFAULT_STOREFRONT: PublicStorefrontConfig = {
   logoUrl: '/assets/aistudio/Beaded_heart_keepsakes_logo_4fef68e3.png',
-  heroImageUrl: '/src/assets/images/hero_bead_art_showcase_1795515646405.jpg',
+  heroImageUrl: '/assets/aistudio/From_Photo_to_Perler_Keepsake_40f444e1.png',
   productImages: {
-    keychain: '/src/assets/images/pet_bead_art_1795515646980.jpg',
-    magnet: '/src/assets/images/couple_bead_art_1795515653017.jpg',
-    bundle: '/src/assets/images/family_bead_art_1795515653155.jpg'
+    keychain: '/assets/aistudio/Custom_Perler_Bead_Keychain_Showcase_b07b8ffc.png',
+    magnet: '/assets/aistudio/Custom_Family_Perler_Bead_Magnet_c104de68.png',
+    bundle: '/assets/aistudio/Custom_Family_Perler_Bead_Bundle_e5569304.png'
   },
   galleryItems: [
     {
@@ -1161,14 +1162,17 @@ export default function App() {
                   <div className="relative rounded-3xl overflow-hidden shadow-2xl border-4 border-white bg-white">
                     <img
                       src={storefront.heroImageUrl}
-                      alt="Little Pixel Keepsakes handmade bead art showcase"
-                      className="w-full h-auto object-cover aspect-[4/3]"
+                      alt="Turn your favourite photo into a custom Perler beads keychain"
+                      className="w-full h-auto block"
                     />
                   </div>
                 </div>
               </div>
             </div>
           </section>
+
+          {/* How It Works Section */}
+          <HowItWorksSection onCreateKeepsake={scrollToSelector} />
 
           {/* Product Selector Section */}
           <section id="product-selector" className="py-16 px-4 sm:px-8 max-w-5xl mx-auto">
@@ -1210,7 +1214,7 @@ export default function App() {
                                 : storefront.productImages.bundle
                           }
                           alt={product.name}
-                          className="w-full h-full object-cover"
+                          className="w-full h-full object-contain"
                         />
                       </div>
 

@@ -131,14 +131,19 @@ const MAX_LOGIN_ATTEMPTS = 10;
 const PHOTO_UPLOAD_SESSION_TTL_MS = 30 * 60 * 1000; // 30 min
 const MAX_UPLOAD_SESSIONS_PER_WINDOW = 30;
 
+const LEGACY_HERO_IMAGE_URL = '/src/assets/images/hero_bead_art_showcase_1795515646405.jpg';
+const LEGACY_KEYCHAIN_IMAGE_URL = '/src/assets/images/pet_bead_art_1795515646980.jpg';
+const LEGACY_MAGNET_IMAGE_URL = '/src/assets/images/couple_bead_art_1795515653017.jpg';
+const LEGACY_BUNDLE_IMAGE_URL = '/src/assets/images/family_bead_art_1795515653155.jpg';
+
 function getDefaultStoreSettings(): EditableStoreSettings {
   return {
     logoUrl: '/assets/aistudio/Beaded_heart_keepsakes_logo_4fef68e3.png',
-    heroImageUrl: '/src/assets/images/hero_bead_art_showcase_1795515646405.jpg',
+    heroImageUrl: '/assets/aistudio/From_Photo_to_Perler_Keepsake_40f444e1.png',
     productImages: {
-      keychain: '/src/assets/images/pet_bead_art_1795515646980.jpg',
-      magnet: '/src/assets/images/couple_bead_art_1795515653017.jpg',
-      bundle: '/src/assets/images/family_bead_art_1795515653155.jpg'
+      keychain: '/assets/aistudio/Custom_Perler_Bead_Keychain_Showcase_b07b8ffc.png',
+      magnet: '/assets/aistudio/Custom_Family_Perler_Bead_Magnet_c104de68.png',
+      bundle: '/assets/aistudio/Custom_Family_Perler_Bead_Bundle_e5569304.png'
     },
     galleryItems: [
       {
@@ -181,13 +186,26 @@ function getDefaultStoreSettings(): EditableStoreSettings {
 function mapStoreSettingsRow(row?: StoreSettingsRow | null): EditableStoreSettings {
   const defaults = getDefaultStoreSettings();
   if (!row) return defaults;
+  const rawHero = row.hero_image_url?.trim();
+  const rawKeychain = row.product_images?.keychain?.trim();
+  const rawMagnet = row.product_images?.magnet?.trim();
+  const rawBundle = row.product_images?.bundle?.trim();
   return {
     logoUrl: row.logo_url?.trim() || defaults.logoUrl,
-    heroImageUrl: row.hero_image_url?.trim() || defaults.heroImageUrl,
+    heroImageUrl: !rawHero || rawHero === LEGACY_HERO_IMAGE_URL ? defaults.heroImageUrl : rawHero,
     productImages: {
-      keychain: row.product_images?.keychain?.trim() || defaults.productImages.keychain,
-      magnet: row.product_images?.magnet?.trim() || defaults.productImages.magnet,
-      bundle: row.product_images?.bundle?.trim() || defaults.productImages.bundle
+      keychain:
+        !rawKeychain || rawKeychain === LEGACY_KEYCHAIN_IMAGE_URL
+          ? defaults.productImages.keychain
+          : rawKeychain,
+      magnet:
+        !rawMagnet || rawMagnet === LEGACY_MAGNET_IMAGE_URL
+          ? defaults.productImages.magnet
+          : rawMagnet,
+      bundle:
+        !rawBundle || rawBundle === LEGACY_BUNDLE_IMAGE_URL
+          ? defaults.productImages.bundle
+          : rawBundle
     },
     galleryItems:
       Array.isArray(row.gallery_items) && row.gallery_items.length > 0
