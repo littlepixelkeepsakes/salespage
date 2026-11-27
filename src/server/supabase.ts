@@ -553,6 +553,19 @@ export async function touchStaffLastLogin(staffId: string): Promise<void> {
     .eq('id', staffId);
 }
 
+export async function fetchStaffAccountById(staffId: string): Promise<StaffAccountRow | null> {
+  const client = getSupabaseAdminClient();
+  const { data, error } = await client
+    .from('staff_accounts')
+    .select('*')
+    .eq('id', staffId)
+    .maybeSingle();
+  if (error) {
+    throw new Error(`Failed to verify staff account: ${sanitizeSupabaseError(error)}`);
+  }
+  return (data as StaffAccountRow | null) ?? null;
+}
+
 // ============================================================================
 // ORDERS, PAYMENTS & EMAIL NOTIFICATIONS REPOSITORY
 // ============================================================================

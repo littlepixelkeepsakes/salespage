@@ -663,6 +663,8 @@ export default function App() {
         });
         return parseApiJsonResponse<{
           success?: boolean;
+          uploadSessionToken?: string;
+          uploadIntentToken?: string;
           signedUploadUrl?: string;
           photoStoragePath?: string;
           fileName?: string;
@@ -692,6 +694,7 @@ export default function App() {
       }
 
       let directUploadSucceeded = false;
+      let directUploadFailureReason: string | null = null;
 
       if (
         signedResult.ok &&
@@ -700,7 +703,7 @@ export default function App() {
         signedResult.data.photoStoragePath &&
         isSafeHttpsUrl(signedResult.data.signedUploadUrl)
       ) {
-        setUploadStageLabel('Uploading photo…');
+        setUploadStageLabel('Uploading photo directly to private storage…');
         setUploadProgress(15);
 
         const putResult = await uploadBinaryWithProgress({
@@ -716,7 +719,7 @@ export default function App() {
         if (!isCurrent()) return;
 
         if (!putResult.networkError && putResult.status >= 200 && putResult.status < 300) {
-          setUploadStageLabel('Verifying photo…');
+          setUploadStageLabel('Verifying uploaded photo…');
           setUploadProgress(92);
 
           const confirmRes = await fetch('/api/upload-photo/confirm', {
@@ -727,11 +730,13 @@ export default function App() {
             },
             body: JSON.stringify({
               uploadSessionToken: sessionTok,
-              photoStoragePath: signedResult.data.photoStoragePath
+              photoStoragePath: signedResult.data.photoStoragePath,
+              uploadIntentToken: signedResult.data.uploadIntentToken
             })
           });
           const confirmParsed = await parseApiJsonResponse<{
             success?: boolean;
+            uploadSessionToken?: string;
             photoStoragePath?: string;
             fileName?: string;
             sizeBytes?: number;
@@ -740,6 +745,9 @@ export default function App() {
           if (!isCurrent()) return;
 
           if (confirmParsed.ok && confirmParsed.data?.success && confirmParsed.data.photoStoragePath) {
+            if (confirmParsed.data.uploadSessionToken) {
+              setUploadSessionToken(confirmParsed.data.uploadSessionToken);
+            }
             setUploadedPhotoStoragePath(confirmParsed.data.photoStoragePath);
             setUploadedFileInfo({
               name: confirmParsed.data.fileName || file.name,
@@ -752,13 +760,36 @@ export default function App() {
             directUploadSucceeded = true;
           } else if (confirmParsed.status >= 400 && confirmParsed.status < 500) {
             throw new Error(confirmParsed.error || 'Uploaded file could not be verified as a valid JPG or PNG image.');
+          } else {
+            directUploadFailureReason =
+              confirmParsed.error || 'Could not verify your uploaded photo. Please tap Retry Upload.';
           }
+        } else if (putResult.networkError === 'timeout') {
+          directUploadFailureReason =
+            'The direct photo upload timed out. Please check your connection and tap Retry Upload.';
+        } else if (putResult.networkError) {
+          directUploadFailureReason =
+            'Network error while uploading directly to private storage. Please check your connection and tap Retry Upload.';
+        } else {
+          directUploadFailureReason =
+            'Direct private storage upload was rejected. Please tap Retry Upload.';
         }
+      } else if (!signedResult.ok && signedResult.error) {
+        directUploadFailureReason = signedResult.error;
       }
 
       if (directUploadSucceeded) return;
 
-      // Fallback: zero-overhead same-origin raw binary upload to /api/upload-photo
+      // Serverless platforms enforce ~6 MB function request limits: never proxy >4.5 MB files through /api/upload-photo
+      const MAX_PROXY_FALLBACK_BYTES = Math.floor(4.5 * 1024 * 1024);
+      if (file.size > MAX_PROXY_FALLBACK_BYTES) {
+        throw new Error(
+          directUploadFailureReason ||
+            'Could not complete direct private storage upload for this high-resolution photo. Please check your connection and tap Retry Upload.'
+        );
+      }
+
+      // Fallback for small photos (<= 4.5 MB): zero-overhead same-origin raw binary upload to /api/upload-photo
       setUploadStageLabel('Uploading photo securely…');
       setUploadProgress(18);
 
@@ -797,6 +828,7 @@ export default function App() {
 
       const fallbackParsed = parseRawApiJson<{
         success?: boolean;
+        uploadSessionToken?: string;
         photoStoragePath?: string;
         fileName?: string;
         sizeBytes?: number;
@@ -804,6 +836,9 @@ export default function App() {
       }>(binaryRes.status, binaryRes.contentType, binaryRes.responseText, 'Photo upload failed. Please try again.');
 
       if (fallbackParsed.ok && fallbackParsed.data?.success && fallbackParsed.data.photoStoragePath) {
+        if (fallbackParsed.data.uploadSessionToken) {
+          setUploadSessionToken(fallbackParsed.data.uploadSessionToken);
+        }
         setUploadedPhotoStoragePath(fallbackParsed.data.photoStoragePath);
         setUploadedFileInfo({
           name: fallbackParsed.data.fileName || file.name,
@@ -814,7 +849,7 @@ export default function App() {
         setUploadStatus('success');
         setUploading(false);
       } else {
-        throw new Error(fallbackParsed.error || 'Photo upload failed. Please try again.');
+        throw new Error(fallbackParsed.error || directUploadFailureReason || 'Photo upload failed. Please try again.');
       }
     } catch (err: any) {
       if (!isCurrent()) return;

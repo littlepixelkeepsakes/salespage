@@ -1,0 +1,28 @@
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+  included_files = ["public/payments/**", "public/assets/**", "src/assets/**"]
+
+# Route all API endpoints to the Express Netlify Function before the SPA fallback
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/api/:splat"
+  status = 200
+  force = true
+
+# Block any direct access to legacy local uploads path
+[[redirects]]
+  from = "/uploads/*"
+  to = "/404"
+  status = 404
+  force = true
+
+# React single-page application fallback
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

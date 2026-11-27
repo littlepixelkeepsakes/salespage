@@ -264,11 +264,12 @@ export default function AdminPage({
     setLoadingFileKey(key);
     setDashboardError(null);
     try {
-      const endpoint =
+      const baseEndpoint =
         kind === 'photo'
-          ? `/api/admin/orders/${encodeURIComponent(order.reference)}/photo${downloadOnly ? '?download=1' : ''}`
-          : `/api/admin/orders/${encodeURIComponent(order.reference)}/receipt${downloadOnly ? '?download=1' : ''}`;
-      const res = await fetch(endpoint, {
+          ? `/api/admin/orders/${encodeURIComponent(order.reference)}/photo`
+          : `/api/admin/orders/${encodeURIComponent(order.reference)}/receipt`;
+      const query = downloadOnly ? '?format=signed&download=1' : '?format=signed';
+      const res = await fetch(`${baseEndpoint}${query}`, {
         headers: { Authorization: `Bearer ${authToken}` }
       });
       if (res.status === 401) {
@@ -276,21 +277,69 @@ export default function AdminPage({
         setAuthError('Session expired. Please sign in again.');
         return;
       }
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        setDashboardError(errData.error || `Unable to load private ${kind}.`);
-        return;
+
+      const contentType = (res.headers.get('content-type') || '').toLowerCase();
+      let blob: Blob;
+      let resolvedFileName: string | undefined;
+      let resolvedMimeType: string | undefined;
+
+      if (contentType.includes('application/json')) {
+        const rawText = await res.text().catch(() => '');
+        let meta: {
+          success?: boolean;
+          signedUrl?: string;
+          fileName?: string;
+          mimeType?: string;
+          error?: string;
+        } = {};
+        try {
+          if (rawText.trim()) meta = JSON.parse(rawText);
+        } catch {
+          meta = {};
+        }
+
+        if (!res.ok || !meta.success || !meta.signedUrl) {
+          setDashboardError(meta.error || `Unable to load private ${kind}.`);
+          return;
+        }
+        let parsedSignedUrl: URL;
+        try {
+          parsedSignedUrl = new URL(meta.signedUrl);
+          if (parsedSignedUrl.protocol !== 'https:') {
+            throw new Error('Signed URL must use HTTPS.');
+          }
+        } catch {
+          setDashboardError(`Received an invalid private ${kind} link from the server.`);
+          return;
+        }
+
+        const storageRes = await fetch(parsedSignedUrl.toString());
+        if (!storageRes.ok) {
+          setDashboardError(`Unable to download private ${kind} from storage.`);
+          return;
+        }
+        blob = await storageRes.blob();
+        resolvedFileName = meta.fileName;
+        resolvedMimeType = meta.mimeType;
+      } else {
+        if (!res.ok) {
+          setDashboardError(`Unable to load private ${kind}.`);
+          return;
+        }
+        blob = await res.blob();
       }
-      const blob = await res.blob();
+
       const mimeType =
+        resolvedMimeType ||
         blob.type ||
         (kind === 'receipt' ? order.receiptMimeType || 'image/jpeg' : 'image/jpeg');
       const fallbackExt =
         mimeType === 'application/pdf' ? 'pdf' : mimeType === 'image/png' ? 'png' : 'jpg';
       const fileName =
-        kind === 'photo'
+        resolvedFileName ||
+        (kind === 'photo'
           ? order.photoFileName || `${order.reference}_photo.${fallbackExt}`
-          : order.receiptFileName || `${order.reference}_receipt.${fallbackExt}`;
+          : order.receiptFileName || `${order.reference}_receipt.${fallbackExt}`);
       const objectUrl = URL.createObjectURL(blob);
 
       if (downloadOnly) {

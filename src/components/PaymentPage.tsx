@@ -35,7 +35,121 @@ interface PaymentPageProps {
   onReturnHome: () => void;
 }
 
+const MAX_RECEIPT_SIZE_BYTES = 10 * 1024 * 1024;
+const RECEIPT_UPLOAD_TIMEOUT_MS = 90_000;
+
 const formatRM = (sen: number) => `RM ${(sen / 100).toFixed(2)}`;
+
+const formatReceiptSize = (bytes: number): string => {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 KB';
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+};
+
+const resolveReceiptMimeType = (
+  file: File
+): 'image/jpeg' | 'image/png' | 'application/pdf' | null => {
+  const type = (file.type || '').trim().toLowerCase();
+  if (type === 'image/jpeg' || type === 'image/jpg') return 'image/jpeg';
+  if (type === 'image/png') return 'image/png';
+  if (type === 'application/pdf') return 'application/pdf';
+  const name = (file.name || '').trim().toLowerCase();
+  if (name.endsWith('.jpg') || name.endsWith('.jpeg')) return 'image/jpeg';
+  if (name.endsWith('.png')) return 'image/png';
+  if (name.endsWith('.pdf')) return 'application/pdf';
+  return null;
+};
+
+const isSafeHttpsUrl = (url: string): boolean => {
+  try {
+    return new URL(url).protocol === 'https:';
+  } catch {
+    return false;
+  }
+};
+
+async function parseReceiptApiJson<T extends Record<string, any>>(
+  res: Response,
+  fallbackError: string
+): Promise<{ ok: boolean; status: number; data: T | null; error: string | null }> {
+  let rawText = '';
+  try {
+    rawText = await res.text();
+  } catch {
+    return {
+      ok: false,
+      status: res.status,
+      data: null,
+      error: 'Connection interrupted while reading the server response. Please try again.'
+    };
+  }
+  const trimmed = rawText.trim();
+  const contentType = (res.headers.get('content-type') || '').toLowerCase();
+
+  if (!trimmed) {
+    return {
+      ok: false,
+      status: res.status,
+      data: null,
+      error: 'The server returned an empty response while processing your receipt. Please try again.'
+    };
+  }
+  if (contentType.includes('text/html') || /^\s*<!doctype|^\s*<html/i.test(trimmed)) {
+    return {
+      ok: false,
+      status: res.status,
+      data: null,
+      error: 'The server returned an unexpected response while processing your receipt. Please try again.'
+    };
+  }
+
+  let parsed: T | null = null;
+  try {
+    parsed = JSON.parse(trimmed) as T;
+  } catch {
+    return {
+      ok: false,
+      status: res.status,
+      data: null,
+      error: 'The server returned an incomplete response. Please check your connection and try again.'
+    };
+  }
+
+  if (!res.ok) {
+    const serverErr =
+      parsed && typeof parsed.error === 'string' && parsed.error.trim()
+        ? parsed.error.trim()
+        : fallbackError;
+    return { ok: false, status: res.status, data: parsed, error: serverErr };
+  }
+
+  return { ok: true, status: res.status, data: parsed, error: null };
+}
+
+function uploadReceiptBinaryWithProgress(params: {
+  url: string;
+  file: File;
+  contentType: string;
+  onProgress?: (percent: number) => void;
+}): Promise<{ status: number; networkError?: 'network' | 'timeout' | 'aborted' }> {
+  return new Promise(resolve => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', params.url, true);
+    xhr.timeout = RECEIPT_UPLOAD_TIMEOUT_MS;
+    xhr.setRequestHeader('Content-Type', params.contentType);
+
+    xhr.upload.onprogress = event => {
+      if (event.lengthComputable && event.total > 0 && params.onProgress) {
+        params.onProgress(Math.min(100, Math.max(0, Math.round((event.loaded / event.total) * 100))));
+      }
+    };
+    xhr.onload = () => resolve({ status: xhr.status });
+    xhr.onerror = () => resolve({ status: 0, networkError: 'network' });
+    xhr.ontimeout = () => resolve({ status: 0, networkError: 'timeout' });
+    xhr.onabort = () => resolve({ status: 0, networkError: 'aborted' });
+    xhr.send(params.file);
+  });
+}
 
 const formatPaymentMethodLabel = (method?: PaymentMethodKey | null) => {
   if (method === 'tng') return 'Touch ’n Go eWallet QR';
@@ -86,6 +200,8 @@ export default function PaymentPage({
   const [transactionRef, setTransactionRef] = useState('');
   const [receiptFile, setReceiptFile] = useState<File | null>(null);
   const [receiptSubmitting, setReceiptSubmitting] = useState(false);
+  const [receiptUploadProgress, setReceiptUploadProgress] = useState(0);
+  const [receiptUploadStage, setReceiptUploadStage] = useState('');
   const [receiptError, setReceiptError] = useState<string | null>(null);
   const [qrImageFailed, setQrImageFailed] = useState<Record<string, boolean>>({});
   const [savingQr, setSavingQr] = useState(false);
@@ -214,20 +330,27 @@ export default function PaymentPage({
 
   const handleReceiptFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0] || null;
+    e.target.value = '';
     setReceiptError(null);
     if (!file) {
       setReceiptFile(null);
       return;
     }
 
-    const allowedTypes = ['image/jpeg', 'image/png', 'application/pdf'];
-    if (!allowedTypes.includes(file.type)) {
+    const mimeType = resolveReceiptMimeType(file);
+    if (!mimeType) {
       setReceiptError('Please upload a JPG, PNG, or PDF receipt file.');
       setReceiptFile(null);
       return;
     }
 
-    if (file.size > 10 * 1024 * 1024) {
+    if (file.size <= 0) {
+      setReceiptError('Selected receipt file appears to be empty. Please choose another file.');
+      setReceiptFile(null);
+      return;
+    }
+
+    if (file.size > MAX_RECEIPT_SIZE_BYTES) {
       setReceiptError('Receipt file must be smaller than 10 MB.');
       setReceiptFile(null);
       return;
@@ -240,7 +363,7 @@ export default function PaymentPage({
     order.paymentStatus === 'Awaiting payment' ||
     order.paymentStatus === 'Receipt correction needed';
 
-  const handleManualQrSubmit = (e: React.FormEvent) => {
+  const handleManualQrSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!canSubmitPayment) return;
     if (activeMethod !== 'tng' && activeMethod !== 'duitnow') return;
@@ -255,47 +378,133 @@ export default function PaymentPage({
       return;
     }
 
+    const mimeType = resolveReceiptMimeType(receiptFile);
+    if (!mimeType) {
+      setReceiptError('Please upload a JPG, PNG, or PDF receipt file.');
+      return;
+    }
+    if (receiptFile.size <= 0 || receiptFile.size > MAX_RECEIPT_SIZE_BYTES) {
+      setReceiptError('Receipt file must be smaller than 10 MB.');
+      return;
+    }
+
     setReceiptSubmitting(true);
     setReceiptError(null);
+    setReceiptUploadProgress(8);
+    setReceiptUploadStage('Authorising private receipt upload…');
 
-    const reader = new FileReader();
-    reader.onerror = () => {
-      setReceiptError('Unable to read the selected file. Please try again.');
-      setReceiptSubmitting(false);
-    };
-    reader.onload = async () => {
-      try {
-        const res = await fetch('/api/upload-receipt', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-order-token': order.accessToken
-          },
-          body: JSON.stringify({
-            reference: order.reference,
-            accessToken: order.accessToken,
-            paymentMethod: activeMethod,
-            transactionReference: cleanRef,
-            receiptBase64: reader.result as string,
-            filename: receiptFile.name
-          })
-        });
-        const data = await res.json();
-        if (res.ok && data.success && data.order) {
-          onOrderUpdated(data.order);
-          setTransactionRef('');
-          setReceiptFile(null);
-          window.scrollTo({ top: 0, behavior: 'smooth' });
-        } else {
-          setReceiptError(data.error || 'Could not submit your receipt. Please try again.');
+    try {
+      // Step 1: Request a scoped Supabase signed upload URL for the private payment-receipts bucket
+      const urlRes = await fetch('/api/upload-receipt-url', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-order-token': order.accessToken
+        },
+        body: JSON.stringify({
+          reference: order.reference,
+          accessToken: order.accessToken,
+          paymentMethod: activeMethod,
+          filename: receiptFile.name,
+          mimeType,
+          sizeBytes: receiptFile.size
+        })
+      });
+
+      const urlParsed = await parseReceiptApiJson<{
+        success?: boolean;
+        signedUploadUrl?: string;
+        receiptStoragePath?: string;
+        receiptUploadToken?: string;
+        error?: string;
+      }>(urlRes, 'Could not authorise secure receipt upload. Please try again.');
+
+      if (
+        !urlParsed.ok ||
+        !urlParsed.data?.success ||
+        !urlParsed.data.signedUploadUrl ||
+        !urlParsed.data.receiptStoragePath ||
+        !urlParsed.data.receiptUploadToken ||
+        !isSafeHttpsUrl(urlParsed.data.signedUploadUrl)
+      ) {
+        setReceiptError(urlParsed.error || 'Could not authorise secure receipt upload. Please try again.');
+        if (urlParsed.status === 409) {
+          await onRefreshOrder();
         }
-      } catch {
-        setReceiptError('Connection error while uploading your receipt. Please try again.');
-      } finally {
-        setReceiptSubmitting(false);
+        return;
       }
-    };
-    reader.readAsDataURL(receiptFile);
+
+      // Step 2: Upload original binary JPG, PNG, or PDF directly to private Supabase Storage
+      setReceiptUploadStage('Uploading receipt directly to private storage…');
+      setReceiptUploadProgress(15);
+
+      const putResult = await uploadReceiptBinaryWithProgress({
+        url: urlParsed.data.signedUploadUrl,
+        file: receiptFile,
+        contentType: mimeType,
+        onProgress: pct => {
+          setReceiptUploadProgress(Math.min(88, 15 + Math.round(pct * 0.73)));
+        }
+      });
+
+      if (putResult.networkError === 'timeout') {
+        setReceiptError('Receipt upload timed out. Please check your connection and try again.');
+        return;
+      }
+      if (putResult.networkError) {
+        setReceiptError('Network error while uploading your receipt. Please check your connection and try again.');
+        return;
+      }
+      if (putResult.status < 200 || putResult.status >= 300) {
+        setReceiptError('Direct storage upload was rejected. Please retry submitting your receipt.');
+        return;
+      }
+
+      // Step 3: Verify uploaded receipt file server-side & save payment record
+      setReceiptUploadStage('Verifying receipt and updating order…');
+      setReceiptUploadProgress(93);
+
+      const confirmRes = await fetch('/api/upload-receipt/confirm', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-order-token': order.accessToken
+        },
+        body: JSON.stringify({
+          reference: order.reference,
+          accessToken: order.accessToken,
+          paymentMethod: activeMethod,
+          transactionReference: cleanRef,
+          receiptStoragePath: urlParsed.data.receiptStoragePath,
+          receiptUploadToken: urlParsed.data.receiptUploadToken
+        })
+      });
+
+      const confirmParsed = await parseReceiptApiJson<{
+        success?: boolean;
+        order?: OrderPublic;
+        error?: string;
+      }>(confirmRes, 'Could not verify your receipt. Please try again.');
+
+      if (confirmParsed.ok && confirmParsed.data?.success && confirmParsed.data.order) {
+        setReceiptUploadProgress(100);
+        onOrderUpdated(confirmParsed.data.order);
+        setTransactionRef('');
+        setReceiptFile(null);
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      } else {
+        setReceiptError(confirmParsed.error || 'Could not verify your receipt. Please try again.');
+        if (confirmParsed.status === 409) {
+          await onRefreshOrder();
+        }
+      }
+    } catch {
+      setReceiptError('Connection error while uploading your receipt. Please try again.');
+    } finally {
+      setReceiptSubmitting(false);
+      setReceiptUploadProgress(0);
+      setReceiptUploadStage('');
+    }
   };
 
   const handleStartStripeCheckout = async () => {
@@ -1142,7 +1351,7 @@ export default function PaymentPage({
                           <Upload className="w-4 h-4 text-[#E05A40] shrink-0" />
                           <span className="text-xs font-medium text-[#14233C] truncate">
                             {receiptFile
-                              ? `${receiptFile.name} (${(receiptFile.size / 1024).toFixed(0)} KB)`
+                              ? `${receiptFile.name} (${formatReceiptSize(receiptFile.size)})`
                               : 'Choose JPG, PNG, or PDF receipt file'}
                           </span>
                         </div>
@@ -1158,10 +1367,25 @@ export default function PaymentPage({
                         />
                       </label>
                       <p className="text-[11px] text-[#14233C]/60 mt-1.5">
-                        Your receipt is stored privately and linked to order {order.reference} under{' '}
-                        {activeQrConfig.label}.
+                        Your receipt is uploaded directly to private storage and linked to order{' '}
+                        {order.reference} under {activeQrConfig.label}.
                       </p>
                     </div>
+
+                    {receiptSubmitting && (
+                      <div className="p-3.5 rounded-xl bg-[#FAF6EE] border border-[#14233C]/15 space-y-2">
+                        <div className="flex items-center justify-between text-xs font-semibold text-[#14233C]">
+                          <span>{receiptUploadStage || 'Uploading receipt securely…'}</span>
+                          <span className="tabular-nums">{receiptUploadProgress}%</span>
+                        </div>
+                        <progress
+                          value={receiptUploadProgress}
+                          max={100}
+                          aria-label="Receipt upload progress"
+                          className="w-full h-2 rounded-full overflow-hidden accent-[#14233C]"
+                        />
+                      </div>
+                    )}
 
                     {receiptError && (
                       <div
@@ -1179,7 +1403,7 @@ export default function PaymentPage({
                       className="w-full py-3.5 px-6 rounded-xl bg-[#14233C] text-white font-bold text-sm hover:bg-[#1e3357] disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
                     >
                       {receiptSubmitting
-                        ? 'Uploading receipt securely…'
+                        ? `Uploading receipt (${receiptUploadProgress}%)…`
                         : isCorrectionNeeded
                           ? `Upload Replacement ${activeQrConfig.label} Receipt`
                           : `Submit ${activeQrConfig.label} Receipt`}
