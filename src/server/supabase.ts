@@ -2,6 +2,7 @@ import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import type {
   DeliveryCountry,
   EditableStoreSettings,
+  MetaConversionEventStatus,
   OrderPricingBreakdown,
   PaymentMethodKey,
   PaymentStatus,
@@ -97,6 +98,12 @@ export interface OrderRow {
   verification_note: string | null;
   correction_reason: string | null;
   last_card_attempt_message: string | null;
+  meta_fbp?: string | null;
+  meta_fbc?: string | null;
+  meta_event_source_url?: string | null;
+  meta_client_ip?: string | null;
+  meta_client_user_agent?: string | null;
+  meta_marketing_consent?: boolean | null;
   created_at: string;
   updated_at: string;
 }
@@ -155,11 +162,36 @@ export interface EmailNotificationRow {
   updated_at: string;
 }
 
+export interface MetaConversionEventRow {
+  id: string;
+  order_id: string;
+  order_reference: string;
+  event_name: string;
+  event_id: string;
+  event_time: number;
+  delivery_country: DeliveryCountry;
+  currency: SupportedCurrency;
+  value_minor: number;
+  content_ids: string[];
+  num_items: number;
+  status: MetaConversionEventStatus;
+  test_mode: boolean;
+  fbtrace_id: string | null;
+  events_received: number | null;
+  error_message: string | null;
+  attempt_count: number;
+  sent_at: string | null;
+  last_attempt_at: string;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface HydratedOrder {
   order: OrderRow;
   latestPayment: PaymentRow | null;
   latestReceiptPayment: PaymentRow | null;
   confirmationEmail: EmailNotificationRow | null;
+  metaPurchaseEvent: MetaConversionEventRow | null;
 }
 
 const BUCKET_NAME_REGEX = /^[a-z0-9][a-z0-9._-]{1,62}$/;
@@ -294,6 +326,7 @@ export async function checkSupabaseHealth(forceRefresh = false): Promise<Supabas
   let photosBucketReady = false;
   let receiptsBucketReady = false;
   let countryPricingSchemaReady = false;
+  let metaConversionsSchemaReady = false;
 
   try {
     const client = getSupabaseAdminClient();
@@ -321,19 +354,29 @@ export async function checkSupabaseHealth(forceRefresh = false): Promise<Supabas
       );
     }
 
-    // 1b. Non-breaking check for 002_country_based_pricing.sql columns
+    // 1b. Non-breaking checks for 002_country_based_pricing.sql and 003_meta_conversions.sql
     if (databaseReady) {
-      const [ordersSchemaCheck, settingsSchemaCheck] = await Promise.all([
-        client
-          .from('orders')
-          .select('delivery_country,currency,pricing_breakdown', { head: true })
-          .limit(1),
-        client
-          .from('store_settings')
-          .select('delivery_rate_singapore_cents,sg_product_prices_cents', { head: true })
-          .limit(1)
-      ]);
+      const [ordersSchemaCheck, settingsSchemaCheck, metaTableCheck, metaOrdersColsCheck] =
+        await Promise.all([
+          client
+            .from('orders')
+            .select('delivery_country,currency,pricing_breakdown', { head: true })
+            .limit(1),
+          client
+            .from('store_settings')
+            .select('delivery_rate_singapore_cents,sg_product_prices_cents', { head: true })
+            .limit(1),
+          client
+            .from('meta_conversion_events')
+            .select('id', { head: true })
+            .limit(1),
+          client
+            .from('orders')
+            .select('meta_fbp,meta_fbc,meta_marketing_consent', { head: true })
+            .limit(1)
+        ]);
       countryPricingSchemaReady = !ordersSchemaCheck.error && !settingsSchemaCheck.error;
+      metaConversionsSchemaReady = !metaTableCheck.error && !metaOrdersColsCheck.error;
     }
 
     // 2. Verify private storage buckets exist and are NOT public
@@ -381,6 +424,7 @@ export async function checkSupabaseHealth(forceRefresh = false): Promise<Supabas
     photosBucketReady,
     receiptsBucketReady,
     countryPricingSchemaReady,
+    metaConversionsSchemaReady,
     photosBucket: cfg.photosBucket,
     receiptsBucket: cfg.receiptsBucket,
     issues,
@@ -557,6 +601,18 @@ function isMissingColumnError(err: unknown): boolean {
   );
 }
 
+function isMissingTableError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const code = String((err as { code?: unknown }).code || '');
+  const msg = String((err as { message?: unknown }).message || '');
+  return (
+    code === '42P01' ||
+    code === 'PGRST205' ||
+    /Could not find the table/i.test(msg) ||
+    /relation "[^"]+" does not exist/i.test(msg)
+  );
+}
+
 export async function upsertStoreSettingsRow(
   settings: EditableStoreSettings,
   updatedByStaffId?: string | null
@@ -685,25 +741,53 @@ export async function insertOrderRow(
   const client = getSupabaseAdminClient();
   const { data, error } = await client.from('orders').insert(input).select('*').single();
   if (error && isMissingColumnError(error)) {
-    if (input.delivery_country && input.delivery_country !== 'MY') {
-      throw new Error(
-        'SCHEMA_MIGRATION_REQUIRED: Run supabase/migrations/002_country_based_pricing.sql in the Supabase SQL Editor to persist Singapore (SGD) orders.'
-      );
-    }
+    // Stage 1 fallback: strip optional 003_meta_conversions attribution columns first so
+    // databases with 002 applied (but not 003 yet) continue persisting MY & SG orders cleanly.
     const {
-      delivery_country: _dc,
-      currency: _cur,
-      pricing_breakdown: _pb,
-      ...legacyInput
+      meta_fbp: _mfbp,
+      meta_fbc: _mfbc,
+      meta_event_source_url: _murl,
+      meta_client_ip: _mip,
+      meta_client_user_agent: _mua,
+      meta_marketing_consent: _mc,
+      ...withoutMetaCols
     } = input;
-    const fallback = await client.from('orders').insert(legacyInput).select('*').single();
-    if (fallback.error || !fallback.data) {
-      throw new SupabaseQueryError(
-        `Failed to insert order: ${sanitizeSupabaseError(fallback.error)}`,
-        (fallback.error as { code?: string } | null)?.code
-      );
+
+    const retryWithoutMeta = await client
+      .from('orders')
+      .insert(withoutMetaCols)
+      .select('*')
+      .single();
+    if (!retryWithoutMeta.error && retryWithoutMeta.data) {
+      return retryWithoutMeta.data as OrderRow;
     }
-    return fallback.data as OrderRow;
+
+    if (retryWithoutMeta.error && isMissingColumnError(retryWithoutMeta.error)) {
+      if (input.delivery_country && input.delivery_country !== 'MY') {
+        throw new Error(
+          'SCHEMA_MIGRATION_REQUIRED: Run supabase/migrations/002_country_based_pricing.sql in the Supabase SQL Editor to persist Singapore (SGD) orders.'
+        );
+      }
+      const {
+        delivery_country: _dc,
+        currency: _cur,
+        pricing_breakdown: _pb,
+        ...legacyInput
+      } = withoutMetaCols;
+      const fallback = await client.from('orders').insert(legacyInput).select('*').single();
+      if (fallback.error || !fallback.data) {
+        throw new SupabaseQueryError(
+          `Failed to insert order: ${sanitizeSupabaseError(fallback.error)}`,
+          (fallback.error as { code?: string } | null)?.code
+        );
+      }
+      return fallback.data as OrderRow;
+    }
+
+    throw new SupabaseQueryError(
+      `Failed to insert order: ${sanitizeSupabaseError(retryWithoutMeta.error)}`,
+      (retryWithoutMeta.error as { code?: string } | null)?.code
+    );
   }
   if (error || !data) {
     throw new SupabaseQueryError(
@@ -761,28 +845,56 @@ export async function updateOrderIfUnpaid(
     .select('*')
     .maybeSingle();
   if (error && isMissingColumnError(error)) {
-    if (patch.delivery_country && patch.delivery_country !== 'MY') {
-      throw new Error(
-        'SCHEMA_MIGRATION_REQUIRED: Run supabase/migrations/002_country_based_pricing.sql in the Supabase SQL Editor to update delivery country to Singapore (SGD).'
-      );
-    }
     const {
-      delivery_country: _dc,
-      currency: _cur,
-      pricing_breakdown: _pb,
-      ...legacyPatch
+      meta_fbp: _mfbp,
+      meta_fbc: _mfbc,
+      meta_event_source_url: _murl,
+      meta_client_ip: _mip,
+      meta_client_user_agent: _mua,
+      meta_marketing_consent: _mc,
+      ...withoutMetaPatch
     } = patch;
-    const fallback = await client
+
+    const retryWithoutMeta = await client
       .from('orders')
-      .update(legacyPatch)
+      .update(withoutMetaPatch)
       .eq('reference', reference)
       .neq('payment_status', 'Paid')
       .select('*')
       .maybeSingle();
-    if (fallback.error) {
-      throw new Error(`Failed to update order ${reference}: ${sanitizeSupabaseError(fallback.error)}`);
+
+    if (!retryWithoutMeta.error) {
+      return (retryWithoutMeta.data as OrderRow | null) ?? null;
     }
-    return (fallback.data as OrderRow | null) ?? null;
+
+    if (isMissingColumnError(retryWithoutMeta.error)) {
+      if (patch.delivery_country && patch.delivery_country !== 'MY') {
+        throw new Error(
+          'SCHEMA_MIGRATION_REQUIRED: Run supabase/migrations/002_country_based_pricing.sql in the Supabase SQL Editor to update delivery country to Singapore (SGD).'
+        );
+      }
+      const {
+        delivery_country: _dc,
+        currency: _cur,
+        pricing_breakdown: _pb,
+        ...legacyPatch
+      } = withoutMetaPatch;
+      const fallback = await client
+        .from('orders')
+        .update(legacyPatch)
+        .eq('reference', reference)
+        .neq('payment_status', 'Paid')
+        .select('*')
+        .maybeSingle();
+      if (fallback.error) {
+        throw new Error(`Failed to update order ${reference}: ${sanitizeSupabaseError(fallback.error)}`);
+      }
+      return (fallback.data as OrderRow | null) ?? null;
+    }
+
+    throw new Error(
+      `Failed to update order ${reference}: ${sanitizeSupabaseError(retryWithoutMeta.error)}`
+    );
   }
   if (error) {
     throw new Error(`Failed to update order ${reference}: ${sanitizeSupabaseError(error)}`);
@@ -922,13 +1034,102 @@ export async function upsertOrderConfirmationEmail(opts: {
   return data as EmailNotificationRow;
 }
 
+export async function fetchMetaPurchaseEvent(
+  orderId: string
+): Promise<MetaConversionEventRow | null> {
+  const client = getSupabaseAdminClient();
+  const { data, error } = await client
+    .from('meta_conversion_events')
+    .select('*')
+    .eq('order_id', orderId)
+    .eq('event_name', 'Purchase')
+    .maybeSingle();
+  if (error) {
+    if (isMissingTableError(error)) return null;
+    throw new Error(`Failed to read Meta conversion record: ${sanitizeSupabaseError(error)}`);
+  }
+  return (data as MetaConversionEventRow | null) ?? null;
+}
+
+export async function upsertMetaPurchaseEvent(opts: {
+  orderId: string;
+  orderReference: string;
+  eventId: string;
+  eventTime: number;
+  deliveryCountry: DeliveryCountry;
+  currency: SupportedCurrency;
+  valueMinor: number;
+  contentIds: string[];
+  numItems: number;
+  status: MetaConversionEventStatus;
+  testMode: boolean;
+  fbtraceId?: string | null;
+  eventsReceived?: number | null;
+  errorMessage?: string | null;
+  attemptCount: number;
+  sentAt?: string | null;
+  lastAttemptAt: string;
+}): Promise<MetaConversionEventRow | null> {
+  const client = getSupabaseAdminClient();
+  const { data, error } = await client
+    .from('meta_conversion_events')
+    .upsert(
+      {
+        order_id: opts.orderId,
+        order_reference: opts.orderReference,
+        event_name: 'Purchase',
+        event_id: opts.eventId,
+        event_time: opts.eventTime,
+        delivery_country: opts.deliveryCountry,
+        currency: opts.currency,
+        value_minor: opts.valueMinor,
+        content_ids: opts.contentIds,
+        num_items: opts.numItems,
+        status: opts.status,
+        test_mode: opts.testMode,
+        fbtrace_id: opts.fbtraceId ?? null,
+        events_received: opts.eventsReceived ?? null,
+        error_message: opts.errorMessage ?? null,
+        attempt_count: opts.attemptCount,
+        sent_at: opts.sentAt ?? null,
+        last_attempt_at: opts.lastAttemptAt
+      },
+      { onConflict: 'order_id,event_name' }
+    )
+    .select('*')
+    .single();
+
+  if (error) {
+    if (isMissingTableError(error)) return null;
+    throw new Error(`Failed to save Meta conversion record: ${sanitizeSupabaseError(error)}`);
+  }
+  return (data as MetaConversionEventRow | null) ?? null;
+}
+
+export async function listRecentMetaConversionEvents(
+  limit = 25
+): Promise<MetaConversionEventRow[]> {
+  const client = getSupabaseAdminClient();
+  const { data, error } = await client
+    .from('meta_conversion_events')
+    .select('*')
+    .order('last_attempt_at', { ascending: false })
+    .limit(limit);
+  if (error) {
+    if (isMissingTableError(error)) return [];
+    throw new Error(`Failed to load Meta conversion events: ${sanitizeSupabaseError(error)}`);
+  }
+  return (data as MetaConversionEventRow[]) || [];
+}
+
 export async function fetchHydratedOrderByReference(reference: string): Promise<HydratedOrder | null> {
   const order = await fetchOrderByReference(reference);
   if (!order) return null;
 
-  const [payments, confirmationEmail] = await Promise.all([
+  const [payments, confirmationEmail, metaPurchaseEvent] = await Promise.all([
     fetchPaymentsForOrder(order.id),
-    fetchOrderConfirmationEmail(order.id)
+    fetchOrderConfirmationEmail(order.id),
+    fetchMetaPurchaseEvent(order.id).catch(() => null)
   ]);
 
   const latestPayment = payments[0] ?? null;
@@ -938,21 +1139,30 @@ export async function fetchHydratedOrderByReference(reference: string): Promise<
     order,
     latestPayment,
     latestReceiptPayment,
-    confirmationEmail
+    confirmationEmail,
+    metaPurchaseEvent
   };
 }
 
 export async function listHydratedOrders(): Promise<HydratedOrder[]> {
   const client = getSupabaseAdminClient();
-  const [{ data: orderRows, error: ordersErr }, { data: paymentRows, error: paymentsErr }, { data: emailRows, error: emailsErr }] =
-    await Promise.all([
-      client.from('orders').select('*').order('created_at', { ascending: false }),
-      client.from('payments').select('*').order('created_at', { ascending: false }),
-      client
-        .from('email_notifications')
-        .select('*')
-        .eq('notification_type', 'order_confirmation')
-    ]);
+  const [
+    { data: orderRows, error: ordersErr },
+    { data: paymentRows, error: paymentsErr },
+    { data: emailRows, error: emailsErr },
+    metaResult
+  ] = await Promise.all([
+    client.from('orders').select('*').order('created_at', { ascending: false }),
+    client.from('payments').select('*').order('created_at', { ascending: false }),
+    client
+      .from('email_notifications')
+      .select('*')
+      .eq('notification_type', 'order_confirmation'),
+    client
+      .from('meta_conversion_events')
+      .select('*')
+      .eq('event_name', 'Purchase')
+  ]);
 
   if (ordersErr) {
     throw new Error(`Failed to load orders: ${sanitizeSupabaseError(ordersErr)}`);
@@ -962,6 +1172,11 @@ export async function listHydratedOrders(): Promise<HydratedOrder[]> {
   }
   if (emailsErr) {
     throw new Error(`Failed to load email notifications: ${sanitizeSupabaseError(emailsErr)}`);
+  }
+  if (metaResult.error && !isMissingTableError(metaResult.error)) {
+    throw new Error(
+      `Failed to load Meta conversion events: ${sanitizeSupabaseError(metaResult.error)}`
+    );
   }
 
   const paymentsByOrder = new Map<string, PaymentRow[]>();
@@ -976,13 +1191,21 @@ export async function listHydratedOrders(): Promise<HydratedOrder[]> {
     emailByOrder.set(row.order_id, row);
   }
 
+  const metaByOrder = new Map<string, MetaConversionEventRow>();
+  if (!metaResult.error) {
+    for (const row of (metaResult.data as MetaConversionEventRow[]) || []) {
+      metaByOrder.set(row.order_id, row);
+    }
+  }
+
   return ((orderRows as OrderRow[]) || []).map(order => {
     const orderPayments = paymentsByOrder.get(order.id) || [];
     return {
       order,
       latestPayment: orderPayments[0] ?? null,
       latestReceiptPayment: orderPayments.find(p => Boolean(p.receipt_storage_path)) ?? null,
-      confirmationEmail: emailByOrder.get(order.id) ?? null
+      confirmationEmail: emailByOrder.get(order.id) ?? null,
+      metaPurchaseEvent: metaByOrder.get(order.id) ?? null
     };
   });
 }

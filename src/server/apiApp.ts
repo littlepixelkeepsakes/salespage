@@ -7,6 +7,9 @@ import Stripe from 'stripe';
 import type {
   DeliveryCountry,
   EditableStoreSettings,
+  MetaConversionEventPublic,
+  MetaConversionEventStatus,
+  MetaTrackingDiagnostic,
   PaymentMethodKey,
   StoreGalleryImage,
   StripeCheckoutDiagnostic,
@@ -39,6 +42,7 @@ import {
   createSignedPrivateUploadUrl,
   downloadPrivateFile,
   fetchHydratedOrderByReference,
+  fetchMetaPurchaseEvent,
   fetchOrderByReference,
   fetchOrderConfirmationEmail,
   fetchPaymentByStripeSessionId,
@@ -52,6 +56,7 @@ import {
   isUniqueViolationError,
   listActiveStaffAccounts,
   listHydratedOrders,
+  listRecentMetaConversionEvents,
   removePrivateFile,
   sanitizeSupabaseError,
   touchStaffLastLogin,
@@ -59,12 +64,26 @@ import {
   updateOrderIfUnpaid,
   updatePaymentById,
   uploadPrivateFile,
+  upsertMetaPurchaseEvent,
   upsertOrderConfirmationEmail,
   upsertStoreSettingsRow,
   type HydratedOrder,
+  type MetaConversionEventRow,
   type OrderRow,
   type StoreSettingsRow
 } from './supabase';
+import {
+  getMetaEnvConfig,
+  sanitizeEventSourceUrl,
+  sanitizeMetaCookie,
+  sanitizeMetaError,
+  sendMetaCapiPurchaseEvent
+} from './metaCapi';
+import {
+  buildPurchaseEventId,
+  resolveMetaContentId,
+  resolveMetaNumItems
+} from '../shared/metaTracking';
 import {
   computePasscodeVersion,
   deriveOrderPhotoPathForUpload,
@@ -310,6 +329,7 @@ function mapStoreSettingsRow(row?: StoreSettingsRow | null): EditableStoreSettin
 // Transient per-instance locks & rate-limiting caches (all persistent records live in Supabase;
 // upload & staff sessions use stateless HMAC-SHA256 tokens so they work across serverless instances and restarts).
 const inFlightConfirmationEmails: Set<string> = new Set();
+const inFlightMetaConversions: Set<string> = new Set();
 const inFlightStripeEvents: Set<string> = new Set();
 const orderOperationLocks: Map<string, Promise<void>> = new Map();
 
@@ -568,13 +588,97 @@ function toPublicOrder(hydrated: HydratedOrder, photoUrl: string) {
   };
 }
 
-// Admin order serializer: includes sanitized email delivery error details for authorised staff only
+// Admin order serializer: includes sanitized email & Meta CAPI delivery details for authorised staff only
 function toAdminOrder(hydrated: HydratedOrder, signedPhotoUrl: string) {
-  const { confirmationEmail } = hydrated;
+  const { confirmationEmail, metaPurchaseEvent } = hydrated;
   return {
     ...toPublicOrder(hydrated, signedPhotoUrl),
     confirmationEmailError: confirmationEmail?.error_message ?? undefined,
-    confirmationEmailLastAttemptAt: confirmationEmail?.last_attempt_at ?? undefined
+    confirmationEmailLastAttemptAt: confirmationEmail?.last_attempt_at ?? undefined,
+    metaPurchaseStatus: metaPurchaseEvent?.status ?? null,
+    metaPurchaseEventId: metaPurchaseEvent?.event_id ?? undefined,
+    metaPurchaseSentAt: metaPurchaseEvent?.sent_at ?? undefined,
+    metaPurchaseError: metaPurchaseEvent?.error_message ?? undefined,
+    metaPurchaseAttemptCount: metaPurchaseEvent?.attempt_count ?? undefined,
+    metaPurchaseTestMode: metaPurchaseEvent ? Boolean(metaPurchaseEvent.test_mode) : undefined
+  };
+}
+
+function mapMetaConversionEventPublic(row: MetaConversionEventRow): MetaConversionEventPublic {
+  return {
+    orderReference: row.order_reference,
+    eventName: row.event_name,
+    eventId: row.event_id,
+    eventTime: row.event_time,
+    deliveryCountry: row.delivery_country === 'SG' ? 'SG' : 'MY',
+    currency: row.currency === 'SGD' ? 'SGD' : 'MYR',
+    valueMinor: row.value_minor,
+    contentIds: Array.isArray(row.content_ids) ? row.content_ids : [],
+    numItems: row.num_items,
+    status: row.status,
+    testMode: Boolean(row.test_mode),
+    fbtraceId: row.fbtrace_id ?? null,
+    eventsReceived: row.events_received ?? null,
+    errorMessage: row.error_message ?? null,
+    attemptCount: row.attempt_count,
+    sentAt: row.sent_at ?? null,
+    lastAttemptAt: row.last_attempt_at
+  };
+}
+
+async function buildMetaTrackingDiagnostic(
+  supabase: SupabaseHealthDiagnostic
+): Promise<MetaTrackingDiagnostic> {
+  const metaCfg = getMetaEnvConfig();
+  const schemaReady = Boolean(supabase.metaConversionsSchemaReady);
+  const recentRows = supabase.databaseReady
+    ? await listRecentMetaConversionEvents(20).catch(() => [])
+    : [];
+  const recentEvents = recentRows.map(mapMetaConversionEventPublic);
+
+  let sent = 0;
+  let failed = 0;
+  let notConfigured = 0;
+  let skippedConsent = 0;
+  let lastSuccessAt: string | null = null;
+
+  for (const ev of recentEvents) {
+    if (ev.status === 'sent') {
+      sent += 1;
+      if (ev.sentAt && (!lastSuccessAt || ev.sentAt > lastSuccessAt)) {
+        lastSuccessAt = ev.sentAt;
+      }
+    } else if (ev.status === 'failed') {
+      failed += 1;
+    } else if (ev.status === 'not_configured') {
+      notConfigured += 1;
+    } else if (ev.status === 'skipped_consent') {
+      skippedConsent += 1;
+    }
+  }
+
+  const issues = [...metaCfg.issues];
+  if (supabase.databaseReady && !schemaReady) {
+    issues.push(
+      'Run supabase/migrations/003_meta_conversions.sql in Supabase SQL Editor to persist Meta CAPI delivery logs and deduplication records.'
+    );
+  }
+
+  return {
+    pixelConfigured: metaCfg.pixelConfigured,
+    pixelId: metaCfg.pixelId,
+    capiConfigured: metaCfg.capiConfigured,
+    testMode: metaCfg.testMode,
+    schemaReady,
+    lastSuccessAt,
+    summary: {
+      sent,
+      failed,
+      notConfigured,
+      skippedConsent
+    },
+    recentEvents,
+    issue: issues.length > 0 ? issues.join(' ') : undefined
   };
 }
 
@@ -1083,6 +1187,8 @@ async function evaluateAllPaymentMethods(forceHealthRefresh = false) {
   const originInfo = resolveTrustedOriginInfo();
   // 4. Paid confirmation email (Resend) — independent of payment & storage config
   const emailInfo = getEmailConfig();
+  // 5. Meta Pixel & Conversions API diagnostics — NEVER exposes META_CAPI_ACCESS_TOKEN
+  const metaTracking = await buildMetaTrackingDiagnostic(supabase);
 
   const stripeIssues = [stripeInfo.error, originInfo.issue].filter(Boolean).join(' ');
   const sgConfigured =
@@ -1133,6 +1239,7 @@ async function evaluateAllPaymentMethods(forceHealthRefresh = false) {
           : 'Singapore delivery fee is not configured. Set a Singapore Delivery Fee (SGD) in Store & Payment Settings or SG_SHIPPING_FEE_CENTS on the server.'
       },
       email: emailInfo,
+      metaTracking,
       supabase
     }
   };
@@ -1145,6 +1252,7 @@ function getPublicStorefrontConfig(settings: EditableStoreSettings) {
     typeof settings.deliveryRateSingaporeCents === 'number' &&
     Number.isInteger(settings.deliveryRateSingaporeCents) &&
     settings.deliveryRateSingaporeCents >= 0;
+  const metaCfg = getMetaEnvConfig();
   return {
     logoUrl: settings.logoUrl,
     heroImageUrl: settings.heroImageUrl,
@@ -1158,7 +1266,13 @@ function getPublicStorefrontConfig(settings: EditableStoreSettings) {
     marketPricing: buildMarketPricingConfig(settings.sgProductPricesCents),
     whatsappSupportNumber: digits,
     whatsappUrl,
-    deliveryPromiseText: DELIVERY_PROMISE_TEXT
+    deliveryPromiseText: DELIVERY_PROMISE_TEXT,
+    // Public Meta Pixel config ONLY — META_CAPI_ACCESS_TOKEN and META_TEST_EVENT_CODE remain strictly server-side
+    metaTracking: {
+      pixelId: metaCfg.pixelId,
+      pixelConfigured: metaCfg.pixelConfigured,
+      testMode: metaCfg.testMode
+    }
   };
 }
 
@@ -1441,6 +1555,159 @@ async function sendOrderConfirmationEmailOnce(
   }
 }
 
+// Guaranteed at-most-once server-side Meta Conversions API Purchase event per verified Paid order.
+// Tracked & deduplicated in public.meta_conversion_events using deterministic event_id = `purchase_${order.reference}`.
+// NEVER sends events for unpaid or pending-verification orders and NEVER disrupts payment confirmation.
+async function sendMetaPurchaseEventOnce(
+  order: OrderRow,
+  req?: express.Request
+): Promise<{
+  sent: boolean;
+  skipped?: boolean;
+  status: MetaConversionEventStatus;
+  eventId: string;
+  error?: string;
+}> {
+  const eventId = buildPurchaseEventId(order.reference);
+  if (order.payment_status !== 'Paid') {
+    return { sent: false, skipped: true, status: 'not_configured', eventId };
+  }
+
+  return withOrderLock(`meta-purchase:${order.reference}`, async () => {
+    if (inFlightMetaConversions.has(order.reference)) {
+      return { sent: false, skipped: true, status: 'sent', eventId };
+    }
+
+    const existing = await fetchMetaPurchaseEvent(order.id).catch(() => null);
+    if (existing?.sent_at || existing?.status === 'sent') {
+      return { sent: false, skipped: true, status: 'sent', eventId };
+    }
+
+    const deliveryCountry = getOrderDeliveryCountry(order);
+    const currency = getOrderCurrency(order);
+    const contentId = resolveMetaContentId(order.product_id, order.bundle_id);
+    const numItems = resolveMetaNumItems(order.product_id, order.bundle_id, order.item_quantity);
+    const paidAtIso = order.paid_at || new Date().toISOString();
+    const parsedPaidMs = Date.parse(paidAtIso);
+    const eventTime = Math.floor((Number.isFinite(parsedPaidMs) ? parsedPaidMs : Date.now()) / 1000);
+    const attemptCount = (existing?.attempt_count || 0) + 1;
+    const attemptTime = new Date().toISOString();
+    const metaCfg = getMetaEnvConfig();
+
+    // Respect customer marketing consent opt-out stored at checkout
+    if (order.meta_marketing_consent === false) {
+      await upsertMetaPurchaseEvent({
+        orderId: order.id,
+        orderReference: order.reference,
+        eventId,
+        eventTime,
+        deliveryCountry,
+        currency,
+        valueMinor: order.total_sen,
+        contentIds: [contentId],
+        numItems,
+        status: 'skipped_consent',
+        testMode: metaCfg.testMode,
+        errorMessage: 'Customer opted out of marketing tracking.',
+        attemptCount,
+        sentAt: null,
+        lastAttemptAt: attemptTime
+      }).catch(err =>
+        console.error(`Failed to record Meta consent skip for ${order.reference}:`, sanitizeMetaError(err))
+      );
+      return { sent: false, skipped: true, status: 'skipped_consent', eventId };
+    }
+
+    inFlightMetaConversions.add(order.reference);
+    try {
+      const originUrl = resolveTrustedOrigin(req);
+      const cleanSourceUrl = sanitizeEventSourceUrl(order.meta_event_source_url, originUrl);
+
+      const sendResult = await sendMetaCapiPurchaseEvent({
+        orderReference: order.reference,
+        deliveryCountry,
+        currency,
+        productId: order.product_id,
+        bundleId: order.bundle_id,
+        productName: order.product_name,
+        itemQuantity: order.item_quantity,
+        subtotalMinor: order.subtotal_sen,
+        totalMinor: order.total_sen,
+        paidAtIso,
+        customerEmail: order.customer_email,
+        customerPhone: order.customer_mobile,
+        fbp: order.meta_fbp ?? null,
+        fbc: order.meta_fbc ?? null,
+        clientIpAddress: order.meta_client_ip ?? null,
+        clientUserAgent: order.meta_client_user_agent ?? null,
+        eventSourceUrl: cleanSourceUrl
+      });
+
+      if (sendResult.ok) {
+        const sentAt = new Date().toISOString();
+        await upsertMetaPurchaseEvent({
+          orderId: order.id,
+          orderReference: order.reference,
+          eventId: sendResult.eventId,
+          eventTime: sendResult.eventTime,
+          deliveryCountry,
+          currency,
+          valueMinor: order.total_sen,
+          contentIds: sendResult.contentIds,
+          numItems: sendResult.numItems,
+          status: 'sent',
+          testMode: sendResult.testMode,
+          fbtraceId: sendResult.fbtraceId ?? null,
+          eventsReceived: sendResult.eventsReceived ?? 1,
+          errorMessage: null,
+          attemptCount,
+          sentAt,
+          lastAttemptAt: attemptTime
+        }).catch(err =>
+          console.error(`Failed to persist Meta CAPI success for ${order.reference}:`, sanitizeMetaError(err))
+        );
+        return { sent: true, status: 'sent', eventId: sendResult.eventId };
+      }
+
+      const finalStatus: MetaConversionEventStatus = sendResult.notConfigured
+        ? 'not_configured'
+        : 'failed';
+      const safeError = sanitizeMetaError(
+        sendResult.error || 'Meta Conversions API Purchase delivery failed.'
+      );
+      if (finalStatus === 'failed') {
+        console.error(`Meta CAPI Purchase failed for order ${order.reference}: ${safeError}`);
+      }
+
+      await upsertMetaPurchaseEvent({
+        orderId: order.id,
+        orderReference: order.reference,
+        eventId: sendResult.eventId,
+        eventTime: sendResult.eventTime,
+        deliveryCountry,
+        currency,
+        valueMinor: order.total_sen,
+        contentIds: sendResult.contentIds,
+        numItems: sendResult.numItems,
+        status: finalStatus,
+        testMode: sendResult.testMode,
+        fbtraceId: sendResult.fbtraceId ?? null,
+        eventsReceived: null,
+        errorMessage: safeError,
+        attemptCount,
+        sentAt: null,
+        lastAttemptAt: attemptTime
+      }).catch(err =>
+        console.error(`Failed to persist Meta CAPI error for ${order.reference}:`, sanitizeMetaError(err))
+      );
+
+      return { sent: false, status: finalStatus, eventId: sendResult.eventId, error: safeError };
+    } finally {
+      inFlightMetaConversions.delete(order.reference);
+    }
+  });
+}
+
 interface AuthenticatedAdminRequest extends express.Request {
   adminSession?: AdminSessionRecord;
 }
@@ -1717,6 +1984,11 @@ export function createApiApp(): express.Express {
               await sendOrderConfirmationEmailOnce(updatedOrder, req);
             } catch (emailErr) {
               console.error(`Unexpected confirmation email error for order ${reference}:`, emailErr);
+            }
+            try {
+              await sendMetaPurchaseEventOnce(updatedOrder, req);
+            } catch (metaErr) {
+              console.error(`Unexpected Meta CAPI error for order ${reference}:`, sanitizeMetaError(metaErr));
             }
             console.log(
               `Order ${reference} (${orderCountry}/${expectedCurrencyLower.toUpperCase()}) confirmed Paid via verified Stripe webhook (${event.id}).`
@@ -2374,8 +2646,15 @@ export function createApiApp(): express.Express {
     pruneTransientCaches();
 
     try {
-      const { productId, bundleId, uploadSessionToken, photoStoragePath, customer, currency } =
-        req.body || {};
+      const {
+        productId,
+        bundleId,
+        uploadSessionToken,
+        photoStoragePath,
+        customer,
+        currency,
+        metaAttribution
+      } = req.body || {};
 
       // Require a cryptographically verified stateless upload session owning the private photo object
       const tokenStr = typeof uploadSessionToken === 'string' ? uploadSessionToken.trim() : '';
@@ -2615,6 +2894,19 @@ export function createApiApp(): express.Express {
         }
 
         const accessToken = crypto.randomBytes(24).toString('base64url');
+        const cleanMetaFbp = sanitizeMetaCookie(metaAttribution?.fbp);
+        const cleanMetaFbc = sanitizeMetaCookie(metaAttribution?.fbc);
+        const cleanMetaSourceUrl = sanitizeEventSourceUrl(
+          metaAttribution?.eventSourceUrl,
+          resolveTrustedOrigin(req)
+        );
+        const cleanClientIp = getClientIp(req);
+        const cleanUserAgent =
+          typeof req.headers['user-agent'] === 'string'
+            ? req.headers['user-agent'].trim().slice(0, 400)
+            : null;
+        const metaMarketingConsent = metaAttribution?.marketingConsent === false ? false : true;
+
         let insertedOrder: OrderRow;
         try {
           insertedOrder = await insertOrderRow({
@@ -2651,7 +2943,13 @@ export function createApiApp(): express.Express {
             verified_by_staff_id: null,
             verification_note: null,
             correction_reason: null,
-            last_card_attempt_message: null
+            last_card_attempt_message: null,
+            meta_fbp: cleanMetaFbp,
+            meta_fbc: cleanMetaFbc,
+            meta_event_source_url: cleanMetaSourceUrl,
+            meta_client_ip: cleanClientIp || null,
+            meta_client_user_agent: cleanUserAgent,
+            meta_marketing_consent: metaMarketingConsent
           });
         } catch (dbErr) {
           // Cross-instance race: another serverless instance inserted the same deterministic reference concurrently
@@ -2682,7 +2980,8 @@ export function createApiApp(): express.Express {
           order: insertedOrder,
           latestPayment: null,
           latestReceiptPayment: null,
-          confirmationEmail: null
+          confirmationEmail: null,
+          metaPurchaseEvent: null
         };
 
         return res.json({
@@ -4394,6 +4693,12 @@ export function createApiApp(): express.Express {
           console.error(`Unexpected confirmation email error for order ${reference}:`, emailErr);
         }
 
+        try {
+          await sendMetaPurchaseEventOnce(updatedOrder, req);
+        } catch (metaErr) {
+          console.error(`Unexpected Meta CAPI error for order ${reference}:`, sanitizeMetaError(metaErr));
+        }
+
         const refreshed = await fetchHydratedOrderByReference(reference);
         if (!refreshed) {
           return res.status(500).json({ error: 'Order marked paid but could not be reloaded.' });
@@ -4456,6 +4761,77 @@ export function createApiApp(): express.Express {
     } catch (err) {
       console.error(`Retry email error for ${reference}:`, sanitizeSupabaseError(err));
       return res.status(500).json({ error: 'Failed to retry confirmation email.' });
+    }
+  });
+
+  // Protected: Retry sending a failed/unconfigured Meta CAPI Purchase event for a Paid order.
+  // Strictly uses the deterministic event_id (`purchase_<REF>`) and blocks retries if already sent.
+  app.post('/api/admin/orders/:reference/retry-meta-purchase', requireAdminAuth, async (req, res) => {
+    const health = await requireSupabaseReady(res);
+    if (!health) return;
+
+    const { reference } = req.params;
+    if (!ORDER_REF_REGEX.test(reference)) {
+      return res.status(400).json({ error: 'Invalid order reference.' });
+    }
+
+    try {
+      const hydrated = await fetchHydratedOrderByReference(reference);
+      if (!hydrated) {
+        return res.status(404).json({ error: 'Order not found.' });
+      }
+      if (hydrated.order.payment_status !== 'Paid') {
+        return res.status(400).json({
+          error: 'Meta Purchase events can only be sent for backend-verified Paid orders.'
+        });
+      }
+      if (hydrated.metaPurchaseEvent?.sent_at || hydrated.metaPurchaseEvent?.status === 'sent') {
+        const signedPhotoUrl = await resolveAdminOrderPhotoUrl(hydrated.order);
+        const metaTracking = await buildMetaTrackingDiagnostic(health);
+        return res.status(409).json({
+          error: 'Meta Purchase event has already been delivered for this order.',
+          order: toAdminOrder(hydrated, signedPhotoUrl),
+          metaTracking
+        });
+      }
+
+      const result = await sendMetaPurchaseEventOnce(hydrated.order, req);
+      const refreshed = (await fetchHydratedOrderByReference(reference)) || hydrated;
+      const signedPhotoUrl = await resolveAdminOrderPhotoUrl(refreshed.order);
+      const metaTracking = await buildMetaTrackingDiagnostic(health);
+
+      if (result.sent) {
+        return res.json({
+          success: true,
+          order: toAdminOrder(refreshed, signedPhotoUrl),
+          metaTracking
+        });
+      }
+      if (result.skipped && result.status === 'sent') {
+        return res.status(409).json({
+          error: 'Meta Purchase event has already been sent or is currently in progress.',
+          order: toAdminOrder(refreshed, signedPhotoUrl),
+          metaTracking
+        });
+      }
+      if (result.status === 'skipped_consent') {
+        return res.status(409).json({
+          error: 'Customer opted out of marketing tracking for this order.',
+          order: toAdminOrder(refreshed, signedPhotoUrl),
+          metaTracking
+        });
+      }
+
+      const statusCode = result.status === 'not_configured' ? 503 : 502;
+      return res.status(statusCode).json({
+        success: false,
+        error: result.error || 'Could not deliver Meta Purchase event. Order remains Paid.',
+        order: toAdminOrder(refreshed, signedPhotoUrl),
+        metaTracking
+      });
+    } catch (err) {
+      console.error(`Retry Meta CAPI error for ${reference}:`, sanitizeMetaError(err));
+      return res.status(500).json({ error: 'Failed to retry Meta Purchase event.' });
     }
   });
 

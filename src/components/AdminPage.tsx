@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import {
+  Activity,
   AlertCircle,
   ArrowLeft,
   Check,
@@ -109,6 +110,7 @@ export default function AdminPage({
   const [verifyNote, setVerifyNote] = useState('');
   const [actionBusyRef, setActionBusyRef] = useState<string | null>(null);
   const [retryingEmailRef, setRetryingEmailRef] = useState<string | null>(null);
+  const [retryingMetaRef, setRetryingMetaRef] = useState<string | null>(null);
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
   const [copiedLinkRef, setCopiedLinkRef] = useState<string | null>(null);
 
@@ -472,6 +474,52 @@ export default function AdminPage({
       );
     } finally {
       setRetryingEmailRef(null);
+    }
+  };
+
+  const handleRetryMetaPurchase = async (reference: string) => {
+    if (!authToken) return;
+    setRetryingMetaRef(reference);
+    setDashboardError(null);
+    setActionFeedback(null);
+    try {
+      const res = await fetch(
+        `/api/admin/orders/${encodeURIComponent(reference)}/retry-meta-purchase`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${authToken}`
+          }
+        }
+      );
+      const data = await res.json();
+      if (res.status === 401) {
+        setAuthToken(null);
+        setAuthError('Session expired. Please sign in again.');
+        return;
+      }
+      if (data.order) {
+        setOrders(prev => prev.map(o => (o.reference === reference ? data.order : o)));
+      }
+      if (data.metaTracking) {
+        setDiagnostics(prev => (prev ? { ...prev, metaTracking: data.metaTracking } : prev));
+      }
+      if (res.ok && data.success) {
+        setActionFeedback(
+          `Meta Conversions API Purchase event delivered for paid order ${reference} (deduplicated via purchase_${reference}).`
+        );
+      } else {
+        setDashboardError(
+          data.error ||
+            `Could not deliver Meta Purchase event for ${reference}. The order remains confirmed as Paid.`
+        );
+      }
+    } catch {
+      setDashboardError(
+        `Network error while retrying Meta Purchase event for ${reference}. The order remains confirmed as Paid.`
+      );
+    } finally {
+      setRetryingMetaRef(null);
     }
   };
 
@@ -1041,7 +1089,196 @@ export default function AdminPage({
                   : diagnostics.email.issue}
               </p>
             </div>
+
+            {diagnostics.metaTracking && (
+              <div className="p-3.5 rounded-xl bg-[#FAF6EE]/70 border border-[#14233C]/10 space-y-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-bold text-[#14233C]">Meta Pixel &amp; CAPI</span>
+                  <span
+                    className={`font-bold ${
+                      diagnostics.metaTracking.pixelConfigured &&
+                      diagnostics.metaTracking.capiConfigured
+                        ? 'text-emerald-800'
+                        : diagnostics.metaTracking.pixelConfigured
+                          ? 'text-amber-800'
+                          : 'text-[#14233C]/65'
+                    }`}
+                  >
+                    {diagnostics.metaTracking.pixelConfigured &&
+                    diagnostics.metaTracking.capiConfigured
+                      ? diagnostics.metaTracking.testMode
+                        ? 'Active (Test Mode)'
+                        : 'Active (Prod)'
+                      : diagnostics.metaTracking.pixelConfigured
+                        ? 'Pixel Only'
+                        : 'Not Set'}
+                  </span>
+                </div>
+                <p className="text-[#14233C]/70 break-words">
+                  Pixel:{' '}
+                  <strong className="text-[#14233C]">
+                    {diagnostics.metaTracking.pixelConfigured
+                      ? `ID ${diagnostics.metaTracking.pixelId}`
+                      : 'Not configured'}
+                  </strong>
+                  {' · '}CAPI:{' '}
+                  <strong className="text-[#14233C]">
+                    {diagnostics.metaTracking.capiConfigured ? 'Configured' : 'Not set'}
+                  </strong>
+                </p>
+                {diagnostics.metaTracking.lastSuccessAt && (
+                  <p className="text-[11px] text-emerald-800 font-medium">
+                    Last CAPI Purchase: {new Date(diagnostics.metaTracking.lastSuccessAt).toLocaleString()}
+                  </p>
+                )}
+                {!diagnostics.metaTracking.schemaReady && (
+                  <p className="text-[11px] text-amber-900 font-semibold">
+                    Run supabase/migrations/003_meta_conversions.sql to persist CAPI delivery logs.
+                  </p>
+                )}
+              </div>
+            )}
           </div>
+
+          {/* Dedicated Meta Tracking & Conversions API Diagnostics Panel */}
+          {diagnostics.metaTracking && (
+            <div className="pt-4 border-t border-[#14233C]/10 space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <Activity className="w-4 h-4 text-[#14233C]" />
+                  <h3 className="text-xs font-extrabold uppercase tracking-wider text-[#14233C]">
+                    Meta Conversions API (Purchase Events &amp; Deduplication)
+                  </h3>
+                </div>
+                <div className="flex flex-wrap items-center gap-3 text-[11px] font-semibold text-[#14233C]/75">
+                  <span>
+                    Mode:{' '}
+                    <strong className="text-[#14233C]">
+                      {diagnostics.metaTracking.testMode ? 'Test Event Code Active' : 'Production'}
+                    </strong>
+                  </span>
+                  <span aria-hidden="true">·</span>
+                  <span>
+                    Sent: <strong className="text-emerald-800">{diagnostics.metaTracking.summary.sent}</strong>
+                  </span>
+                  <span>
+                    Failed: <strong className="text-red-700">{diagnostics.metaTracking.summary.failed}</strong>
+                  </span>
+                  <span>
+                    Last Success:{' '}
+                    <strong className="text-[#14233C]">
+                      {diagnostics.metaTracking.lastSuccessAt
+                        ? new Date(diagnostics.metaTracking.lastSuccessAt).toLocaleString()
+                        : 'None yet'}
+                    </strong>
+                  </span>
+                </div>
+              </div>
+
+              {diagnostics.metaTracking.issue && (
+                <p className="text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded-xl px-3.5 py-2">
+                  {diagnostics.metaTracking.issue}
+                </p>
+              )}
+
+              {diagnostics.metaTracking.recentEvents.length === 0 ? (
+                <p className="text-xs text-[#14233C]/65">
+                  No server-side Meta Purchase events recorded yet. Events are sent automatically only when an order is confirmed Paid via Stripe webhook or staff QR verification.
+                </p>
+              ) : (
+                <div className="overflow-x-auto rounded-xl border border-[#14233C]/10">
+                  <table className="w-full text-left text-xs border-collapse">
+                    <thead>
+                      <tr className="bg-[#FAF6EE] text-[#14233C]/70 border-b border-[#14233C]/10">
+                        <th className="py-2 px-3 font-bold">Order Ref</th>
+                        <th className="py-2 px-3 font-bold">Event ID</th>
+                        <th className="py-2 px-3 font-bold">Market / Value</th>
+                        <th className="py-2 px-3 font-bold">Status</th>
+                        <th className="py-2 px-3 font-bold">Details / Last Attempt</th>
+                        <th className="py-2 px-3 font-bold text-right">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-[#14233C]/10 bg-white">
+                      {diagnostics.metaTracking.recentEvents.slice(0, 10).map(ev => {
+                        const canRetry = ev.status === 'failed' || ev.status === 'not_configured';
+                        return (
+                          <tr key={ev.eventId} className="align-top">
+                            <td className="py-2.5 px-3 font-mono font-bold text-[#14233C] whitespace-nowrap">
+                              {ev.orderReference}
+                            </td>
+                            <td className="py-2.5 px-3 font-mono text-[11px] text-[#14233C]/75 whitespace-nowrap">
+                              {ev.eventId}
+                            </td>
+                            <td className="py-2.5 px-3 whitespace-nowrap tabular-nums">
+                              <span className="font-semibold text-[#14233C]">
+                                {formatCurrencyAmount(ev.valueMinor, ev.currency)}
+                              </span>{' '}
+                              <span className="text-[#14233C]/60">({ev.deliveryCountry})</span>
+                            </td>
+                            <td className="py-2.5 px-3 whitespace-nowrap">
+                              <span
+                                className={`font-bold ${
+                                  ev.status === 'sent'
+                                    ? 'text-emerald-800'
+                                    : ev.status === 'failed'
+                                      ? 'text-red-700'
+                                      : 'text-amber-800'
+                                }`}
+                              >
+                                {ev.status === 'sent'
+                                  ? ev.testMode
+                                    ? 'Sent (Test)'
+                                    : 'Sent'
+                                  : ev.status === 'failed'
+                                    ? 'Failed'
+                                    : ev.status === 'skipped_consent'
+                                      ? 'Opted Out'
+                                      : 'Not Configured'}
+                              </span>
+                              <span className="block text-[11px] text-[#14233C]/55">
+                                {ev.attemptCount} {ev.attemptCount === 1 ? 'attempt' : 'attempts'}
+                              </span>
+                            </td>
+                            <td className="py-2.5 px-3 text-[11px] text-[#14233C]/75 max-w-xs break-words">
+                              <div>
+                                {ev.sentAt
+                                  ? `Delivered ${new Date(ev.sentAt).toLocaleString()}`
+                                  : `Last try ${new Date(ev.lastAttemptAt).toLocaleString()}`}
+                              </div>
+                              {ev.errorMessage && (
+                                <div className="text-red-700 mt-0.5">{ev.errorMessage}</div>
+                              )}
+                            </td>
+                            <td className="py-2.5 px-3 text-right whitespace-nowrap">
+                              {canRetry ? (
+                                <button
+                                  type="button"
+                                  disabled={retryingMetaRef === ev.orderReference}
+                                  onClick={() => handleRetryMetaPurchase(ev.orderReference)}
+                                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-[#14233C] text-white text-[11px] font-bold hover:bg-[#1e3357] disabled:opacity-60 transition-colors"
+                                >
+                                  <RefreshCw
+                                    className={`w-3 h-3 ${
+                                      retryingMetaRef === ev.orderReference ? 'animate-spin' : ''
+                                    }`}
+                                  />
+                                  <span>
+                                    {retryingMetaRef === ev.orderReference ? 'Sending…' : 'Retry'}
+                                  </span>
+                                </button>
+                              ) : (
+                                <span className="text-[11px] text-[#14233C]/45">—</span>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
         </section>
       )}
 
@@ -1168,24 +1405,48 @@ export default function AdminPage({
                           {formatCurrencyAmount(order.totalSen, orderCurrency)}
                         </p>
                         {isPaid && (
-                          <p
-                            className={`text-[11px] flex items-center md:justify-end gap-1 mt-0.5 font-semibold ${
-                              order.confirmationEmailStatus === 'sent'
-                                ? 'text-emerald-800'
-                                : order.confirmationEmailStatus === 'failed'
-                                  ? 'text-red-700'
-                                  : 'text-amber-800'
-                            }`}
-                          >
-                            <Mail className="w-3 h-3 shrink-0" />
-                            <span>
-                              {order.confirmationEmailStatus === 'sent'
-                                ? 'Confirmation email sent'
-                                : order.confirmationEmailStatus === 'failed'
-                                  ? 'Confirmation email failed'
-                                  : 'Email not sent yet'}
-                            </span>
-                          </p>
+                          <>
+                            <p
+                              className={`text-[11px] flex items-center md:justify-end gap-1 mt-0.5 font-semibold ${
+                                order.confirmationEmailStatus === 'sent'
+                                  ? 'text-emerald-800'
+                                  : order.confirmationEmailStatus === 'failed'
+                                    ? 'text-red-700'
+                                    : 'text-amber-800'
+                              }`}
+                            >
+                              <Mail className="w-3 h-3 shrink-0" />
+                              <span>
+                                {order.confirmationEmailStatus === 'sent'
+                                  ? 'Confirmation email sent'
+                                  : order.confirmationEmailStatus === 'failed'
+                                    ? 'Confirmation email failed'
+                                    : 'Email not sent yet'}
+                              </span>
+                            </p>
+                            <p
+                              className={`text-[11px] flex items-center md:justify-end gap-1 mt-0.5 font-semibold ${
+                                order.metaPurchaseStatus === 'sent'
+                                  ? 'text-emerald-800'
+                                  : order.metaPurchaseStatus === 'failed'
+                                    ? 'text-red-700'
+                                    : 'text-[#14233C]/65'
+                              }`}
+                            >
+                              <Activity className="w-3 h-3 shrink-0" />
+                              <span>
+                                {order.metaPurchaseStatus === 'sent'
+                                  ? order.metaPurchaseTestMode
+                                    ? 'Meta CAPI sent (Test)'
+                                    : 'Meta CAPI Purchase sent'
+                                  : order.metaPurchaseStatus === 'failed'
+                                    ? 'Meta CAPI Purchase failed'
+                                    : order.metaPurchaseStatus === 'skipped_consent'
+                                      ? 'Meta tracking opted out'
+                                      : 'Meta CAPI not sent'}
+                              </span>
+                            </p>
+                          </>
                         )}
                       </div>
                     </div>
@@ -1313,6 +1574,26 @@ export default function AdminPage({
                             </span>
                           </button>
                         )}
+
+                        {isPaid &&
+                          !order.metaPurchaseSentAt &&
+                          order.metaPurchaseStatus !== 'skipped_consent' && (
+                            <button
+                              type="button"
+                              disabled={retryingMetaRef === order.reference}
+                              onClick={() => handleRetryMetaPurchase(order.reference)}
+                              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-[#14233C] text-white text-xs font-bold hover:bg-[#1e3357] disabled:opacity-60 transition-colors whitespace-nowrap shrink-0"
+                            >
+                              <Activity className="w-3.5 h-3.5" />
+                              <span>
+                                {retryingMetaRef === order.reference
+                                  ? 'Sending…'
+                                  : order.metaPurchaseStatus === 'failed'
+                                    ? 'Retry Meta CAPI'
+                                    : 'Send Meta Purchase'}
+                              </span>
+                            </button>
+                          )}
 
                         <button
                           type="button"

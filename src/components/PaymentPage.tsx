@@ -40,6 +40,8 @@ import {
   getCurrencyForCountry,
   validateCustomerDeliveryAddress
 } from '../shared/pricing';
+import { buildMetaEcommerceParams } from '../shared/metaTracking';
+import { trackMetaAddPaymentInfo, trackMetaPurchaseOnce } from '../lib/metaPixel';
 
 interface PaymentPageProps {
   order: OrderPublic;
@@ -48,6 +50,7 @@ interface PaymentPageProps {
   singaporeShippingConfigured?: boolean;
   whatsappUrl: string | null;
   returnNotice: 'success_pending' | 'cancelled' | 'failed' | null;
+  excludeTracking?: boolean;
   onOrderUpdated: (updated: OrderPublic) => void;
   onRefreshOrder: () => Promise<OrderPublic | null>;
   onReturnHome: () => void;
@@ -181,6 +184,7 @@ export default function PaymentPage({
   singaporeShippingConfigured = true,
   whatsappUrl,
   returnNotice,
+  excludeTracking = false,
   onOrderUpdated,
   onRefreshOrder,
   onReturnHome
@@ -350,6 +354,39 @@ export default function PaymentPage({
 
     return () => window.clearTimeout(timer);
   }, [waitingForWebhook, pollAttempts, order.paymentStatus, onRefreshOrder]);
+
+  // Browser Meta Pixel Purchase event — strictly gated on backend-verified Paid status.
+  // NEVER fires for Awaiting payment, Pending verification, Receipt correction needed, or Staff Admin previews.
+  // Deduplicates with server-side Conversions API via exact matching event_id (`purchase_<REF>`),
+  // and prevents duplicate fires across page refreshes and order link revisits.
+  useEffect(() => {
+    if (excludeTracking) return;
+    if (order.paymentStatus !== 'Paid') return;
+    trackMetaPurchaseOnce(
+      order.reference,
+      buildMetaEcommerceParams({
+        productId: order.productId,
+        bundleId: order.bundleId,
+        productName: order.productName,
+        itemQuantity: order.itemQuantity,
+        valueMinor: order.totalSen,
+        itemPriceMinor: order.subtotalSen,
+        currency: orderCurrency,
+        orderReference: order.reference
+      })
+    );
+  }, [
+    excludeTracking,
+    order.paymentStatus,
+    order.reference,
+    order.productId,
+    order.bundleId,
+    order.productName,
+    order.itemQuantity,
+    order.totalSen,
+    order.subtotalSen,
+    orderCurrency
+  ]);
 
   const secureOrderUrl =
     typeof window !== 'undefined'
@@ -649,6 +686,22 @@ export default function PaymentPage({
 
       if (confirmParsed.ok && confirmParsed.data?.success && confirmParsed.data.order) {
         setReceiptUploadProgress(100);
+        // Track standard AddPaymentInfo ONLY (never Purchase — QR orders require staff verification first)
+        if (!excludeTracking) {
+          const updated = confirmParsed.data.order;
+          trackMetaAddPaymentInfo(
+            buildMetaEcommerceParams({
+              productId: updated.productId,
+              bundleId: updated.bundleId,
+              productName: updated.productName,
+              itemQuantity: updated.itemQuantity,
+              valueMinor: updated.totalSen,
+              itemPriceMinor: updated.subtotalSen,
+              currency: updated.currency || orderCurrency,
+              orderReference: updated.reference
+            })
+          );
+        }
         onOrderUpdated(confirmParsed.data.order);
         setTransactionRef('');
         setReceiptFile(null);
@@ -784,6 +837,22 @@ export default function PaymentPage({
       );
       setCardLoading(false);
       return;
+    }
+
+    // Track standard AddPaymentInfo when Stripe Checkout session is created (never Purchase until webhook confirms Paid)
+    if (!excludeTracking) {
+      trackMetaAddPaymentInfo(
+        buildMetaEcommerceParams({
+          productId: order.productId,
+          bundleId: order.bundleId,
+          productName: order.productName,
+          itemQuantity: order.itemQuantity,
+          valueMinor: order.totalSen,
+          itemPriceMinor: order.subtotalSen,
+          currency: orderCurrency,
+          orderReference: order.reference
+        })
+      );
     }
 
     const isEmbeddedFrame = (() => {

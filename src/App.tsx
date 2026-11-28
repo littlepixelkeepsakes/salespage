@@ -51,6 +51,20 @@ import {
   getCurrencyForCountry,
   validateCustomerDeliveryAddress
 } from './shared/pricing';
+import { buildMetaEcommerceParams } from './shared/metaTracking';
+import {
+  collectBrowserMetaAttribution,
+  getEffectiveMarketingConsent,
+  getSavedConsentPreference,
+  initMetaPixel,
+  isExcludedMarketingRoute,
+  setMarketingConsentPreference,
+  trackMetaAddToCart,
+  trackMetaInitiateCheckout,
+  trackMetaPageView,
+  trackMetaViewContent,
+  type MarketingConsentState
+} from './lib/metaPixel';
 
 interface ProductOption {
   id: string;
@@ -435,6 +449,14 @@ export default function App() {
   const [merchantConfigLoading, setMerchantConfigLoading] = useState<boolean>(true);
   const [supabaseReady, setSupabaseReady] = useState<boolean>(true);
   const [supabaseError, setSupabaseError] = useState<string | null>(null);
+  const [staffPreviewOrder, setStaffPreviewOrder] = useState<boolean>(false);
+  const [marketingConsent, setMarketingConsent] = useState<MarketingConsentState>(() =>
+    getEffectiveMarketingConsent()
+  );
+  const [showConsentNotice, setShowConsentNotice] = useState<boolean>(
+    () => getSavedConsentPreference() === null
+  );
+  const lastTrackedPageKeyRef = useRef<string | null>(null);
 
   const fetchOrderByReference = useCallback(
     async (
@@ -545,6 +567,41 @@ export default function App() {
       .finally(() => setMerchantConfigLoading(false));
   }, [fetchOrderByReference]);
 
+  // Meta Pixel base initialization & customer-only PageView tracking.
+  // Strictly excludes Staff Admin (?view=admin / orderStep === 'admin'), staff order previews,
+  // internal test pages, and customers who opted out of marketing tracking.
+  const metaPixelId = storefront.metaTracking?.pixelId || null;
+  useEffect(() => {
+    if (orderStep === 'admin' || staffPreviewOrder || isExcludedMarketingRoute()) {
+      return;
+    }
+    if (marketingConsent !== 'granted' || !metaPixelId) {
+      return;
+    }
+    const ready = initMetaPixel(metaPixelId);
+    if (!ready) return;
+
+    const pageKey =
+      orderStep === 'payment' && currentOrder?.reference
+        ? `payment:${currentOrder.reference}`
+        : `step:${orderStep}`;
+    if (lastTrackedPageKeyRef.current !== pageKey) {
+      lastTrackedPageKeyRef.current = pageKey;
+      trackMetaPageView();
+    }
+  }, [metaPixelId, orderStep, staffPreviewOrder, marketingConsent, currentOrder?.reference]);
+
+  const handleUpdateMarketingConsent = (next: MarketingConsentState) => {
+    setMarketingConsentPreference(next);
+    setMarketingConsent(next);
+    setShowConsentNotice(false);
+    if (next === 'granted' && metaPixelId && orderStep !== 'admin' && !staffPreviewOrder) {
+      if (initMetaPixel(metaPixelId)) {
+        lastTrackedPageKeyRef.current = null;
+      }
+    }
+  };
+
   // Active display country: browsing market on sales/upload; validated delivery country on details/review
   const activePricingCountry: DeliveryCountry =
     orderStep === 'details' || orderStep === 'review' ? customer.country : browsingCountry;
@@ -645,6 +702,60 @@ export default function App() {
     sgProductPricesCents: storefront.marketPricing?.SG?.products
   });
 
+  const trackProductSelectionView = (
+    productId: string,
+    bundleId: 'bundle_2_keychains' | 'bundle_kc_magnet' | 'bundle_2_magnets',
+    country: DeliveryCountry
+  ) => {
+    if (orderStep === 'admin' || staffPreviewOrder || marketingConsent !== 'granted') return;
+    const market = (storefront.marketPricing || buildMarketPricingConfig())[country];
+    const curr = getCurrencyForCountry(country);
+    const valueMinor =
+      productId === 'bundle'
+        ? market.bundles[bundleId].priceMinor
+        : productId === 'magnet'
+          ? market.products.magnet
+          : market.products.keychain;
+    const label =
+      productId === 'bundle'
+        ? bundleId === 'bundle_2_keychains'
+          ? '2-Piece Bundle (2 Keychains)'
+          : bundleId === 'bundle_2_magnets'
+            ? '2-Piece Bundle (2 Fridge Magnets)'
+            : '2-Piece Bundle (1 Keychain + 1 Fridge Magnet)'
+        : productId === 'magnet'
+          ? 'Fridge Magnet'
+          : 'Keychain';
+    trackMetaViewContent(
+      buildMetaEcommerceParams({
+        productId,
+        bundleId: productId === 'bundle' ? bundleId : undefined,
+        productName: label,
+        itemQuantity: productId === 'bundle' ? 2 : 1,
+        valueMinor,
+        itemPriceMinor: valueMinor,
+        currency: curr
+      })
+    );
+  };
+
+  const handleSelectBrowsingCountry = (countryCode: DeliveryCountry) => {
+    setBrowsingCountry(countryCode);
+    trackProductSelectionView(selectedProductId, selectedBundleId, countryCode);
+  };
+
+  const handleSelectProduct = (productId: string) => {
+    setSelectedProductId(productId);
+    trackProductSelectionView(productId, selectedBundleId, browsingCountry);
+  };
+
+  const handleSelectBundle = (
+    bundleId: 'bundle_2_keychains' | 'bundle_kc_magnet' | 'bundle_2_magnets'
+  ) => {
+    setSelectedBundleId(bundleId);
+    trackProductSelectionView('bundle', bundleId, browsingCountry);
+  };
+
   const scrollToSelector = () => {
     const el = document.getElementById('product-selector');
     if (el) {
@@ -653,6 +764,25 @@ export default function App() {
   };
 
   const handleStartOrder = () => {
+    // Track standard Meta AddToCart when customer confirms product/bundle and begins customization
+    if (marketingConsent === 'granted' && !staffPreviewOrder) {
+      const selectedName =
+        selectedProductId === 'bundle' && activeBundle
+          ? `${currentProduct.name} (${activeBundle.name})`
+          : currentProduct.name;
+      trackMetaAddToCart(
+        buildMetaEcommerceParams({
+          productId: selectedProductId,
+          bundleId: selectedProductId === 'bundle' ? selectedBundleId : undefined,
+          productName: selectedName,
+          itemQuantity: selectedProductId === 'bundle' ? 2 : 1,
+          valueMinor: activePriceMinor,
+          itemPriceMinor: activePriceMinor,
+          currency: activeCurrency
+        })
+      );
+    }
+
     setCustomer(prev => {
       if (browsingCountry === 'SG') {
         return {
@@ -1242,7 +1372,8 @@ export default function App() {
           uploadSessionToken,
           photoStoragePath: uploadedPhotoStoragePath,
           customer: clientCheck.normalized,
-          currency: targetCurrency
+          currency: targetCurrency,
+          metaAttribution: collectBrowserMetaAttribution()
         })
       });
       const parsed = await parseApiJsonResponse<{
@@ -1255,6 +1386,7 @@ export default function App() {
 
       if (parsed.ok && parsed.data?.success && parsed.data.order) {
         const createdOrder = parsed.data.order;
+        setStaffPreviewOrder(false);
         setCurrentOrder(createdOrder);
         setBrowsingCountry(createdOrder.deliveryCountry);
         setCountryPriceUpdatedNotice(false);
@@ -1298,6 +1430,7 @@ export default function App() {
   const handleReturnHome = () => {
     const leavingCompletedOrder = Boolean(currentOrder);
     setOrderStep('sales');
+    setStaffPreviewOrder(false);
     setCurrentOrder(null);
     setPaymentReturnNotice(null);
     setOrderLookupError(null);
@@ -1335,6 +1468,7 @@ export default function App() {
     const { order } = await fetchOrderByReference(reference, accessToken);
     setLoadingOrderRef(false);
     if (order) {
+      setStaffPreviewOrder(true);
       setPaymentReturnNotice(null);
       setOrderStep('payment');
       window.history.replaceState(
@@ -1502,7 +1636,7 @@ export default function App() {
                       <button
                         key={countryCode}
                         type="button"
-                        onClick={() => setBrowsingCountry(countryCode)}
+                        onClick={() => handleSelectBrowsingCountry(countryCode)}
                         aria-pressed={isActive}
                         className={`inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-bold transition-colors ${
                           isActive
@@ -1535,7 +1669,7 @@ export default function App() {
                 return (
                   <div 
                     key={product.id}
-                    onClick={() => setSelectedProductId(product.id)}
+                    onClick={() => handleSelectProduct(product.id)}
                     className={`cursor-pointer rounded-3xl p-6 transition-all relative border-2 flex flex-col justify-between ${
                       isSelected 
                         ? 'bg-white border-[#14233C] shadow-xl ring-2 ring-[#14233C]/20 scale-[1.02]' 
@@ -1614,7 +1748,7 @@ export default function App() {
                     return (
                       <div
                         key={choice.id}
-                        onClick={() => setSelectedBundleId(choice.id)}
+                        onClick={() => handleSelectBundle(choice.id)}
                         className={`cursor-pointer rounded-2xl p-4 border-2 transition-all flex flex-col justify-between ${
                           isBundleSelected 
                             ? 'bg-[#FAF6EE] border-[#14233C] shadow-md' 
@@ -1899,7 +2033,32 @@ export default function App() {
             <button
               type="button"
               disabled={!uploadedPhotoStoragePath || uploading}
-              onClick={() => setOrderStep('details')}
+              onClick={() => {
+                if (marketingConsent === 'granted' && !staffPreviewOrder) {
+                  const checkoutCurrency = getCurrencyForCountry(customer.country);
+                  const checkoutValueMinor = liveCheckoutEstimate.ok
+                    ? liveCheckoutEstimate.totalMinor
+                    : activePriceMinor;
+                  const checkoutSubtotalMinor = liveCheckoutEstimate.ok
+                    ? liveCheckoutEstimate.subtotalMinor
+                    : activePriceMinor;
+                  const checkoutProductName = liveCheckoutEstimate.ok
+                    ? liveCheckoutEstimate.productName
+                    : currentProduct.name;
+                  trackMetaInitiateCheckout(
+                    buildMetaEcommerceParams({
+                      productId: selectedProductId,
+                      bundleId: selectedProductId === 'bundle' ? selectedBundleId : undefined,
+                      productName: checkoutProductName,
+                      itemQuantity: selectedProductId === 'bundle' ? 2 : 1,
+                      valueMinor: checkoutValueMinor,
+                      itemPriceMinor: checkoutSubtotalMinor,
+                      currency: checkoutCurrency
+                    })
+                  );
+                }
+                setOrderStep('details');
+              }}
               className={`w-full py-4 rounded-2xl font-bold text-sm transition-colors ${
                 uploadedPhotoStoragePath && !uploading
                   ? 'bg-[#14233C] text-white hover:bg-[#1c3154]'
@@ -2419,6 +2578,7 @@ export default function App() {
             singaporeShippingConfigured={storefront.singaporeShippingConfigured}
             whatsappUrl={storefront.whatsappUrl}
             returnNotice={paymentReturnNotice}
+            excludeTracking={staffPreviewOrder}
             onOrderUpdated={updated => {
               setCurrentOrder(updated);
               setPaymentReturnNotice(null);
@@ -2447,11 +2607,59 @@ export default function App() {
         </div>
       )}
 
+      {/* Customer Marketing Consent Preference Bar (hidden on Staff Admin & when Pixel not configured) */}
+      {orderStep !== 'admin' &&
+        !staffPreviewOrder &&
+        storefront.metaTracking?.pixelConfigured &&
+        showConsentNotice && (
+          <div
+            role="region"
+            aria-label="Cookie and analytics preferences"
+            className="fixed bottom-4 left-4 right-4 sm:left-auto sm:right-6 sm:max-w-md z-40 bg-white/95 backdrop-blur border border-[#14233C]/15 rounded-2xl shadow-xl p-4 text-xs text-[#14233C]"
+          >
+            <p className="font-bold text-[#14233C]">Privacy &amp; Marketing Measurement</p>
+            <p className="mt-1 text-[#14233C]/75 leading-relaxed">
+              We use Meta measurement tools to understand storefront visits and confirmed orders. Customer photos and payment receipts are never shared.
+            </p>
+            <div className="mt-3 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => handleUpdateMarketingConsent('denied')}
+                className="px-3 py-1.5 rounded-lg border border-[#14233C]/20 font-semibold text-[#14233C]/80 hover:bg-[#FAF6EE] transition-colors"
+              >
+                Decline
+              </button>
+              <button
+                type="button"
+                onClick={() => handleUpdateMarketingConsent('granted')}
+                className="px-3.5 py-1.5 rounded-lg bg-[#14233C] text-[#FAF6EE] font-bold hover:bg-[#1e3357] transition-colors"
+              >
+                Accept
+              </button>
+            </div>
+          </div>
+        )}
+
       {/* Quiet Footer */}
       <footer className="mt-auto border-t border-[#14233C]/10 py-6 px-4 sm:px-8">
         <div className="max-w-6xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-3 text-xs text-[#14233C]/60">
           <span>© {new Date().getFullYear()} Little Pixel Keepsakes · Handmade in Malaysia</span>
-          <div className="flex items-center gap-4">
+          <div className="flex flex-wrap items-center justify-center gap-4">
+            {orderStep !== 'admin' && storefront.metaTracking?.pixelConfigured && (
+              <button
+                type="button"
+                onClick={() =>
+                  handleUpdateMarketingConsent(
+                    marketingConsent === 'granted' ? 'denied' : 'granted'
+                  )
+                }
+                className="font-medium text-[#14233C]/60 hover:text-[#14233C] underline transition-colors"
+              >
+                {marketingConsent === 'granted'
+                  ? 'Marketing Cookies: On'
+                  : 'Marketing Cookies: Off'}
+              </button>
+            )}
             {storefront.whatsappUrl && (
               <a
                 href={storefront.whatsappUrl}

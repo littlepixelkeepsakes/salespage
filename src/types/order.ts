@@ -96,7 +96,62 @@ export interface OrderPublic {
   confirmationEmailSentAt?: string;
   confirmationEmailError?: string;
   confirmationEmailLastAttemptAt?: string;
+  metaPurchaseStatus?: MetaConversionEventStatus | null;
+  metaPurchaseEventId?: string;
+  metaPurchaseSentAt?: string;
+  metaPurchaseError?: string;
+  metaPurchaseAttemptCount?: number;
+  metaPurchaseTestMode?: boolean;
   createdAt: string;
+}
+
+export type MetaConversionEventStatus =
+  | 'sent'
+  | 'failed'
+  | 'not_configured'
+  | 'skipped_consent';
+
+export interface PublicMetaTrackingConfig {
+  pixelId: string | null;
+  pixelConfigured: boolean;
+  testMode: boolean;
+}
+
+export interface MetaConversionEventPublic {
+  orderReference: string;
+  eventName: string;
+  eventId: string;
+  eventTime: number;
+  deliveryCountry: DeliveryCountry;
+  currency: SupportedCurrency;
+  valueMinor: number;
+  contentIds: string[];
+  numItems: number;
+  status: MetaConversionEventStatus;
+  testMode: boolean;
+  fbtraceId?: string | null;
+  eventsReceived?: number | null;
+  errorMessage?: string | null;
+  attemptCount: number;
+  sentAt?: string | null;
+  lastAttemptAt: string;
+}
+
+export interface MetaTrackingDiagnostic {
+  pixelConfigured: boolean;
+  pixelId: string | null;
+  capiConfigured: boolean;
+  testMode: boolean;
+  schemaReady: boolean;
+  lastSuccessAt: string | null;
+  summary: {
+    sent: number;
+    failed: number;
+    notConfigured: number;
+    skippedConsent: number;
+  };
+  recentEvents: MetaConversionEventPublic[];
+  issue?: string;
 }
 
 export interface QrMethodConfig {
@@ -188,6 +243,7 @@ export interface PublicStorefrontConfig {
   whatsappSupportNumber: string;
   whatsappUrl: string | null;
   deliveryPromiseText: string;
+  metaTracking?: PublicMetaTrackingConfig;
 }
 
 export interface SupabaseHealthDiagnostic {
@@ -196,6 +252,7 @@ export interface SupabaseHealthDiagnostic {
   photosBucketReady: boolean;
   receiptsBucketReady: boolean;
   countryPricingSchemaReady?: boolean;
+  metaConversionsSchemaReady?: boolean;
   photosBucket: string | null;
   receiptsBucket: string | null;
   issues: string[];
@@ -239,5 +296,6 @@ export interface AdminConfigDiagnostics {
     fromAddress: string | null;
     issue?: string;
   };
+  metaTracking?: MetaTrackingDiagnostic;
   supabase: SupabaseHealthDiagnostic;
 }
