@@ -28,6 +28,7 @@ import AdminPage from './components/AdminPage';
 import HowItWorksSection from './components/HowItWorksSection';
 import {
   DELIVERY_PROMISE_TEXT,
+  buildDeliveryPromiseText,
   type DeliveryCountry,
   type MerchantPaymentConfig,
   type OrderCustomer,
@@ -41,7 +42,11 @@ import {
   COUNTRY_LABELS,
   COUNTRY_UPDATE_NOTICE,
   CURRENCY_NAMES,
+  DEFAULT_PORTRAIT_FRAME_CONFIG,
   MALAYSIAN_STATES,
+  PORTRAIT_FRAME_DIMENSIONS,
+  PORTRAIT_FRAME_MAX_PERSONALISATION_LENGTH,
+  PORTRAIT_FRAME_PRODUCT_ID,
   buildMarketPricingConfig,
   calculateAuthoritativeOrderPricing,
   formatCountryLabel,
@@ -49,6 +54,7 @@ import {
   formatCurrencyWithCode,
   getAllowedPaymentMethodsForCountry,
   getCurrencyForCountry,
+  resolvePortraitFrameConfig,
   validateCustomerDeliveryAddress
 } from './shared/pricing';
 import { buildMetaEcommerceParams } from './shared/metaTracking';
@@ -73,7 +79,9 @@ interface ProductOption {
   regularMinor?: number;
   savingsMinor?: number;
   description: string;
+  metaNote?: string;
   badge?: string;
+  badgeVariant?: 'coral' | 'premium';
 }
 
 interface BundleChoice {
@@ -96,9 +104,21 @@ interface ValidatedDeliveryQuote {
   deliveryZone: string;
   deliveryFeeMinor: number;
   totalMinor: number;
+  deliveryDays?: number;
   allowedPaymentMethods: PaymentMethodKey[];
   breakdown: OrderPricingBreakdown;
 }
+
+const PORTRAIT_FRAME_HEADLINE = 'Your Favourite Memories, Beautifully Framed.';
+const PORTRAIT_FRAME_DESCRIPTION =
+  'Transform your favourite photograph into a handcrafted Perler bead portrait. Beautifully presented in a wooden frame, this personalised keepsake makes a meaningful gift for families, couples and pet lovers.';
+const PORTRAIT_FRAME_FEATURES = [
+  'Personalised from your own photograph',
+  'Individually handcrafted bead artwork',
+  'Wooden frame included',
+  '20 cm x 17 cm portrait',
+  'Perfect for special occasions'
+] as const;
 
 const DEFAULT_STOREFRONT: PublicStorefrontConfig = {
   logoUrl: '/assets/aistudio/Beaded_heart_keepsakes_logo_4fef68e3.png',
@@ -106,7 +126,8 @@ const DEFAULT_STOREFRONT: PublicStorefrontConfig = {
   productImages: {
     keychain: '/assets/aistudio/Custom_Perler_Bead_Keychain_Showcase_b07b8ffc.png',
     magnet: '/assets/aistudio/Custom_Family_Perler_Bead_Magnet_c104de68.png',
-    bundle: '/assets/aistudio/Custom_Family_Perler_Bead_Bundle_e5569304.png'
+    bundle: '/assets/aistudio/Custom_Family_Perler_Bead_Bundle_e5569304.png',
+    portrait_frame: '/assets/aistudio/Our_Family_Perler_Bead_Portrait_ee465ba0.png'
   },
   galleryItems: [
     {
@@ -141,6 +162,11 @@ const DEFAULT_STOREFRONT: PublicStorefrontConfig = {
   deliveryRateSingaporeCents: null,
   singaporeShippingConfigured: false,
   marketPricing: buildMarketPricingConfig(),
+  portraitFrameConfig: {
+    ...DEFAULT_PORTRAIT_FRAME_CONFIG,
+    singaporeShippingConfigured: true,
+    deliveryPromiseText: buildDeliveryPromiseText(DEFAULT_PORTRAIT_FRAME_CONFIG.deliveryDays, true)
+  },
   whatsappSupportNumber: '',
   whatsappUrl: null,
   deliveryPromiseText: DELIVERY_PROMISE_TEXT
@@ -149,19 +175,19 @@ const DEFAULT_STOREFRONT: PublicStorefrontConfig = {
 const FAQS = [
   {
     question: "What kind of photo works best?",
-    answer: "Clear lighting, close-up subjects, and good contrast give the best bead art detail! Portraits of pets, couples, and family members with simple backgrounds work wonderfully in Perler beads."
+    answer: "Clear lighting, close-up subjects, and good contrast give the best bead art detail! High-resolution portraits of pets, couples, and family members with simple backgrounds work wonderfully for keychains, magnets, and 20 cm x 17 cm framed portraits."
   },
   {
     question: "How do bundles work?",
-    answer: "Choose your 2-piece combination and enjoy an automatic 20% discount off the combined regular price. Important note: Both keepsakes in a bundle will be made from the exact same photo."
+    answer: "Choose your 2-piece combination of keychains and/or fridge magnets and enjoy an automatic 20% discount off the combined regular price. Both keepsakes in a bundle are made from the same photo. The Custom Portrait Frame is a standalone premium keepsake."
   },
   {
     question: "How long does delivery take?",
     answer: `${DELIVERY_PROMISE_TEXT} Each piece is meticulously handcrafted bead-by-bead in our Malaysian studio.`
   },
   {
-    question: "How are the keychains and magnets made?",
-    answer: "We carefully map your photo into custom pixel bead grids, hand-place each Perler bead, and fuse them with professional heat pressing for durable, long-lasting keepsakes."
+    question: "How are the keychains, magnets, and portrait frames made?",
+    answer: "We carefully map your photo into custom pixel bead grids, hand-place each Perler bead, and fuse them with professional heat pressing. Our 20 cm x 17 cm Custom Portrait Frame comes beautifully mounted in a wooden frame ready to display or gift."
   }
 ];
 
@@ -414,6 +440,7 @@ export default function App() {
   const [uploadStageLabel, setUploadStageLabel] = useState<string>('');
   const [uploadedFileInfo, setUploadedFileInfo] = useState<{ name: string; sizeBytes: number } | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [personalisationText, setPersonalisationText] = useState<string>('');
   const activeUploadIdRef = useRef<number>(0);
   const orderSubmitLockRef = useRef<boolean>(false);
 
@@ -552,9 +579,22 @@ export default function App() {
           }
           setSupabaseError(data.supabaseError || null);
           if (data.storefront) {
+            const mergedFrame = resolvePortraitFrameConfig(data.storefront.portraitFrameConfig);
             setStorefront({
               ...DEFAULT_STOREFRONT,
               ...data.storefront,
+              productImages: {
+                ...DEFAULT_STOREFRONT.productImages,
+                ...(data.storefront.productImages || {})
+              },
+              portraitFrameConfig: {
+                ...mergedFrame,
+                singaporeShippingConfigured:
+                  typeof mergedFrame.deliverySingaporeCents === 'number' &&
+                  Number.isInteger(mergedFrame.deliverySingaporeCents) &&
+                  mergedFrame.deliverySingaporeCents >= 0,
+                deliveryPromiseText: buildDeliveryPromiseText(mergedFrame.deliveryDays, true)
+              },
               marketPricing: data.storefront.marketPricing || buildMarketPricingConfig()
             });
           }
@@ -649,15 +689,15 @@ export default function App() {
   const products: ProductOption[] = [
     {
       id: 'keychain',
-      name: 'Keychain',
+      name: 'Custom Keychain',
       priceMinor: activeMarketTable.products.keychain,
       description: 'Handcrafted bead keychain with secure metal ring. Perfect for bags, keys, and lanyards.'
     },
     {
       id: 'magnet',
-      name: 'Fridge Magnet',
+      name: 'Custom Fridge Magnet',
       priceMinor: activeMarketTable.products.magnet,
-      description: 'Handcrafted bead magnet with strong neodymium magnet backing for refrigerators and magnetic boards.'
+      description: 'Handcrafted bead magnet with strong neodymium backing for refrigerators and magnetic boards.'
     },
     {
       id: 'bundle',
@@ -671,13 +711,32 @@ export default function App() {
       savingsMinor:
         bundleChoices.find(b => b.id === selectedBundleId)?.savingsMinor ||
         activeMarketTable.bundles.bundle_kc_magnet.savingsMinor,
-      description: 'Save 20% on a pair! Choose 2 keychains, 2 magnets, or a mixed pairing.',
-      badge: 'Save 20%'
+      description: 'Save 20% on a pair of keychains and/or fridge magnets made from the same photo.',
+      badge: 'Save 20%',
+      badgeVariant: 'coral'
+    },
+    {
+      id: PORTRAIT_FRAME_PRODUCT_ID,
+      name: 'Custom Portrait Frame',
+      priceMinor:
+        activeMarketTable.products.portrait_frame ??
+        (activePricingCountry === 'SG'
+          ? storefront.portraitFrameConfig.priceSgCents
+          : storefront.portraitFrameConfig.priceMySen),
+      description:
+        'Handcrafted Perler bead portrait beautifully presented in a wooden frame for families, couples & pets.',
+      metaNote: `${PORTRAIT_FRAME_DIMENSIONS} · Wooden frame included`,
+      badge: 'Premium Keepsake',
+      badgeVariant: 'premium'
     }
   ];
 
   const currentProduct = products.find(p => p.id === selectedProductId) || products[0];
   const activeBundle = bundleChoices.find(b => b.id === selectedBundleId);
+  const isPortraitFrameSelected = selectedProductId === PORTRAIT_FRAME_PRODUCT_ID;
+  const activeDeliveryPromiseText = isPortraitFrameSelected
+    ? storefront.portraitFrameConfig.deliveryPromiseText
+    : storefront.deliveryPromiseText || DELIVERY_PROMISE_TEXT;
 
   const activePriceMinor =
     selectedProductId === 'bundle' && activeBundle
@@ -699,7 +758,8 @@ export default function App() {
       eastMalaysiaSen: storefront.deliveryRatesSen.eastMalaysia,
       singaporeCents: storefront.deliveryRateSingaporeCents
     },
-    sgProductPricesCents: storefront.marketPricing?.SG?.products
+    sgProductPricesCents: storefront.marketPricing?.SG?.products,
+    portraitFrameConfig: storefront.portraitFrameConfig
   });
 
   const trackProductSelectionView = (
@@ -713,9 +773,14 @@ export default function App() {
     const valueMinor =
       productId === 'bundle'
         ? market.bundles[bundleId].priceMinor
-        : productId === 'magnet'
-          ? market.products.magnet
-          : market.products.keychain;
+        : productId === PORTRAIT_FRAME_PRODUCT_ID
+          ? market.products.portrait_frame ??
+            (country === 'SG'
+              ? storefront.portraitFrameConfig.priceSgCents
+              : storefront.portraitFrameConfig.priceMySen)
+          : productId === 'magnet'
+            ? market.products.magnet
+            : market.products.keychain;
     const label =
       productId === 'bundle'
         ? bundleId === 'bundle_2_keychains'
@@ -723,9 +788,11 @@ export default function App() {
           : bundleId === 'bundle_2_magnets'
             ? '2-Piece Bundle (2 Fridge Magnets)'
             : '2-Piece Bundle (1 Keychain + 1 Fridge Magnet)'
-        : productId === 'magnet'
-          ? 'Fridge Magnet'
-          : 'Keychain';
+        : productId === PORTRAIT_FRAME_PRODUCT_ID
+          ? 'Custom Perler Bead Portrait Frame (20 cm x 17 cm)'
+          : productId === 'magnet'
+            ? 'Fridge Magnet'
+            : 'Keychain';
     trackMetaViewContent(
       buildMetaEcommerceParams({
         productId,
@@ -763,21 +830,34 @@ export default function App() {
     }
   };
 
-  const handleStartOrder = () => {
+  const handleStartOrder = (overrideProductId?: string) => {
+    const targetProductId = overrideProductId || selectedProductId;
+    if (overrideProductId && overrideProductId !== selectedProductId) {
+      setSelectedProductId(overrideProductId);
+    }
+
+    const targetProduct = products.find(p => p.id === targetProductId) || currentProduct;
+    const targetPriceMinor =
+      targetProductId === 'bundle' && activeBundle
+        ? activeBundle.priceMinor
+        : targetProduct.priceMinor;
+
     // Track standard Meta AddToCart when customer confirms product/bundle and begins customization
     if (marketingConsent === 'granted' && !staffPreviewOrder) {
       const selectedName =
-        selectedProductId === 'bundle' && activeBundle
-          ? `${currentProduct.name} (${activeBundle.name})`
-          : currentProduct.name;
+        targetProductId === 'bundle' && activeBundle
+          ? `${targetProduct.name} (${activeBundle.name})`
+          : targetProductId === PORTRAIT_FRAME_PRODUCT_ID
+            ? 'Custom Perler Bead Portrait Frame (20 cm x 17 cm)'
+            : targetProduct.name;
       trackMetaAddToCart(
         buildMetaEcommerceParams({
-          productId: selectedProductId,
-          bundleId: selectedProductId === 'bundle' ? selectedBundleId : undefined,
+          productId: targetProductId,
+          bundleId: targetProductId === 'bundle' ? selectedBundleId : undefined,
           productName: selectedName,
-          itemQuantity: selectedProductId === 'bundle' ? 2 : 1,
-          valueMinor: activePriceMinor,
-          itemPriceMinor: activePriceMinor,
+          itemQuantity: targetProductId === 'bundle' ? 2 : 1,
+          valueMinor: targetPriceMinor,
+          itemPriceMinor: targetPriceMinor,
           currency: activeCurrency
         })
       );
@@ -1221,6 +1301,7 @@ export default function App() {
         currency?: SupportedCurrency;
         zone?: string;
         deliveryFeeSen?: number;
+        deliveryDays?: number;
         allowedPaymentMethods?: PaymentMethodKey[];
         pricing?: OrderPricingBreakdown | null;
         error?: string;
@@ -1245,6 +1326,7 @@ export default function App() {
           deliveryZone: breakdown.deliveryZone,
           deliveryFeeMinor: breakdown.deliveryFeeMinor,
           totalMinor: breakdown.totalMinor,
+          deliveryDays: parsed.data.deliveryDays ?? breakdown.deliveryDays,
           allowedPaymentMethods:
             parsed.data.allowedPaymentMethods ||
             getAllowedPaymentMethodsForCountry(parsed.data.deliveryCountry),
@@ -1373,6 +1455,10 @@ export default function App() {
           photoStoragePath: uploadedPhotoStoragePath,
           customer: clientCheck.normalized,
           currency: targetCurrency,
+          personalisationText:
+            selectedProductId === PORTRAIT_FRAME_PRODUCT_ID
+              ? personalisationText.trim() || undefined
+              : undefined,
           metaAttribution: collectBrowserMetaAttribution()
         })
       });
@@ -1449,6 +1535,7 @@ export default function App() {
       setUploadProgress(0);
       setUploadStageLabel('');
       setUploadError(null);
+      setPersonalisationText('');
       setValidatedQuote(null);
       setCountryPriceUpdatedNotice(false);
       setUpdatedTotalReviewed(false);
@@ -1614,7 +1701,7 @@ export default function App() {
           <HowItWorksSection onCreateKeepsake={scrollToSelector} />
 
           {/* Product Selector Section */}
-          <section id="product-selector" className="py-16 px-4 sm:px-8 max-w-5xl mx-auto">
+          <section id="product-selector" className="py-16 px-4 sm:px-8 max-w-6xl mx-auto">
             <div className="text-center space-y-3 mb-10">
               <span className="text-xs font-bold uppercase tracking-widest text-[#FF8D76]">Step 1 of Your Order</span>
               <h2 className="text-3xl sm:text-4xl font-extrabold text-[#14233C]">Choose Your Keepsake Style</h2>
@@ -1654,30 +1741,46 @@ export default function App() {
                 </div>
                 <p className="text-[11px] font-medium text-[#14233C]/65">
                   {browsingCountry === 'SG'
-                    ? storefront.singaporeShippingConfigured &&
-                      typeof storefront.deliveryRateSingaporeCents === 'number'
-                      ? `Singapore delivery (${formatCurrencyAmount(storefront.deliveryRateSingaporeCents, 'SGD')} shipping) · Stripe Card payment only`
-                      : 'Singapore shipping rate is currently being configured by the shop. Malaysia delivery is available.'
-                    : `Malaysia delivery (${formatCurrencyAmount(storefront.deliveryRatesSen.peninsular, 'MYR')} Peninsular / ${formatCurrencyAmount(storefront.deliveryRatesSen.eastMalaysia, 'MYR')} East MY) · TNG, Public Bank QR & Stripe Card`}
+                    ? isPortraitFrameSelected
+                      ? storefront.portraitFrameConfig.singaporeShippingConfigured &&
+                        typeof storefront.portraitFrameConfig.deliverySingaporeCents === 'number'
+                        ? `Singapore Portrait Frame delivery (${formatCurrencyAmount(storefront.portraitFrameConfig.deliverySingaporeCents, 'SGD')} shipping) · Stripe Card payment only`
+                        : 'Singapore Portrait Frame shipping is currently being configured by the shop. Malaysia delivery is available.'
+                      : storefront.singaporeShippingConfigured &&
+                          typeof storefront.deliveryRateSingaporeCents === 'number'
+                        ? `Singapore delivery (${formatCurrencyAmount(storefront.deliveryRateSingaporeCents, 'SGD')} shipping) · Stripe Card payment only`
+                        : 'Singapore shipping rate is currently being configured by the shop. Malaysia delivery is available.'
+                    : isPortraitFrameSelected
+                      ? `Malaysia Portrait Frame delivery (${formatCurrencyAmount(storefront.portraitFrameConfig.deliveryPeninsularSen, 'MYR')} Peninsular / ${formatCurrencyAmount(storefront.portraitFrameConfig.deliveryEastMalaysiaSen, 'MYR')} East MY) · TNG, Public Bank QR & Stripe Card`
+                      : `Malaysia delivery (${formatCurrencyAmount(storefront.deliveryRatesSen.peninsular, 'MYR')} Peninsular / ${formatCurrencyAmount(storefront.deliveryRatesSen.eastMalaysia, 'MYR')} East MY) · TNG, Public Bank QR & Stripe Card`}
                 </p>
               </div>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5 mb-8">
               {products.map((product) => {
                 const isSelected = selectedProductId === product.id;
+                const isPortraitCard = product.id === PORTRAIT_FRAME_PRODUCT_ID;
                 return (
-                  <div 
+                  <div
                     key={product.id}
                     onClick={() => handleSelectProduct(product.id)}
-                    className={`cursor-pointer rounded-3xl p-6 transition-all relative border-2 flex flex-col justify-between ${
-                      isSelected 
-                        ? 'bg-white border-[#14233C] shadow-xl ring-2 ring-[#14233C]/20 scale-[1.02]' 
-                        : 'bg-white/60 border-[#14233C]/15 hover:border-[#14233C]/40 hover:bg-white'
+                    className={`cursor-pointer rounded-3xl p-5 transition-all relative border-2 flex flex-col justify-between ${
+                      isSelected
+                        ? 'bg-white border-[#14233C] shadow-xl ring-2 ring-[#14233C]/20 scale-[1.01]'
+                        : isPortraitCard
+                          ? 'bg-white/90 border-amber-600/35 hover:border-[#14233C]/60 hover:bg-white shadow-sm'
+                          : 'bg-white/60 border-[#14233C]/15 hover:border-[#14233C]/40 hover:bg-white'
                     }`}
                   >
                     {product.badge && (
-                      <span className="absolute -top-3 right-6 bg-[#FF8D76] text-[#14233C] text-xs font-extrabold px-3 py-1 rounded-full shadow-sm">
+                      <span
+                        className={`absolute -top-3 right-5 text-[11px] font-extrabold tracking-wide px-3 py-1 rounded-full shadow-sm ${
+                          product.badgeVariant === 'premium'
+                            ? 'bg-[#14233C] text-amber-200 border border-amber-300/40'
+                            : 'bg-[#FF8D76] text-[#14233C]'
+                        }`}
+                      >
                         {product.badge}
                       </span>
                     )}
@@ -1690,7 +1793,9 @@ export default function App() {
                               ? storefront.productImages.keychain
                               : product.id === 'magnet'
                                 ? storefront.productImages.magnet
-                                : storefront.productImages.bundle
+                                : product.id === 'bundle'
+                                  ? storefront.productImages.bundle
+                                  : storefront.productImages.portrait_frame
                           }
                           alt={product.name}
                           className="w-full h-full object-contain"
@@ -1698,34 +1803,70 @@ export default function App() {
                       </div>
 
                       <div className="flex items-center justify-between">
-                        <div className={`w-10 h-10 rounded-xl flex items-center justify-center ${isSelected ? 'bg-[#14233C] text-[#FAF6EE]' : 'bg-[#14233C]/10 text-[#14233C]'}`}>
-                          {product.id === 'keychain' && <Package className="w-5 h-5" />}
-                          {product.id === 'magnet' && <Gift className="w-5 h-5" />}
-                          {product.id === 'bundle' && <Sparkles className="w-5 h-5" />}
+                        <div
+                          className={`w-9 h-9 rounded-xl flex items-center justify-center ${
+                            isSelected ? 'bg-[#14233C] text-[#FAF6EE]' : 'bg-[#14233C]/10 text-[#14233C]'
+                          }`}
+                        >
+                          {product.id === 'keychain' && <Package className="w-4 h-4" />}
+                          {product.id === 'magnet' && <Gift className="w-4 h-4" />}
+                          {product.id === 'bundle' && <Sparkles className="w-4 h-4" />}
+                          {product.id === PORTRAIT_FRAME_PRODUCT_ID && <Heart className="w-4 h-4" />}
                         </div>
-                        <div className={`w-6 h-6 rounded-full border-2 flex items-center justify-center ${isSelected ? 'border-[#14233C] bg-[#14233C]' : 'border-gray-300'}`}>
+                        <div
+                          className={`w-6 h-6 rounded-full border-2 flex items-center justify-center ${
+                            isSelected ? 'border-[#14233C] bg-[#14233C]' : 'border-gray-300'
+                          }`}
+                        >
                           {isSelected && <Check className="w-3.5 h-3.5 text-white" />}
                         </div>
                       </div>
 
                       <div>
-                        <h3 className="font-extrabold text-xl text-[#14233C]">{product.name}</h3>
-                        <p className="text-xs text-[#14233C]/70 mt-1 min-h-[36px]">{product.description}</p>
+                        <h3 className="font-extrabold text-lg text-[#14233C] leading-snug">
+                          {product.name}
+                        </h3>
+                        {product.metaNote && (
+                          <p className="text-[11px] font-bold text-amber-800 mt-1">
+                            {product.metaNote}
+                          </p>
+                        )}
+                        <p className="text-xs text-[#14233C]/70 mt-1.5 leading-relaxed min-h-[44px]">
+                          {product.description}
+                        </p>
                       </div>
                     </div>
 
-                    <div className="pt-6 mt-6 border-t border-[#14233C]/10 flex items-baseline justify-between">
-                      <span className="text-xs font-semibold text-[#14233C]/60">Price ({activeCurrency})</span>
-                      <div className="text-right">
-                        <span className="text-2xl font-black text-[#14233C] tabular-nums">
-                          {formatCurrencyAmount(product.priceMinor, activeCurrency)}
+                    <div className="pt-5 mt-5 border-t border-[#14233C]/10 space-y-3">
+                      <div className="flex items-baseline justify-between">
+                        <span className="text-xs font-semibold text-[#14233C]/60">
+                          Price ({activeCurrency})
                         </span>
-                        {product.regularMinor && (
-                          <div className="text-xs text-emerald-600 font-bold tabular-nums">
-                            Save {formatCurrencyAmount(product.savingsMinor || 0, activeCurrency)} (20% OFF)
-                          </div>
-                        )}
+                        <div className="text-right">
+                          <span className="text-2xl font-black text-[#14233C] tabular-nums">
+                            {formatCurrencyAmount(product.priceMinor, activeCurrency)}
+                          </span>
+                          {product.regularMinor && (
+                            <div className="text-[11px] text-emerald-600 font-bold tabular-nums">
+                              Save {formatCurrencyAmount(product.savingsMinor || 0, activeCurrency)} (20% OFF)
+                            </div>
+                          )}
+                        </div>
                       </div>
+
+                      {isPortraitCard && (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleStartOrder(PORTRAIT_FRAME_PRODUCT_ID);
+                          }}
+                          className="w-full py-2.5 px-4 rounded-xl bg-[#14233C] text-[#FAF6EE] text-xs font-extrabold hover:bg-[#1e3357] active:scale-[0.99] transition-all flex items-center justify-center gap-1.5"
+                        >
+                          <span>Create My Portrait</span>
+                          <ArrowRight className="w-3.5 h-3.5" />
+                        </button>
+                      )}
                     </div>
                   </div>
                 );
@@ -1738,7 +1879,9 @@ export default function App() {
                   <div>
                     <span className="text-xs font-bold text-[#E05A40] uppercase tracking-wider">Bundle Selection</span>
                     <h3 className="text-xl font-extrabold text-[#14233C]">Choose Your 2-Piece Pairing</h3>
-                    <p className="text-xs text-[#14233C]/70 mt-0.5">Both keepsakes will be made from the same photo. 20% discount applied automatically!</p>
+                    <p className="text-xs text-[#14233C]/70 mt-0.5">
+                      Both keepsakes will be made from the same photo. The 20% bundle discount applies to keychains and fridge magnets.
+                    </p>
                   </div>
                 </div>
 
@@ -1780,16 +1923,82 @@ export default function App() {
               </div>
             )}
 
+            {isPortraitFrameSelected && (
+              <div className="bg-white rounded-3xl p-6 sm:p-8 border-2 border-[#14233C]/20 shadow-xl mb-8">
+                <div className="grid grid-cols-1 md:grid-cols-12 gap-6 sm:gap-8 items-center">
+                  <div className="md:col-span-5">
+                    <div className="rounded-2xl overflow-hidden aspect-[4/3] bg-[#FAF6EE] border border-[#14233C]/12 shadow-sm">
+                      <img
+                        src={storefront.productImages.portrait_frame}
+                        alt="Custom Perler Bead Portrait Frame in a wooden frame"
+                        className="w-full h-full object-cover"
+                      />
+                    </div>
+                  </div>
+                  <div className="md:col-span-7 space-y-4">
+                    <div className="space-y-1.5">
+                      <span className="inline-block text-[11px] font-extrabold uppercase tracking-wider px-3 py-1 rounded-full bg-[#14233C] text-amber-200">
+                        Premium Keepsake · {PORTRAIT_FRAME_DIMENSIONS}
+                      </span>
+                      <h3 className="text-2xl sm:text-3xl font-extrabold text-[#14233C] leading-tight">
+                        {PORTRAIT_FRAME_HEADLINE}
+                      </h3>
+                      <p className="text-xs sm:text-sm text-[#14233C]/75 leading-relaxed">
+                        {PORTRAIT_FRAME_DESCRIPTION}
+                      </p>
+                    </div>
+
+                    <ul className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-1">
+                      {PORTRAIT_FRAME_FEATURES.map(feature => (
+                        <li
+                          key={feature}
+                          className="flex items-start gap-2 text-xs font-semibold text-[#14233C]"
+                        >
+                          <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0 mt-0.5" />
+                          <span>{feature}</span>
+                        </li>
+                      ))}
+                    </ul>
+
+                    <div className="pt-3 border-t border-[#14233C]/10 flex flex-wrap items-center justify-between gap-4">
+                      <div className="text-xs text-[#14233C]/70 space-y-0.5">
+                        <p className="font-bold text-[#14233C]">
+                          Standalone Keepsake · {formatCurrencyAmount(activePriceMinor, activeCurrency)} ({activeCurrency})
+                        </p>
+                        <p>
+                          Delivered within {storefront.portraitFrameConfig.deliveryDays} days after confirmation. Optional frame personalisation available on the next step.
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => handleStartOrder(PORTRAIT_FRAME_PRODUCT_ID)}
+                        className="bg-[#FF8D76] text-[#14233C] font-extrabold px-6 py-3 rounded-2xl shadow-md hover:bg-[#ff7b60] active:scale-95 transition-all inline-flex items-center gap-2 text-sm"
+                      >
+                        <span>Create My Portrait</span>
+                        <ArrowRight className="w-4 h-4" />
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
             <div className="bg-[#14233C] text-[#FAF6EE] rounded-3xl p-6 sm:p-8 shadow-2xl flex flex-col sm:flex-row items-center justify-between gap-6">
               <div className="space-y-2 text-center sm:text-left">
                 <span className="text-xs font-bold text-[#FF8D76] uppercase tracking-wider">
                   Your Keepsake Summary · {formatCountryLabel(browsingCountry)}
                 </span>
                 <h3 className="text-2xl font-extrabold">
-                  {currentProduct.name} {selectedProductId === 'bundle' && activeBundle ? `(${activeBundle.name})` : ''}
+                  {isPortraitFrameSelected
+                    ? `Custom Perler Bead Portrait Frame (${PORTRAIT_FRAME_DIMENSIONS})`
+                    : `${currentProduct.name}${selectedProductId === 'bundle' && activeBundle ? ` (${activeBundle.name})` : ''}`}
                 </h3>
                 <p className="text-xs sm:text-sm text-[#FAF6EE]/80">
-                  {selectedProductId === 'bundle' ? activeBundle?.description : currentProduct.description}
+                  {selectedProductId === 'bundle'
+                    ? activeBundle?.description
+                    : isPortraitFrameSelected
+                      ? 'Wooden frame included · Standalone premium keepsake handcrafted from your photo.'
+                      : currentProduct.description}
                 </p>
               </div>
 
@@ -1809,10 +2018,11 @@ export default function App() {
                 </div>
 
                 <button 
-                  onClick={handleStartOrder}
+                  type="button"
+                  onClick={() => handleStartOrder()}
                   className="w-full sm:w-auto bg-[#FF8D76] text-[#14233C] font-extrabold px-8 py-3.5 rounded-2xl shadow-lg hover:bg-[#ff7b60] active:scale-95 transition-all flex items-center justify-center gap-2"
                 >
-                  <span>Continue to Order</span>
+                  <span>{isPortraitFrameSelected ? 'Create My Portrait' : 'Continue to Order'}</span>
                   <ArrowRight className="w-4 h-4" />
                 </button>
               </div>
@@ -1892,9 +2102,18 @@ export default function App() {
           </button>
           <div className="bg-white rounded-3xl p-6 sm:p-10 shadow-xl border border-[#14233C]/10 space-y-6">
             <div className="space-y-1.5">
-              <h2 className="text-2xl font-black text-[#14233C]">Upload Your Photo</h2>
+              {isPortraitFrameSelected && (
+                <span className="inline-block text-[11px] font-extrabold uppercase tracking-wider px-2.5 py-0.5 rounded-full bg-[#14233C] text-amber-200 mb-1">
+                  Custom Portrait Frame · {PORTRAIT_FRAME_DIMENSIONS} · Wooden Frame Included
+                </span>
+              )}
+              <h2 className="text-2xl font-black text-[#14233C]">
+                {isPortraitFrameSelected ? 'Upload Your Portrait Photo' : 'Upload Your Photo'}
+              </h2>
               <p className="text-sm text-[#14233C]/70">
-                Upload 1 clear JPG or PNG photo (up to 10 MB). Both items in a bundle use the same photo.
+                {isPortraitFrameSelected
+                  ? 'Upload 1 clear, high-resolution JPG or PNG photograph (up to 10 MB) for your handcrafted 20 cm x 17 cm Perler bead portrait.'
+                  : 'Upload 1 clear JPG or PNG photo (up to 10 MB). Both items in a bundle use the same photo.'}
               </p>
             </div>
 
@@ -2028,7 +2247,41 @@ export default function App() {
               </div>
             )}
 
-            <p className="text-xs text-[#14233C]/65">{DELIVERY_PROMISE_TEXT}</p>
+            {/* Optional Frame Personalisation (Portrait Frame only) */}
+            {isPortraitFrameSelected && (
+              <div className="p-4 sm:p-5 rounded-2xl bg-[#FAF6EE]/80 border border-[#14233C]/12 space-y-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <label
+                    htmlFor="portrait-personalisation"
+                    className="text-xs font-bold text-[#14233C]"
+                  >
+                    Optional Frame Personalisation{' '}
+                    <span className="font-normal text-[#14233C]/60">(Name, date, or short message)</span>
+                  </label>
+                  <span className="text-[11px] font-semibold tabular-nums text-[#14233C]/55">
+                    {personalisationText.length}/{PORTRAIT_FRAME_MAX_PERSONALISATION_LENGTH}
+                  </span>
+                </div>
+                <input
+                  id="portrait-personalisation"
+                  type="text"
+                  maxLength={PORTRAIT_FRAME_MAX_PERSONALISATION_LENGTH}
+                  value={personalisationText}
+                  onChange={e =>
+                    setPersonalisationText(
+                      e.target.value.slice(0, PORTRAIT_FRAME_MAX_PERSONALISATION_LENGTH)
+                    )
+                  }
+                  placeholder="e.g. HAPPY FAMILY · Est. 2026"
+                  className="w-full px-4 py-2.5 rounded-xl bg-white border border-[#14233C]/20 text-sm text-[#14233C] placeholder:text-[#14233C]/40 focus:outline-none focus:border-[#14233C]"
+                />
+                <p className="text-[11px] text-[#14233C]/65 leading-relaxed">
+                  Add a short name, date, or message to appear on your portrait or wooden frame, subject to production feasibility. Leave blank if you prefer artwork only.
+                </p>
+              </div>
+            )}
+
+            <p className="text-xs text-[#14233C]/65">{activeDeliveryPromiseText}</p>
 
             <button
               type="button"
@@ -2458,6 +2711,27 @@ export default function App() {
                     {formatCurrencyAmount(reviewSubtotal, reviewCurrency)}
                   </span>
                 </div>
+                {isPortraitFrameSelected && (
+                  <div className="text-xs text-[#14233C]/75 space-y-1 pt-1 border-t border-[#14233C]/10">
+                    <div className="flex justify-between">
+                      <span>Frame &amp; Size</span>
+                      <span className="font-semibold text-[#14233C]">
+                        Wooden frame included · {PORTRAIT_FRAME_DIMENSIONS}
+                      </span>
+                    </div>
+                    {personalisationText.trim() && (
+                      <div className="flex items-start justify-between gap-4">
+                        <span>Personalisation</span>
+                        <span className="font-semibold text-[#14233C] text-right">
+                          &ldquo;{personalisationText.trim()}&rdquo;
+                          <span className="block text-[10px] font-normal text-[#14233C]/60">
+                            Subject to production feasibility
+                          </span>
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                )}
                 {reviewRegular && reviewSavings ? (
                   <>
                     <div className="flex justify-between text-xs text-[#14233C]/60">
@@ -2504,7 +2778,13 @@ export default function App() {
                 </p>
               </div>
 
-              <p className="text-xs text-[#14233C]/70 leading-relaxed">{DELIVERY_PROMISE_TEXT}</p>
+              <p className="text-xs text-[#14233C]/70 leading-relaxed">
+                {buildDeliveryPromiseText(
+                  validatedQuote?.deliveryDays ??
+                    (isPortraitFrameSelected ? storefront.portraitFrameConfig.deliveryDays : 14),
+                  isPortraitFrameSelected
+                )}
+              </p>
               {orderError && (
                 <div
                   role="alert"
@@ -2575,7 +2855,11 @@ export default function App() {
             order={currentOrder}
             merchantConfig={merchantConfig}
             merchantConfigLoading={merchantConfigLoading}
-            singaporeShippingConfigured={storefront.singaporeShippingConfigured}
+            singaporeShippingConfigured={
+              currentOrder.productId === PORTRAIT_FRAME_PRODUCT_ID
+                ? storefront.portraitFrameConfig.singaporeShippingConfigured
+                : storefront.singaporeShippingConfigured
+            }
             whatsappUrl={storefront.whatsappUrl}
             returnNotice={paymentReturnNotice}
             excludeTracking={staffPreviewOrder}
@@ -2597,9 +2881,22 @@ export default function App() {
             onBackToShop={handleReturnHome}
             onOpenOrderPayment={handleOpenOrderPaymentFromAdmin}
             onStorefrontUpdated={(nextStorefront, nextMerchant) => {
+              const mergedFrame = resolvePortraitFrameConfig(nextStorefront.portraitFrameConfig);
               setStorefront({
                 ...DEFAULT_STOREFRONT,
                 ...nextStorefront,
+                productImages: {
+                  ...DEFAULT_STOREFRONT.productImages,
+                  ...(nextStorefront.productImages || {})
+                },
+                portraitFrameConfig: {
+                  ...mergedFrame,
+                  singaporeShippingConfigured:
+                    typeof mergedFrame.deliverySingaporeCents === 'number' &&
+                    Number.isInteger(mergedFrame.deliverySingaporeCents) &&
+                    mergedFrame.deliverySingaporeCents >= 0,
+                  deliveryPromiseText: buildDeliveryPromiseText(mergedFrame.deliveryDays, true)
+                },
                 marketPricing: nextStorefront.marketPricing || buildMarketPricingConfig()
               });
               setMerchantConfig(nextMerchant);

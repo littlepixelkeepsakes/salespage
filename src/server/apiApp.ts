@@ -4,23 +4,26 @@ import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
 import Stripe from 'stripe';
-import type {
-  DeliveryCountry,
-  EditableStoreSettings,
-  MetaConnectionCheckResult,
-  MetaConversionEventPublic,
-  MetaConversionEventStatus,
-  MetaTrackingDiagnostic,
-  PaymentMethodKey,
-  StoreGalleryImage,
-  StripeCheckoutDiagnostic,
-  SupabaseHealthDiagnostic,
-  SupportedCurrency
+import {
+  buildDeliveryPromiseText,
+  type DeliveryCountry,
+  type EditableStoreSettings,
+  type MetaConnectionCheckResult,
+  type MetaConversionEventPublic,
+  type MetaConversionEventStatus,
+  type MetaTrackingDiagnostic,
+  type PaymentMethodKey,
+  type StoreGalleryImage,
+  type StripeCheckoutDiagnostic,
+  type SupabaseHealthDiagnostic,
+  type SupportedCurrency
 } from '../types/order';
 import {
   COUNTRY_LABELS,
   COUNTRY_UPDATE_NOTICE,
   DEFAULT_MARKET_PRODUCT_BASE_PRICES,
+  DEFAULT_PORTRAIT_FRAME_CONFIG,
+  PORTRAIT_FRAME_PRODUCT_ID,
   buildMarketPricingConfig,
   calculateAuthoritativeOrderPricing,
   formatCountryLabel,
@@ -30,6 +33,8 @@ import {
   getCurrencyForCountry,
   normalizeCurrency,
   normalizeDeliveryCountry,
+  resolvePortraitFrameConfig,
+  sanitizePersonalisationText,
   validateCountryCurrencyPair,
   validateCustomerDeliveryAddress,
   verifySavedOrderPricingIntegrity
@@ -152,6 +157,7 @@ const LEGACY_HERO_IMAGE_URL = '/src/assets/images/hero_bead_art_showcase_1795515
 const LEGACY_KEYCHAIN_IMAGE_URL = '/src/assets/images/pet_bead_art_1795515646980.jpg';
 const LEGACY_MAGNET_IMAGE_URL = '/src/assets/images/couple_bead_art_1795515653017.jpg';
 const LEGACY_BUNDLE_IMAGE_URL = '/src/assets/images/family_bead_art_1795515653155.jpg';
+const LEGACY_PORTRAIT_FRAME_IMAGE_URL = '/src/assets/images/family_bead_art_1795515653155.jpg';
 
 function resolveEnvSingaporeShippingCents(): number | null {
   const raw = stripWrappingQuotes(process.env.SG_SHIPPING_FEE_CENTS || '');
@@ -170,7 +176,8 @@ function getDefaultStoreSettings(): EditableStoreSettings {
     productImages: {
       keychain: '/assets/aistudio/Custom_Perler_Bead_Keychain_Showcase_b07b8ffc.png',
       magnet: '/assets/aistudio/Custom_Family_Perler_Bead_Magnet_c104de68.png',
-      bundle: '/assets/aistudio/Custom_Family_Perler_Bead_Bundle_e5569304.png'
+      bundle: '/assets/aistudio/Custom_Family_Perler_Bead_Bundle_e5569304.png',
+      portrait_frame: '/assets/aistudio/Our_Family_Perler_Bead_Portrait_ee465ba0.png'
     },
     galleryItems: [
       {
@@ -203,7 +210,11 @@ function getDefaultStoreSettings(): EditableStoreSettings {
       eastMalaysia: 1500
     },
     deliveryRateSingaporeCents: resolveEnvSingaporeShippingCents(),
-    sgProductPricesCents: { ...DEFAULT_MARKET_PRODUCT_BASE_PRICES.SG },
+    sgProductPricesCents: {
+      keychain: DEFAULT_MARKET_PRODUCT_BASE_PRICES.SG.keychain,
+      magnet: DEFAULT_MARKET_PRODUCT_BASE_PRICES.SG.magnet
+    },
+    portraitFrameConfig: { ...DEFAULT_PORTRAIT_FRAME_CONFIG },
     whatsappSupportNumber: (process.env.WHATSAPP_SUPPORT_NUMBER || '').replace(/\D/g, ''),
     qrOverrides: {
       tng: { enabled: null, recipientName: '', qrImage: '' },
@@ -219,6 +230,7 @@ function mapStoreSettingsRow(row?: StoreSettingsRow | null): EditableStoreSettin
   const rawKeychain = row.product_images?.keychain?.trim();
   const rawMagnet = row.product_images?.magnet?.trim();
   const rawBundle = row.product_images?.bundle?.trim();
+  const rawPortraitFrame = row.product_images?.portrait_frame?.trim();
 
   const hasSgShippingColumn = Object.prototype.hasOwnProperty.call(
     row,
@@ -235,6 +247,27 @@ function mapStoreSettingsRow(row?: StoreSettingsRow | null): EditableStoreSettin
   } else {
     resolvedSgShippingCents = defaults.deliveryRateSingaporeCents;
   }
+
+  const hasPortraitSgShippingColumn = Object.prototype.hasOwnProperty.call(
+    row,
+    'portrait_frame_delivery_singapore_cents'
+  );
+  const resolvedPortraitSgShippingCents = hasPortraitSgShippingColumn
+    ? typeof row.portrait_frame_delivery_singapore_cents === 'number' &&
+      Number.isInteger(row.portrait_frame_delivery_singapore_cents) &&
+      row.portrait_frame_delivery_singapore_cents >= 0
+      ? row.portrait_frame_delivery_singapore_cents
+      : null
+    : defaults.portraitFrameConfig.deliverySingaporeCents;
+
+  const portraitFrameConfig = resolvePortraitFrameConfig({
+    priceMySen: row.portrait_frame_price_my_sen ?? undefined,
+    priceSgCents: row.portrait_frame_price_sg_cents ?? undefined,
+    deliveryPeninsularSen: row.portrait_frame_delivery_peninsular_sen ?? undefined,
+    deliveryEastMalaysiaSen: row.portrait_frame_delivery_east_malaysia_sen ?? undefined,
+    deliverySingaporeCents: resolvedPortraitSgShippingCents,
+    deliveryDays: row.portrait_frame_delivery_days ?? undefined
+  });
 
   const rawSgPrices = row.sg_product_prices_cents;
   const sgProductPricesCents = {
@@ -269,7 +302,11 @@ function mapStoreSettingsRow(row?: StoreSettingsRow | null): EditableStoreSettin
       bundle:
         !rawBundle || rawBundle === LEGACY_BUNDLE_IMAGE_URL
           ? defaults.productImages.bundle
-          : rawBundle
+          : rawBundle,
+      portrait_frame:
+        !rawPortraitFrame || rawPortraitFrame === LEGACY_PORTRAIT_FRAME_IMAGE_URL
+          ? defaults.productImages.portrait_frame
+          : rawPortraitFrame
     },
     galleryItems:
       Array.isArray(row.gallery_items) && row.gallery_items.length > 0
@@ -312,6 +349,7 @@ function mapStoreSettingsRow(row?: StoreSettingsRow | null): EditableStoreSettin
     },
     deliveryRateSingaporeCents: resolvedSgShippingCents,
     sgProductPricesCents,
+    portraitFrameConfig,
     whatsappSupportNumber: (row.whatsapp_support_number || '').replace(/\D/g, '').slice(0, 20),
     qrOverrides: {
       tng: {
@@ -558,6 +596,8 @@ function toPublicOrder(hydrated: HydratedOrder, photoUrl: string) {
     savingsSen: order.savings_sen ?? undefined,
     deliveryFeeSen: order.delivery_fee_sen,
     totalSen: order.total_sen,
+    personalisationText: order.personalisation_text ?? undefined,
+    deliveryDays: order.delivery_days ?? order.pricing_breakdown?.deliveryDays ?? 14,
     photoUrl,
     photoFileName: order.photo_original_filename ?? undefined,
     customer: {
@@ -1298,6 +1338,11 @@ function getPublicStorefrontConfig(settings: EditableStoreSettings) {
     typeof settings.deliveryRateSingaporeCents === 'number' &&
     Number.isInteger(settings.deliveryRateSingaporeCents) &&
     settings.deliveryRateSingaporeCents >= 0;
+  const resolvedFrame = resolvePortraitFrameConfig(settings.portraitFrameConfig);
+  const portraitFrameSingaporeShippingConfigured =
+    typeof resolvedFrame.deliverySingaporeCents === 'number' &&
+    Number.isInteger(resolvedFrame.deliverySingaporeCents) &&
+    resolvedFrame.deliverySingaporeCents >= 0;
   const metaCfg = getMetaEnvConfig();
   return {
     logoUrl: settings.logoUrl,
@@ -1309,7 +1354,12 @@ function getPublicStorefrontConfig(settings: EditableStoreSettings) {
       ? settings.deliveryRateSingaporeCents
       : null,
     singaporeShippingConfigured,
-    marketPricing: buildMarketPricingConfig(settings.sgProductPricesCents),
+    marketPricing: buildMarketPricingConfig(settings.sgProductPricesCents, resolvedFrame),
+    portraitFrameConfig: {
+      ...resolvedFrame,
+      singaporeShippingConfigured: portraitFrameSingaporeShippingConfigured,
+      deliveryPromiseText: buildDeliveryPromiseText(resolvedFrame.deliveryDays, true)
+    },
     whatsappSupportNumber: digits,
     whatsappUrl,
     deliveryPromiseText: DELIVERY_PROMISE_TEXT,
@@ -1428,6 +1478,10 @@ function buildConfirmationEmailContent(order: OrderRow, originUrl: string) {
       ? formatCurrencyAmount(order.savings_sen, currency)
       : null;
   const totalPaid = formatCurrencyWithCode(order.total_sen, currency);
+  const isPortraitFrame = order.product_id === PORTRAIT_FRAME_PRODUCT_ID;
+  const deliveryDays = order.delivery_days ?? order.pricing_breakdown?.deliveryDays ?? 14;
+  const deliveryPromiseText = buildDeliveryPromiseText(deliveryDays, isPortraitFrame);
+  const personalisationNote = sanitizePersonalisationText(order.personalisation_text);
   const deliveryAddress =
     deliveryCountry === 'SG'
       ? `${order.customer_address}, Singapore ${order.customer_postcode}`
@@ -1444,13 +1498,17 @@ function buildConfirmationEmailContent(order: OrderRow, originUrl: string) {
     `Delivery Address: ${deliveryAddress}`,
     `Currency: ${currency}`,
     `Items: ${order.product_name} (Qty ${order.item_quantity})`,
+    ...(isPortraitFrame ? ['Frame Details: Wooden frame included (20 cm x 17 cm)'] : []),
+    ...(personalisationNote
+      ? [`Frame Personalisation: "${personalisationNote}" (subject to production feasibility)`]
+      : []),
     `Items Subtotal: ${subtotalText}`,
     ...(savingsText ? [`Bundle Savings (20% off): - ${savingsText}`] : []),
     `Delivery Fee: ${deliveryFeeText}`,
     `Total Paid: ${totalPaid}`,
     `Payment Method: ${methodLabel}`,
     '',
-    DELIVERY_PROMISE_TEXT,
+    deliveryPromiseText,
     '',
     `View your order status anytime: ${orderLink}`,
     '',
@@ -1467,13 +1525,15 @@ function buildConfirmationEmailContent(order: OrderRow, originUrl: string) {
         <p style="margin: 0 0 8px; font-size: 13px;"><strong>Delivery Address:</strong> ${escapeHtml(deliveryAddress)}</p>
         <p style="margin: 0 0 8px; font-size: 13px;"><strong>Currency:</strong> ${escapeHtml(currency)}</p>
         <p style="margin: 0 0 8px; font-size: 13px;"><strong>Items:</strong> ${escapeHtml(order.product_name)} (Qty ${order.item_quantity})</p>
+        ${isPortraitFrame ? '<p style="margin: 0 0 8px; font-size: 13px;"><strong>Frame Details:</strong> Wooden frame included (20 cm x 17 cm)</p>' : ''}
+        ${personalisationNote ? `<p style="margin: 0 0 8px; font-size: 13px;"><strong>Frame Personalisation:</strong> &ldquo;${escapeHtml(personalisationNote)}&rdquo; <span style="color: #526075;">(subject to production feasibility)</span></p>` : ''}
         <p style="margin: 0 0 8px; font-size: 13px;"><strong>Items Subtotal:</strong> ${escapeHtml(subtotalText)}</p>
         ${savingsText ? `<p style="margin: 0 0 8px; font-size: 13px; color: #047857;"><strong>Bundle Savings (20% off):</strong> - ${escapeHtml(savingsText)}</p>` : ''}
         <p style="margin: 0 0 8px; font-size: 13px;"><strong>Delivery Fee:</strong> ${escapeHtml(deliveryFeeText)}</p>
         <p style="margin: 0 0 8px; font-size: 14px;"><strong>Total Paid:</strong> ${escapeHtml(totalPaid)}</p>
         <p style="margin: 0; font-size: 13px;"><strong>Payment Method:</strong> ${escapeHtml(methodLabel)}</p>
       </div>
-      <p style="font-size: 14px; line-height: 1.6; margin: 0 0 20px; font-weight: 600;">${escapeHtml(DELIVERY_PROMISE_TEXT)}</p>
+      <p style="font-size: 14px; line-height: 1.6; margin: 0 0 20px; font-weight: 600;">${escapeHtml(deliveryPromiseText)}</p>
       <p style="margin: 0 0 16px;">
         <a href="${escapeHtml(orderLink)}" style="display: inline-block; background: #14233C; color: #FFFFFF; text-decoration: none; font-weight: 700; font-size: 13px; padding: 10px 18px; border-radius: 10px;">View Order Status</a>
       </p>
@@ -2664,7 +2724,8 @@ export function createApiApp(): express.Express {
       bundleId: typeof bundleId === 'string' ? bundleId : undefined,
       state: typeof state === 'string' ? state : deliveryCountry === 'SG' ? 'Singapore' : '',
       deliveryRates: getSettingsDeliveryRatesInput(settings),
-      sgProductPricesCents: settings.sgProductPricesCents
+      sgProductPricesCents: settings.sgProductPricesCents,
+      portraitFrameConfig: settings.portraitFrameConfig
     });
 
     if (!pricing.ok) {
@@ -2681,6 +2742,7 @@ export function createApiApp(): express.Express {
       currency: pricing.currency,
       zone: pricing.deliveryZone,
       deliveryFeeSen: pricing.deliveryFeeMinor,
+      deliveryDays: pricing.deliveryDays,
       allowedPaymentMethods: pricing.allowedPaymentMethods,
       pricing: pricing.breakdown
     });
@@ -2700,6 +2762,7 @@ export function createApiApp(): express.Express {
         photoStoragePath,
         customer,
         currency,
+        personalisationText,
         metaAttribution
       } = req.body || {};
 
@@ -2763,7 +2826,8 @@ export function createApiApp(): express.Express {
         bundleId,
         state: cleanCustomer.state,
         deliveryRates: getSettingsDeliveryRatesInput(settings),
-        sgProductPricesCents: settings.sgProductPricesCents
+        sgProductPricesCents: settings.sgProductPricesCents,
+        portraitFrameConfig: settings.portraitFrameConfig
       });
 
       if (!pricing.ok) {
@@ -2772,6 +2836,11 @@ export function createApiApp(): express.Express {
           code: pricing.code
         });
       }
+
+      const cleanPersonalisationText =
+        pricing.productId === PORTRAIT_FRAME_PRODUCT_ID
+          ? sanitizePersonalisationText(personalisationText)
+          : null;
 
       const cfg = getSupabaseEnvConfig();
       const ext: 'jpg' | 'png' = verifiedSession.mime === 'image/png' ? 'png' : 'jpg';
@@ -2833,7 +2902,8 @@ export function createApiApp(): express.Express {
             existing.order.customer_address !== cleanCustomer.address ||
             existing.order.customer_postcode !== cleanCustomer.postcode ||
             existing.order.customer_city !== cleanCustomer.city ||
-            existing.order.customer_state !== cleanCustomer.state;
+            existing.order.customer_state !== cleanCustomer.state ||
+            (existing.order.personalisation_text ?? null) !== cleanPersonalisationText;
 
           if (existing.order.payment_status === 'Awaiting payment' && deliveryChanged) {
             const countryOrTotalChanged =
@@ -2867,6 +2937,8 @@ export function createApiApp(): express.Express {
                 savings_sen: pricing.savingsMinor,
                 delivery_fee_sen: pricing.deliveryFeeMinor,
                 total_sen: pricing.totalMinor,
+                personalisation_text: cleanPersonalisationText,
+                delivery_days: pricing.deliveryDays,
                 customer_full_name: cleanCustomer.fullName,
                 customer_email: cleanCustomer.email,
                 customer_mobile: cleanCustomer.mobile,
@@ -2971,6 +3043,8 @@ export function createApiApp(): express.Express {
             savings_sen: pricing.savingsMinor,
             delivery_fee_sen: pricing.deliveryFeeMinor,
             total_sen: pricing.totalMinor,
+            personalisation_text: cleanPersonalisationText,
+            delivery_days: pricing.deliveryDays,
             photo_storage_bucket: cfg.photosBucket,
             photo_storage_path: finalPhotoPath,
             photo_original_filename: verifiedSession.name,
@@ -3171,7 +3245,8 @@ export function createApiApp(): express.Express {
           bundleId: order.bundle_id,
           state: cleanCustomer.state,
           deliveryRates: getSettingsDeliveryRatesInput(settings),
-          sgProductPricesCents: settings.sgProductPricesCents
+          sgProductPricesCents: settings.sgProductPricesCents,
+          portraitFrameConfig: settings.portraitFrameConfig
         });
 
         if (!pricing.ok) {
@@ -3213,6 +3288,7 @@ export function createApiApp(): express.Express {
           savings_sen: pricing.savingsMinor,
           delivery_fee_sen: pricing.deliveryFeeMinor,
           total_sen: pricing.totalMinor,
+          delivery_days: pricing.deliveryDays,
           customer_full_name: cleanCustomer.fullName,
           customer_email: cleanCustomer.email,
           customer_mobile: cleanCustomer.mobile,
@@ -3856,7 +3932,8 @@ export function createApiApp(): express.Express {
       const verified = verifySavedOrderPricingIntegrity({
         order,
         deliveryRates: getSettingsDeliveryRatesInput(settings),
-        sgProductPricesCents: settings.sgProductPricesCents
+        sgProductPricesCents: settings.sgProductPricesCents,
+        portraitFrameConfig: settings.portraitFrameConfig
       });
 
       if (!verified.valid) {
@@ -3931,10 +4008,22 @@ export function createApiApp(): express.Express {
       }
 
       const stripeCurrency = verified.currency.toLowerCase();
+      const isPortraitFrameOrder = order.product_id === PORTRAIT_FRAME_PRODUCT_ID;
+      const orderDeliveryDays =
+        order.delivery_days ?? order.pricing_breakdown?.deliveryDays ?? verified.expected.deliveryDays;
+      const orderDeliveryPromise = buildDeliveryPromiseText(orderDeliveryDays, isPortraitFrameOrder);
+      const personalisationNote = sanitizePersonalisationText(order.personalisation_text);
       const deliveryLabel =
         verified.deliveryCountry === 'SG'
-          ? 'Delivery (Singapore)'
-          : `Delivery (${verified.expected.deliveryZone}, Malaysia)`;
+          ? isPortraitFrameOrder
+            ? 'Portrait Frame Delivery (Singapore)'
+            : 'Delivery (Singapore)'
+          : isPortraitFrameOrder
+            ? `Portrait Frame Delivery (${verified.expected.deliveryZone}, Malaysia)`
+            : `Delivery (${verified.expected.deliveryZone}, Malaysia)`;
+      const itemDescription = personalisationNote
+        ? `Order Ref: ${order.reference} (Qty: ${order.item_quantity} · ${COUNTRY_LABELS[verified.deliveryCountry]}) · Personalisation: ${personalisationNote}`
+        : `Order Ref: ${order.reference} (Qty: ${order.item_quantity} · ${COUNTRY_LABELS[verified.deliveryCountry]})`;
 
       let session: Stripe.Checkout.Session;
       try {
@@ -3948,7 +4037,9 @@ export function createApiApp(): express.Express {
             orderReference: order.reference,
             deliveryCountry: verified.deliveryCountry,
             currency: verified.currency,
+            productId: order.product_id,
             productName: order.product_name,
+            ...(personalisationNote ? { personalisationText: personalisationNote } : {}),
             expectedSubtotalMinor: String(order.subtotal_sen),
             expectedDeliveryFeeMinor: String(order.delivery_fee_sen),
             expectedTotalMinor: String(order.total_sen),
@@ -3960,7 +4051,7 @@ export function createApiApp(): express.Express {
                 currency: stripeCurrency,
                 product_data: {
                   name: `Little Pixel Keepsakes — ${order.product_name}`,
-                  description: `Order Ref: ${order.reference} (Qty: ${order.item_quantity} · ${COUNTRY_LABELS[verified.deliveryCountry]})`
+                  description: itemDescription
                 },
                 unit_amount: order.subtotal_sen
               },
@@ -3971,7 +4062,7 @@ export function createApiApp(): express.Express {
                 currency: stripeCurrency,
                 product_data: {
                   name: deliveryLabel,
-                  description: DELIVERY_PROMISE_TEXT
+                  description: orderDeliveryPromise
                 },
                 unit_amount: order.delivery_fee_sen
               },
@@ -4338,7 +4429,7 @@ export function createApiApp(): express.Express {
       }
 
       if (incoming.productImages && typeof incoming.productImages === 'object') {
-        for (const key of ['keychain', 'magnet', 'bundle'] as const) {
+        for (const key of ['keychain', 'magnet', 'bundle', 'portrait_frame'] as const) {
           const val = incoming.productImages[key];
           if (typeof val === 'string' && val.trim()) {
             const check = validateStorefrontAssetSource(val);
@@ -4445,6 +4536,77 @@ export function createApiApp(): express.Express {
         }
       }
 
+      if (incoming.portraitFrameConfig && typeof incoming.portraitFrameConfig === 'object') {
+        const pf = incoming.portraitFrameConfig;
+        if (typeof pf.priceMySen === 'number') {
+          if (!Number.isInteger(pf.priceMySen) || pf.priceMySen < 200 || pf.priceMySen > 500000) {
+            return res.status(400).json({
+              error: 'Portrait Frame Malaysia price must be between RM 2.00 and RM 5,000.00.'
+            });
+          }
+          next.portraitFrameConfig.priceMySen = pf.priceMySen;
+        }
+        if (typeof pf.priceSgCents === 'number') {
+          if (!Number.isInteger(pf.priceSgCents) || pf.priceSgCents < 50 || pf.priceSgCents > 500000) {
+            return res.status(400).json({
+              error: 'Portrait Frame Singapore price must be between S$ 0.50 and S$ 5,000.00.'
+            });
+          }
+          next.portraitFrameConfig.priceSgCents = pf.priceSgCents;
+        }
+        if (typeof pf.deliveryPeninsularSen === 'number') {
+          if (
+            !Number.isInteger(pf.deliveryPeninsularSen) ||
+            pf.deliveryPeninsularSen < 0 ||
+            pf.deliveryPeninsularSen > 100000
+          ) {
+            return res.status(400).json({
+              error:
+                'Portrait Frame Peninsular Malaysia delivery fee must be between RM 0.00 and RM 1,000.00.'
+            });
+          }
+          next.portraitFrameConfig.deliveryPeninsularSen = pf.deliveryPeninsularSen;
+        }
+        if (typeof pf.deliveryEastMalaysiaSen === 'number') {
+          if (
+            !Number.isInteger(pf.deliveryEastMalaysiaSen) ||
+            pf.deliveryEastMalaysiaSen < 0 ||
+            pf.deliveryEastMalaysiaSen > 100000
+          ) {
+            return res.status(400).json({
+              error:
+                'Portrait Frame Sabah & Sarawak delivery fee must be between RM 0.00 and RM 1,000.00.'
+            });
+          }
+          next.portraitFrameConfig.deliveryEastMalaysiaSen = pf.deliveryEastMalaysiaSen;
+        }
+        if (pf.deliverySingaporeCents !== undefined) {
+          if (pf.deliverySingaporeCents === null) {
+            next.portraitFrameConfig.deliverySingaporeCents = null;
+          } else if (
+            typeof pf.deliverySingaporeCents === 'number' &&
+            Number.isInteger(pf.deliverySingaporeCents) &&
+            pf.deliverySingaporeCents >= 0 &&
+            pf.deliverySingaporeCents <= 100000
+          ) {
+            next.portraitFrameConfig.deliverySingaporeCents = pf.deliverySingaporeCents;
+          } else {
+            return res.status(400).json({
+              error:
+                'Portrait Frame Singapore delivery fee must be between S$ 0.00 and S$ 1,000.00, or left blank to disable Singapore shipping.'
+            });
+          }
+        }
+        if (typeof pf.deliveryDays === 'number') {
+          if (!Number.isInteger(pf.deliveryDays) || pf.deliveryDays < 1 || pf.deliveryDays > 90) {
+            return res.status(400).json({
+              error: 'Portrait Frame delivery timeframe must be a whole number between 1 and 90 days.'
+            });
+          }
+          next.portraitFrameConfig.deliveryDays = pf.deliveryDays;
+        }
+      }
+
       if (typeof incoming.whatsappSupportNumber === 'string') {
         const digits = incoming.whatsappSupportNumber.replace(/\D/g, '').slice(0, 20);
         if (digits && (digits.length < 8 || digits.length > 16)) {
@@ -4492,7 +4654,14 @@ export function createApiApp(): express.Express {
         diagnostics: evaluated.diagnostics
       });
     } catch (err) {
-      console.error('Failed to save store settings:', sanitizeSupabaseError(err));
+      const msg = sanitizeSupabaseError(err);
+      if (msg.includes('SCHEMA_MIGRATION_REQUIRED')) {
+        return res.status(503).json({
+          error: msg.replace(/^SCHEMA_MIGRATION_REQUIRED:\s*/i, ''),
+          code: 'SCHEMA_MIGRATION_REQUIRED'
+        });
+      }
+      console.error('Failed to save store settings:', msg);
       return res.status(500).json({ error: 'Failed to save store settings to Supabase.' });
     }
   });

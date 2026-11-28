@@ -41,6 +41,7 @@ export interface StoreSettingsRow {
     keychain: string;
     magnet: string;
     bundle: string;
+    portrait_frame?: string;
   };
   gallery_items: EditableStoreSettings['galleryItems'];
   delivery_rate_peninsular_sen: number;
@@ -50,6 +51,12 @@ export interface StoreSettingsRow {
     keychain: number;
     magnet: number;
   } | null;
+  portrait_frame_price_my_sen?: number | null;
+  portrait_frame_price_sg_cents?: number | null;
+  portrait_frame_delivery_peninsular_sen?: number | null;
+  portrait_frame_delivery_east_malaysia_sen?: number | null;
+  portrait_frame_delivery_singapore_cents?: number | null;
+  portrait_frame_delivery_days?: number | null;
   whatsapp_support_number: string;
   tng_override_enabled: boolean | null;
   tng_override_recipient_name: string;
@@ -78,6 +85,8 @@ export interface OrderRow {
   savings_sen: number | null;
   delivery_fee_sen: number;
   total_sen: number;
+  personalisation_text?: string | null;
+  delivery_days?: number | null;
   photo_storage_bucket: string;
   photo_storage_path: string;
   photo_original_filename: string | null;
@@ -327,6 +336,7 @@ export async function checkSupabaseHealth(forceRefresh = false): Promise<Supabas
   let receiptsBucketReady = false;
   let countryPricingSchemaReady = false;
   let metaConversionsSchemaReady = false;
+  let portraitFrameSchemaReady = false;
 
   try {
     const client = getSupabaseAdminClient();
@@ -354,29 +364,44 @@ export async function checkSupabaseHealth(forceRefresh = false): Promise<Supabas
       );
     }
 
-    // 1b. Non-breaking checks for 002_country_based_pricing.sql and 003_meta_conversions.sql
+    // 1b. Non-breaking checks for 002, 003, and 004 schema migrations
     if (databaseReady) {
-      const [ordersSchemaCheck, settingsSchemaCheck, metaTableCheck, metaOrdersColsCheck] =
-        await Promise.all([
-          client
-            .from('orders')
-            .select('delivery_country,currency,pricing_breakdown', { head: true })
-            .limit(1),
-          client
-            .from('store_settings')
-            .select('delivery_rate_singapore_cents,sg_product_prices_cents', { head: true })
-            .limit(1),
-          client
-            .from('meta_conversion_events')
-            .select('id', { head: true })
-            .limit(1),
-          client
-            .from('orders')
-            .select('meta_fbp,meta_fbc,meta_marketing_consent', { head: true })
-            .limit(1)
-        ]);
+      const [
+        ordersSchemaCheck,
+        settingsSchemaCheck,
+        metaTableCheck,
+        metaOrdersColsCheck,
+        portraitSettingsCheck,
+        portraitOrdersCheck
+      ] = await Promise.all([
+        client
+          .from('orders')
+          .select('delivery_country,currency,pricing_breakdown', { head: true })
+          .limit(1),
+        client
+          .from('store_settings')
+          .select('delivery_rate_singapore_cents,sg_product_prices_cents', { head: true })
+          .limit(1),
+        client.from('meta_conversion_events').select('id', { head: true }).limit(1),
+        client
+          .from('orders')
+          .select('meta_fbp,meta_fbc,meta_marketing_consent', { head: true })
+          .limit(1),
+        client
+          .from('store_settings')
+          .select(
+            'portrait_frame_price_my_sen,portrait_frame_price_sg_cents,portrait_frame_delivery_peninsular_sen,portrait_frame_delivery_east_malaysia_sen,portrait_frame_delivery_singapore_cents,portrait_frame_delivery_days',
+            { head: true }
+          )
+          .limit(1),
+        client
+          .from('orders')
+          .select('personalisation_text,delivery_days', { head: true })
+          .limit(1)
+      ]);
       countryPricingSchemaReady = !ordersSchemaCheck.error && !settingsSchemaCheck.error;
       metaConversionsSchemaReady = !metaTableCheck.error && !metaOrdersColsCheck.error;
+      portraitFrameSchemaReady = !portraitSettingsCheck.error && !portraitOrdersCheck.error;
     }
 
     // 2. Verify private storage buckets exist and are NOT public
@@ -425,6 +450,7 @@ export async function checkSupabaseHealth(forceRefresh = false): Promise<Supabas
     receiptsBucketReady,
     countryPricingSchemaReady,
     metaConversionsSchemaReady,
+    portraitFrameSchemaReady,
     photosBucket: cfg.photosBucket,
     receiptsBucket: cfg.receiptsBucket,
     issues,
@@ -635,31 +661,67 @@ export async function upsertStoreSettingsRow(
     duitnow_override_qr_image: settings.qrOverrides.duitnow.qrImage,
     updated_by_staff_id: updatedByStaffId ?? null
   };
-  const extendedPayload = {
+  const countryPayload = {
     ...basePayload,
     delivery_rate_singapore_cents: settings.deliveryRateSingaporeCents,
     sg_product_prices_cents: settings.sgProductPricesCents
   };
+  const fullPayload = {
+    ...countryPayload,
+    portrait_frame_price_my_sen: settings.portraitFrameConfig.priceMySen,
+    portrait_frame_price_sg_cents: settings.portraitFrameConfig.priceSgCents,
+    portrait_frame_delivery_peninsular_sen: settings.portraitFrameConfig.deliveryPeninsularSen,
+    portrait_frame_delivery_east_malaysia_sen: settings.portraitFrameConfig.deliveryEastMalaysiaSen,
+    portrait_frame_delivery_singapore_cents: settings.portraitFrameConfig.deliverySingaporeCents,
+    portrait_frame_delivery_days: settings.portraitFrameConfig.deliveryDays
+  };
+
   const { data, error } = await client
     .from('store_settings')
-    .upsert(extendedPayload, { onConflict: 'id' })
+    .upsert(fullPayload, { onConflict: 'id' })
     .select('*')
     .single();
   if (error && isMissingColumnError(error)) {
-    if (settings.deliveryRateSingaporeCents !== null) {
-      throw new Error(
-        'SCHEMA_MIGRATION_REQUIRED: Run supabase/migrations/002_country_based_pricing.sql in the Supabase SQL Editor before saving Singapore delivery rates.'
-      );
-    }
-    const fallback = await client
+    const hasCustomPortraitFrameSettings =
+      settings.portraitFrameConfig.priceMySen !== 19990 ||
+      settings.portraitFrameConfig.priceSgCents !== 7990 ||
+      settings.portraitFrameConfig.deliveryPeninsularSen !== 1200 ||
+      settings.portraitFrameConfig.deliveryEastMalaysiaSen !== 2000 ||
+      settings.portraitFrameConfig.deliverySingaporeCents !== 1200 ||
+      settings.portraitFrameConfig.deliveryDays !== 14;
+
+    const retryCountry = await client
       .from('store_settings')
-      .upsert(basePayload, { onConflict: 'id' })
+      .upsert(countryPayload, { onConflict: 'id' })
       .select('*')
       .single();
-    if (fallback.error || !fallback.data) {
-      throw new Error(`Failed to save store_settings: ${sanitizeSupabaseError(fallback.error)}`);
+    if (!retryCountry.error && retryCountry.data) {
+      if (hasCustomPortraitFrameSettings) {
+        throw new Error(
+          'SCHEMA_MIGRATION_REQUIRED: Run supabase/migrations/004_portrait_frame.sql in the Supabase SQL Editor before saving custom Portrait Frame pricing, delivery charges, or delivery timeframe.'
+        );
+      }
+      return retryCountry.data as StoreSettingsRow;
     }
-    return fallback.data as StoreSettingsRow;
+
+    if (retryCountry.error && isMissingColumnError(retryCountry.error)) {
+      if (settings.deliveryRateSingaporeCents !== null) {
+        throw new Error(
+          'SCHEMA_MIGRATION_REQUIRED: Run supabase/migrations/002_country_based_pricing.sql in the Supabase SQL Editor before saving Singapore delivery rates.'
+        );
+      }
+      const fallback = await client
+        .from('store_settings')
+        .upsert(basePayload, { onConflict: 'id' })
+        .select('*')
+        .single();
+      if (fallback.error || !fallback.data) {
+        throw new Error(`Failed to save store_settings: ${sanitizeSupabaseError(fallback.error)}`);
+      }
+      return fallback.data as StoreSettingsRow;
+    }
+
+    throw new Error(`Failed to save store_settings: ${sanitizeSupabaseError(retryCountry.error)}`);
   }
   if (error || !data) {
     throw new Error(`Failed to save store_settings: ${sanitizeSupabaseError(error)}`);
@@ -741,52 +803,75 @@ export async function insertOrderRow(
   const client = getSupabaseAdminClient();
   const { data, error } = await client.from('orders').insert(input).select('*').single();
   if (error && isMissingColumnError(error)) {
-    // Stage 1 fallback: strip optional 003_meta_conversions attribution columns first so
-    // databases with 002 applied (but not 003 yet) continue persisting MY & SG orders cleanly.
+    // Stage 1 fallback: strip optional 004_portrait_frame columns first so databases
+    // before migration 004 continue persisting orders cleanly (pricing_breakdown still captures deliveryDays).
     const {
-      meta_fbp: _mfbp,
-      meta_fbc: _mfbc,
-      meta_event_source_url: _murl,
-      meta_client_ip: _mip,
-      meta_client_user_agent: _mua,
-      meta_marketing_consent: _mc,
-      ...withoutMetaCols
+      personalisation_text: _pt,
+      delivery_days: _dd,
+      ...withoutPortraitCols
     } = input;
 
-    const retryWithoutMeta = await client
+    const retryWithoutPortrait = await client
       .from('orders')
-      .insert(withoutMetaCols)
+      .insert(withoutPortraitCols)
       .select('*')
       .single();
-    if (!retryWithoutMeta.error && retryWithoutMeta.data) {
-      return retryWithoutMeta.data as OrderRow;
+    if (!retryWithoutPortrait.error && retryWithoutPortrait.data) {
+      return retryWithoutPortrait.data as OrderRow;
     }
 
-    if (retryWithoutMeta.error && isMissingColumnError(retryWithoutMeta.error)) {
-      if (input.delivery_country && input.delivery_country !== 'MY') {
-        throw new Error(
-          'SCHEMA_MIGRATION_REQUIRED: Run supabase/migrations/002_country_based_pricing.sql in the Supabase SQL Editor to persist Singapore (SGD) orders.'
-        );
-      }
+    if (retryWithoutPortrait.error && isMissingColumnError(retryWithoutPortrait.error)) {
+      // Stage 2 fallback: strip optional 003_meta_conversions attribution columns.
       const {
-        delivery_country: _dc,
-        currency: _cur,
-        pricing_breakdown: _pb,
-        ...legacyInput
-      } = withoutMetaCols;
-      const fallback = await client.from('orders').insert(legacyInput).select('*').single();
-      if (fallback.error || !fallback.data) {
-        throw new SupabaseQueryError(
-          `Failed to insert order: ${sanitizeSupabaseError(fallback.error)}`,
-          (fallback.error as { code?: string } | null)?.code
-        );
+        meta_fbp: _mfbp,
+        meta_fbc: _mfbc,
+        meta_event_source_url: _murl,
+        meta_client_ip: _mip,
+        meta_client_user_agent: _mua,
+        meta_marketing_consent: _mc,
+        ...withoutMetaCols
+      } = withoutPortraitCols;
+
+      const retryWithoutMeta = await client
+        .from('orders')
+        .insert(withoutMetaCols)
+        .select('*')
+        .single();
+      if (!retryWithoutMeta.error && retryWithoutMeta.data) {
+        return retryWithoutMeta.data as OrderRow;
       }
-      return fallback.data as OrderRow;
+
+      if (retryWithoutMeta.error && isMissingColumnError(retryWithoutMeta.error)) {
+        if (input.delivery_country && input.delivery_country !== 'MY') {
+          throw new Error(
+            'SCHEMA_MIGRATION_REQUIRED: Run supabase/migrations/002_country_based_pricing.sql in the Supabase SQL Editor to persist Singapore (SGD) orders.'
+          );
+        }
+        const {
+          delivery_country: _dc,
+          currency: _cur,
+          pricing_breakdown: _pb,
+          ...legacyInput
+        } = withoutMetaCols;
+        const fallback = await client.from('orders').insert(legacyInput).select('*').single();
+        if (fallback.error || !fallback.data) {
+          throw new SupabaseQueryError(
+            `Failed to insert order: ${sanitizeSupabaseError(fallback.error)}`,
+            (fallback.error as { code?: string } | null)?.code
+          );
+        }
+        return fallback.data as OrderRow;
+      }
+
+      throw new SupabaseQueryError(
+        `Failed to insert order: ${sanitizeSupabaseError(retryWithoutMeta.error)}`,
+        (retryWithoutMeta.error as { code?: string } | null)?.code
+      );
     }
 
     throw new SupabaseQueryError(
-      `Failed to insert order: ${sanitizeSupabaseError(retryWithoutMeta.error)}`,
-      (retryWithoutMeta.error as { code?: string } | null)?.code
+      `Failed to insert order: ${sanitizeSupabaseError(retryWithoutPortrait.error)}`,
+      (retryWithoutPortrait.error as { code?: string } | null)?.code
     );
   }
   if (error || !data) {
@@ -846,54 +931,78 @@ export async function updateOrderIfUnpaid(
     .maybeSingle();
   if (error && isMissingColumnError(error)) {
     const {
-      meta_fbp: _mfbp,
-      meta_fbc: _mfbc,
-      meta_event_source_url: _murl,
-      meta_client_ip: _mip,
-      meta_client_user_agent: _mua,
-      meta_marketing_consent: _mc,
-      ...withoutMetaPatch
+      personalisation_text: _pt,
+      delivery_days: _dd,
+      ...withoutPortraitPatch
     } = patch;
 
-    const retryWithoutMeta = await client
+    const retryWithoutPortrait = await client
       .from('orders')
-      .update(withoutMetaPatch)
+      .update(withoutPortraitPatch)
       .eq('reference', reference)
       .neq('payment_status', 'Paid')
       .select('*')
       .maybeSingle();
 
-    if (!retryWithoutMeta.error) {
-      return (retryWithoutMeta.data as OrderRow | null) ?? null;
+    if (!retryWithoutPortrait.error) {
+      return (retryWithoutPortrait.data as OrderRow | null) ?? null;
     }
 
-    if (isMissingColumnError(retryWithoutMeta.error)) {
-      if (patch.delivery_country && patch.delivery_country !== 'MY') {
-        throw new Error(
-          'SCHEMA_MIGRATION_REQUIRED: Run supabase/migrations/002_country_based_pricing.sql in the Supabase SQL Editor to update delivery country to Singapore (SGD).'
-        );
-      }
+    if (isMissingColumnError(retryWithoutPortrait.error)) {
       const {
-        delivery_country: _dc,
-        currency: _cur,
-        pricing_breakdown: _pb,
-        ...legacyPatch
-      } = withoutMetaPatch;
-      const fallback = await client
+        meta_fbp: _mfbp,
+        meta_fbc: _mfbc,
+        meta_event_source_url: _murl,
+        meta_client_ip: _mip,
+        meta_client_user_agent: _mua,
+        meta_marketing_consent: _mc,
+        ...withoutMetaPatch
+      } = withoutPortraitPatch;
+
+      const retryWithoutMeta = await client
         .from('orders')
-        .update(legacyPatch)
+        .update(withoutMetaPatch)
         .eq('reference', reference)
         .neq('payment_status', 'Paid')
         .select('*')
         .maybeSingle();
-      if (fallback.error) {
-        throw new Error(`Failed to update order ${reference}: ${sanitizeSupabaseError(fallback.error)}`);
+
+      if (!retryWithoutMeta.error) {
+        return (retryWithoutMeta.data as OrderRow | null) ?? null;
       }
-      return (fallback.data as OrderRow | null) ?? null;
+
+      if (isMissingColumnError(retryWithoutMeta.error)) {
+        if (patch.delivery_country && patch.delivery_country !== 'MY') {
+          throw new Error(
+            'SCHEMA_MIGRATION_REQUIRED: Run supabase/migrations/002_country_based_pricing.sql in the Supabase SQL Editor to update delivery country to Singapore (SGD).'
+          );
+        }
+        const {
+          delivery_country: _dc,
+          currency: _cur,
+          pricing_breakdown: _pb,
+          ...legacyPatch
+        } = withoutMetaPatch;
+        const fallback = await client
+          .from('orders')
+          .update(legacyPatch)
+          .eq('reference', reference)
+          .neq('payment_status', 'Paid')
+          .select('*')
+          .maybeSingle();
+        if (fallback.error) {
+          throw new Error(`Failed to update order ${reference}: ${sanitizeSupabaseError(fallback.error)}`);
+        }
+        return (fallback.data as OrderRow | null) ?? null;
+      }
+
+      throw new Error(
+        `Failed to update order ${reference}: ${sanitizeSupabaseError(retryWithoutMeta.error)}`
+      );
     }
 
     throw new Error(
-      `Failed to update order ${reference}: ${sanitizeSupabaseError(retryWithoutMeta.error)}`
+      `Failed to update order ${reference}: ${sanitizeSupabaseError(retryWithoutPortrait.error)}`
     );
   }
   if (error) {

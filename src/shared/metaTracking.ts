@@ -5,7 +5,8 @@ export type MetaProductContentId =
   | 'fridge_magnet'
   | 'bundle_2_keychains'
   | 'bundle_keychain_magnet'
-  | 'bundle_2_magnets';
+  | 'bundle_2_magnets'
+  | 'portrait_frame';
 
 export type MetaStandardEventName =
   | 'PageView'
@@ -34,7 +35,7 @@ export interface MetaEcommerceParams {
 
 /**
  * Maps internal productId / bundleId values to canonical Meta Pixel & CAPI product IDs:
- *   keychain | fridge_magnet | bundle_2_keychains | bundle_keychain_magnet | bundle_2_magnets
+ *   keychain | fridge_magnet | bundle_2_keychains | bundle_keychain_magnet | bundle_2_magnets | portrait_frame
  */
 export function resolveMetaContentId(
   productId: string,
@@ -47,6 +48,13 @@ export function resolveMetaContentId(
     if (normalizedBundle === 'bundle_2_keychains') return 'bundle_2_keychains';
     if (normalizedBundle === 'bundle_2_magnets') return 'bundle_2_magnets';
     return 'bundle_keychain_magnet';
+  }
+  if (
+    normalizedProduct === 'portrait_frame' ||
+    normalizedProduct === 'portraitframe' ||
+    normalizedProduct === 'custom_portrait_frame'
+  ) {
+    return 'portrait_frame';
   }
   if (normalizedProduct === 'magnet' || normalizedProduct === 'fridge_magnet') {
     return 'fridge_magnet';

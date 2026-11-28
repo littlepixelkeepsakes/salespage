@@ -1,6 +1,15 @@
 export const DELIVERY_PROMISE_TEXT =
   'Your order will be delivered within 14 days after your payment is confirmed and we receive a usable photo.';
 
+export const PORTRAIT_FRAME_DEFAULT_DELIVERY_DAYS = 14;
+
+export function buildDeliveryPromiseText(days: number = 14, isPortraitFrame = false): string {
+  const safeDays = Number.isInteger(days) && days >= 1 && days <= 90 ? days : 14;
+  return isPortraitFrame
+    ? `Your custom portrait frame will be delivered within ${safeDays} days after your payment is confirmed and we receive a usable photo.`
+    : `Your order will be delivered within ${safeDays} days after your payment is confirmed and we receive a usable photo.`;
+}
+
 export const PAID_CONFIRMATION_HEADING = 'Thank you! Your order is confirmed.';
 
 export type PaymentStatus =
@@ -27,6 +36,16 @@ export interface OrderPricingBreakdown {
   deliveryZone: string;
   deliveryFeeMinor: number;
   totalMinor: number;
+  deliveryDays?: number;
+}
+
+export interface PortraitFrameConfig {
+  priceMySen: number;
+  priceSgCents: number;
+  deliveryPeninsularSen: number;
+  deliveryEastMalaysiaSen: number;
+  deliverySingaporeCents: number | null;
+  deliveryDays: number;
 }
 
 export interface MarketPriceTable {
@@ -35,6 +54,7 @@ export interface MarketPriceTable {
   products: {
     keychain: number;
     magnet: number;
+    portrait_frame: number;
   };
   bundles: {
     bundle_2_keychains: { priceMinor: number; regularMinor: number; savingsMinor: number };
@@ -75,6 +95,8 @@ export interface OrderPublic {
   savingsSen?: number;
   deliveryFeeSen: number;
   totalSen: number;
+  personalisationText?: string;
+  deliveryDays?: number;
   photoUrl: string;
   photoFileName?: string;
   customer: OrderCustomer;
@@ -210,6 +232,7 @@ export interface EditableStoreSettings {
     keychain: string;
     magnet: string;
     bundle: string;
+    portrait_frame: string;
   };
   galleryItems: StoreGalleryImage[];
   deliveryRatesSen: {
@@ -221,6 +244,7 @@ export interface EditableStoreSettings {
     keychain: number;
     magnet: number;
   };
+  portraitFrameConfig: PortraitFrameConfig;
   whatsappSupportNumber: string;
   qrOverrides: {
     tng: {
@@ -243,6 +267,7 @@ export interface PublicStorefrontConfig {
     keychain: string;
     magnet: string;
     bundle: string;
+    portrait_frame: string;
   };
   galleryItems: StoreGalleryImage[];
   deliveryRatesSen: {
@@ -252,6 +277,10 @@ export interface PublicStorefrontConfig {
   deliveryRateSingaporeCents: number | null;
   singaporeShippingConfigured: boolean;
   marketPricing: MarketPricingConfig;
+  portraitFrameConfig: PortraitFrameConfig & {
+    singaporeShippingConfigured: boolean;
+    deliveryPromiseText: string;
+  };
   whatsappSupportNumber: string;
   whatsappUrl: string | null;
   deliveryPromiseText: string;
@@ -265,6 +294,7 @@ export interface SupabaseHealthDiagnostic {
   receiptsBucketReady: boolean;
   countryPricingSchemaReady?: boolean;
   metaConversionsSchemaReady?: boolean;
+  portraitFrameSchemaReady?: boolean;
   photosBucket: string | null;
   receiptsBucket: string | null;
   issues: string[];

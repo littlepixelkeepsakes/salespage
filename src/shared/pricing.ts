@@ -4,6 +4,7 @@ import type {
   OrderCustomer,
   OrderPricingBreakdown,
   PaymentMethodKey,
+  PortraitFrameConfig,
   SupportedCurrency
 } from '../types/order';
 
@@ -68,19 +69,95 @@ export const EAST_MALAYSIA_STATES = new Set(['sabah', 'sarawak', 'labuan']);
 
 export const BUNDLE_DISCOUNT_PERCENT = 20;
 
+export const PORTRAIT_FRAME_PRODUCT_ID = 'portrait_frame' as const;
+export const PORTRAIT_FRAME_DIMENSIONS = '20 cm x 17 cm';
+export const PORTRAIT_FRAME_MAX_PERSONALISATION_LENGTH = 60;
+
+export const DEFAULT_PORTRAIT_FRAME_CONFIG: PortraitFrameConfig = {
+  priceMySen: 19990, // RM 199.90
+  priceSgCents: 7990, // S$ 79.90
+  deliveryPeninsularSen: 1200, // RM 12.00
+  deliveryEastMalaysiaSen: 2000, // RM 20.00
+  deliverySingaporeCents: 1200, // S$ 12.00
+  deliveryDays: 14
+};
+
 export const DEFAULT_MARKET_PRODUCT_BASE_PRICES: Record<
   DeliveryCountry,
-  { keychain: number; magnet: number }
+  { keychain: number; magnet: number; portrait_frame: number }
 > = {
   MY: {
     keychain: 2990, // RM 29.90
-    magnet: 3190 // RM 31.90
+    magnet: 3190, // RM 31.90
+    portrait_frame: DEFAULT_PORTRAIT_FRAME_CONFIG.priceMySen // RM 199.90
   },
   SG: {
     keychain: 1290, // S$ 12.90
-    magnet: 1390 // S$ 13.90
+    magnet: 1390, // S$ 13.90
+    portrait_frame: DEFAULT_PORTRAIT_FRAME_CONFIG.priceSgCents // S$ 79.90
   }
 };
+
+export function resolvePortraitFrameConfig(
+  input?: Partial<PortraitFrameConfig> | null
+): PortraitFrameConfig {
+  const priceMySen =
+    typeof input?.priceMySen === 'number' && Number.isInteger(input.priceMySen) && input.priceMySen >= 200
+      ? input.priceMySen
+      : DEFAULT_PORTRAIT_FRAME_CONFIG.priceMySen;
+  const priceSgCents =
+    typeof input?.priceSgCents === 'number' && Number.isInteger(input.priceSgCents) && input.priceSgCents >= 50
+      ? input.priceSgCents
+      : DEFAULT_PORTRAIT_FRAME_CONFIG.priceSgCents;
+  const deliveryPeninsularSen =
+    typeof input?.deliveryPeninsularSen === 'number' &&
+    Number.isInteger(input.deliveryPeninsularSen) &&
+    input.deliveryPeninsularSen >= 0
+      ? input.deliveryPeninsularSen
+      : DEFAULT_PORTRAIT_FRAME_CONFIG.deliveryPeninsularSen;
+  const deliveryEastMalaysiaSen =
+    typeof input?.deliveryEastMalaysiaSen === 'number' &&
+    Number.isInteger(input.deliveryEastMalaysiaSen) &&
+    input.deliveryEastMalaysiaSen >= 0
+      ? input.deliveryEastMalaysiaSen
+      : DEFAULT_PORTRAIT_FRAME_CONFIG.deliveryEastMalaysiaSen;
+  const deliverySingaporeCents =
+    input && 'deliverySingaporeCents' in input
+      ? input.deliverySingaporeCents === null
+        ? null
+        : typeof input.deliverySingaporeCents === 'number' &&
+            Number.isInteger(input.deliverySingaporeCents) &&
+            input.deliverySingaporeCents >= 0
+          ? input.deliverySingaporeCents
+          : DEFAULT_PORTRAIT_FRAME_CONFIG.deliverySingaporeCents
+      : DEFAULT_PORTRAIT_FRAME_CONFIG.deliverySingaporeCents;
+  const deliveryDays =
+    typeof input?.deliveryDays === 'number' &&
+    Number.isInteger(input.deliveryDays) &&
+    input.deliveryDays >= 1 &&
+    input.deliveryDays <= 90
+      ? input.deliveryDays
+      : DEFAULT_PORTRAIT_FRAME_CONFIG.deliveryDays;
+
+  return {
+    priceMySen,
+    priceSgCents,
+    deliveryPeninsularSen,
+    deliveryEastMalaysiaSen,
+    deliverySingaporeCents,
+    deliveryDays
+  };
+}
+
+export function sanitizePersonalisationText(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const cleaned = raw
+    .replace(/[\u0000-\u001F\u007F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, PORTRAIT_FRAME_MAX_PERSONALISATION_LENGTH);
+  return cleaned.length > 0 ? cleaned : null;
+}
 
 export const STRIPE_MIN_AMOUNT_MINOR: Record<SupportedCurrency, number> = {
   MYR: 200, // RM 2.00
@@ -88,8 +165,14 @@ export const STRIPE_MIN_AMOUNT_MINOR: Record<SupportedCurrency, number> = {
 };
 
 export interface MarketCatalogItem {
-  key: 'keychain' | 'magnet' | 'bundle_2_keychains' | 'bundle_kc_magnet' | 'bundle_2_magnets';
-  productId: 'keychain' | 'magnet' | 'bundle';
+  key:
+    | 'keychain'
+    | 'magnet'
+    | 'bundle_2_keychains'
+    | 'bundle_kc_magnet'
+    | 'bundle_2_magnets'
+    | 'portrait_frame';
+  productId: 'keychain' | 'magnet' | 'bundle' | 'portrait_frame';
   bundleId?: 'bundle_2_keychains' | 'bundle_kc_magnet' | 'bundle_2_magnets';
   name: string;
   shortName: string;
@@ -101,17 +184,24 @@ export interface MarketCatalogItem {
 
 export function buildMarketCatalog(
   country: DeliveryCountry,
-  basePrices?: { keychain: number; magnet: number }
+  basePrices?: { keychain?: number; magnet?: number; portrait_frame?: number }
 ): Record<MarketCatalogItem['key'], MarketCatalogItem> {
   const defaults = DEFAULT_MARKET_PRODUCT_BASE_PRICES[country];
   const keychain =
-    basePrices && Number.isInteger(basePrices.keychain) && basePrices.keychain > 0
+    basePrices && typeof basePrices.keychain === 'number' && Number.isInteger(basePrices.keychain) && basePrices.keychain > 0
       ? basePrices.keychain
       : defaults.keychain;
   const magnet =
-    basePrices && Number.isInteger(basePrices.magnet) && basePrices.magnet > 0
+    basePrices && typeof basePrices.magnet === 'number' && Number.isInteger(basePrices.magnet) && basePrices.magnet > 0
       ? basePrices.magnet
       : defaults.magnet;
+  const portraitFrame =
+    basePrices &&
+    typeof basePrices.portrait_frame === 'number' &&
+    Number.isInteger(basePrices.portrait_frame) &&
+    basePrices.portrait_frame > 0
+      ? basePrices.portrait_frame
+      : defaults.portrait_frame;
 
   const reg2Kc = keychain * 2;
   const disc2Kc = Math.round((reg2Kc * (100 - BUNDLE_DISCOUNT_PERCENT)) / 100);
@@ -171,16 +261,34 @@ export function buildMarketCatalog(
       priceMinor: disc2Mag,
       regularMinor: reg2Mag,
       savingsMinor: reg2Mag - disc2Mag
+    },
+    portrait_frame: {
+      key: 'portrait_frame',
+      productId: 'portrait_frame',
+      name: 'Custom Perler Bead Portrait Frame (20 cm x 17 cm)',
+      shortName: 'Custom Portrait Frame',
+      itemQuantity: 1,
+      priceMinor: portraitFrame
     }
   };
 }
 
-export function buildMarketPricingConfig(sgBasePrices?: {
-  keychain: number;
-  magnet: number;
-}): MarketPricingConfig {
-  const myCatalog = buildMarketCatalog('MY', DEFAULT_MARKET_PRODUCT_BASE_PRICES.MY);
-  const sgCatalog = buildMarketCatalog('SG', sgBasePrices || DEFAULT_MARKET_PRODUCT_BASE_PRICES.SG);
+export function buildMarketPricingConfig(
+  sgBasePrices?: {
+    keychain: number;
+    magnet: number;
+  },
+  portraitFrameConfig?: Partial<PortraitFrameConfig>
+): MarketPricingConfig {
+  const resolvedFrame = resolvePortraitFrameConfig(portraitFrameConfig);
+  const myCatalog = buildMarketCatalog('MY', {
+    ...DEFAULT_MARKET_PRODUCT_BASE_PRICES.MY,
+    portrait_frame: resolvedFrame.priceMySen
+  });
+  const sgCatalog = buildMarketCatalog('SG', {
+    ...(sgBasePrices || DEFAULT_MARKET_PRODUCT_BASE_PRICES.SG),
+    portrait_frame: resolvedFrame.priceSgCents
+  });
 
   const toMarketEntry = (
     country: DeliveryCountry,
@@ -190,7 +298,8 @@ export function buildMarketPricingConfig(sgBasePrices?: {
     currency: COUNTRY_CURRENCY_MAP[country],
     products: {
       keychain: catalog.keychain.priceMinor,
-      magnet: catalog.magnet.priceMinor
+      magnet: catalog.magnet.priceMinor,
+      portrait_frame: catalog.portrait_frame.priceMinor
     },
     bundles: {
       bundle_2_keychains: {
@@ -523,7 +632,7 @@ export interface AuthoritativePricingResult {
   deliveryCountry: DeliveryCountry;
   currency: SupportedCurrency;
   productKey: MarketCatalogItem['key'];
-  productId: 'keychain' | 'magnet' | 'bundle';
+  productId: 'keychain' | 'magnet' | 'bundle' | 'portrait_frame';
   bundleId: string | null;
   productName: string;
   itemQuantity: number;
@@ -533,6 +642,7 @@ export interface AuthoritativePricingResult {
   deliveryZone: string;
   deliveryFeeMinor: number;
   totalMinor: number;
+  deliveryDays: number;
   allowedPaymentMethods: PaymentMethodKey[];
   breakdown: OrderPricingBreakdown;
 }
@@ -551,10 +661,20 @@ export function calculateAuthoritativeOrderPricing(params: {
   state?: string;
   deliveryRates: DeliveryRateSettingsInput;
   sgProductPricesCents?: { keychain: number; magnet: number };
+  portraitFrameConfig?: Partial<PortraitFrameConfig> | null;
 }): AuthoritativePricingResult | AuthoritativePricingError {
+  const resolvedFrame = resolvePortraitFrameConfig(params.portraitFrameConfig);
   const catalog = buildMarketCatalog(
     params.country,
-    params.country === 'SG' ? params.sgProductPricesCents : DEFAULT_MARKET_PRODUCT_BASE_PRICES.MY
+    params.country === 'SG'
+      ? {
+          ...(params.sgProductPricesCents || DEFAULT_MARKET_PRODUCT_BASE_PRICES.SG),
+          portrait_frame: resolvedFrame.priceSgCents
+        }
+      : {
+          ...DEFAULT_MARKET_PRODUCT_BASE_PRICES.MY,
+          portrait_frame: resolvedFrame.priceMySen
+        }
   );
 
   const resolvedKey = params.productId === 'bundle' ? params.bundleId : params.productId;
@@ -563,7 +683,7 @@ export function calculateAuthoritativeOrderPricing(params: {
       ? catalog[resolvedKey as MarketCatalogItem['key']]
       : undefined;
 
-  if (!item) {
+  if (!item || (params.productId === 'bundle' && item.productId !== 'bundle')) {
     return {
       ok: false,
       httpStatus: 400,
@@ -572,10 +692,19 @@ export function calculateAuthoritativeOrderPricing(params: {
     };
   }
 
+  const isPortraitFrame = item.productId === PORTRAIT_FRAME_PRODUCT_ID;
+  const effectiveDeliveryRates: DeliveryRateSettingsInput = isPortraitFrame
+    ? {
+        peninsularSen: resolvedFrame.deliveryPeninsularSen,
+        eastMalaysiaSen: resolvedFrame.deliveryEastMalaysiaSen,
+        singaporeCents: resolvedFrame.deliverySingaporeCents
+      }
+    : params.deliveryRates;
+
   const shipping = resolveDeliveryZoneAndFee({
     country: params.country,
     state: params.state,
-    deliveryRates: params.deliveryRates
+    deliveryRates: effectiveDeliveryRates
   });
   if (!shipping.ok) {
     return shipping;
@@ -587,6 +716,7 @@ export function calculateAuthoritativeOrderPricing(params: {
   const savingsMinor = item.savingsMinor ?? null;
   const deliveryFeeMinor = shipping.deliveryFeeMinor;
   const totalMinor = subtotalMinor + deliveryFeeMinor;
+  const deliveryDays = isPortraitFrame ? resolvedFrame.deliveryDays : 14;
 
   const breakdown: OrderPricingBreakdown = {
     deliveryCountry: params.country,
@@ -600,7 +730,8 @@ export function calculateAuthoritativeOrderPricing(params: {
     bundleSavingsMinor: savingsMinor,
     deliveryZone: shipping.zone,
     deliveryFeeMinor,
-    totalMinor
+    totalMinor,
+    deliveryDays
   };
 
   return {
@@ -618,6 +749,7 @@ export function calculateAuthoritativeOrderPricing(params: {
     deliveryZone: shipping.zone,
     deliveryFeeMinor,
     totalMinor,
+    deliveryDays,
     allowedPaymentMethods: getAllowedPaymentMethodsForCountry(params.country),
     breakdown
   };
@@ -640,6 +772,7 @@ export function verifySavedOrderPricingIntegrity(params: {
   };
   deliveryRates: DeliveryRateSettingsInput;
   sgProductPricesCents?: { keychain: number; magnet: number };
+  portraitFrameConfig?: Partial<PortraitFrameConfig> | null;
 }):
   | {
       valid: true;
@@ -681,7 +814,8 @@ export function verifySavedOrderPricingIntegrity(params: {
     bundleId: order.bundle_id,
     state: order.customer_state,
     deliveryRates: params.deliveryRates,
-    sgProductPricesCents: params.sgProductPricesCents
+    sgProductPricesCents: params.sgProductPricesCents,
+    portraitFrameConfig: params.portraitFrameConfig
   });
 
   if (!expected.ok) {

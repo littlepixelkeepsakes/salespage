@@ -19,8 +19,8 @@ import {
   Upload
 } from 'lucide-react';
 import {
-  DELIVERY_PROMISE_TEXT,
   PAID_CONFIRMATION_HEADING,
+  buildDeliveryPromiseText,
   type DeliveryCountry,
   type MerchantPaymentConfig,
   type OrderCustomer,
@@ -33,6 +33,8 @@ import {
   COUNTRY_UPDATE_NOTICE,
   CURRENCY_NAMES,
   MALAYSIAN_STATES,
+  PORTRAIT_FRAME_DIMENSIONS,
+  PORTRAIT_FRAME_PRODUCT_ID,
   formatCountryLabel,
   formatCurrencyAmount,
   formatCurrencyWithCode,
@@ -197,6 +199,13 @@ export default function PaymentPage({
 }: PaymentPageProps) {
   const orderCountry: DeliveryCountry = order.deliveryCountry || order.customer?.country || 'MY';
   const orderCurrency: SupportedCurrency = order.currency || getCurrencyForCountry(orderCountry);
+  const isPortraitFrameOrder = order.productId === PORTRAIT_FRAME_PRODUCT_ID;
+  const orderDeliveryDays =
+    order.deliveryDays ?? order.pricingBreakdown?.deliveryDays ?? 14;
+  const orderDeliveryPromiseText = buildDeliveryPromiseText(
+    orderDeliveryDays,
+    isPortraitFrameOrder
+  );
   const allowedByCountry: PaymentMethodKey[] =
     order.allowedPaymentMethods && order.allowedPaymentMethods.length > 0
       ? order.allowedPaymentMethods
@@ -1036,8 +1045,13 @@ export default function PaymentPage({
               <p className="text-xs text-[#14233C]/65">
                 Quantity: <span className="tabular-nums font-medium">{order.itemQuantity}</span>
                 <span aria-hidden="true"> · </span>
-                <span>Photo saved</span>
+                <span>{isPortraitFrameOrder ? 'Wooden frame included' : 'Photo saved'}</span>
               </p>
+              {order.personalisationText && (
+                <p className="text-xs text-[#14233C]/80 bg-[#FAF6EE] px-2.5 py-1 rounded-lg border border-[#14233C]/10">
+                  <span className="font-semibold">Personalisation:</span> &ldquo;{order.personalisationText}&rdquo;
+                </p>
+              )}
               <p className="text-xs font-mono text-[#14233C]/60 truncate">
                 Ref: {order.reference}
               </p>
@@ -1309,7 +1323,7 @@ export default function PaymentPage({
             )}
 
             <p className="pt-2 text-[11px] font-medium text-[#14233C]/70">
-              {DELIVERY_PROMISE_TEXT}
+              {orderDeliveryPromiseText}
             </p>
           </div>
 
@@ -1343,7 +1357,7 @@ export default function PaymentPage({
                     {PAID_CONFIRMATION_HEADING}
                   </h2>
                   <p className="text-sm text-[#14233C]/80 leading-relaxed">
-                    {DELIVERY_PROMISE_TEXT}
+                    {orderDeliveryPromiseText}
                   </p>
                 </div>
               </div>
@@ -1359,6 +1373,23 @@ export default function PaymentPage({
                     {order.productName} (Qty {order.itemQuantity})
                   </dd>
                 </div>
+                {isPortraitFrameOrder && (
+                  <div>
+                    <dt className="text-[#14233C]/60">Frame Specification</dt>
+                    <dd className="font-bold text-[#14233C] mt-0.5">
+                      Wooden frame included ({PORTRAIT_FRAME_DIMENSIONS})
+                    </dd>
+                  </div>
+                )}
+                {order.personalisationText && (
+                  <div>
+                    <dt className="text-[#14233C]/60">Frame Personalisation</dt>
+                    <dd className="font-bold text-[#14233C] mt-0.5">
+                      &ldquo;{order.personalisationText}&rdquo;{' '}
+                      <span className="font-normal text-[#14233C]/60">(subject to feasibility)</span>
+                    </dd>
+                  </div>
+                )}
                 <div>
                   <dt className="text-[#14233C]/60">Delivery Country</dt>
                   <dd className="font-bold text-[#14233C] mt-0.5">

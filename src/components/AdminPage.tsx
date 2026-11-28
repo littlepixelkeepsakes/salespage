@@ -31,9 +31,13 @@ import type {
 } from '../types/order';
 import {
   DEFAULT_MARKET_PRODUCT_BASE_PRICES,
+  DEFAULT_PORTRAIT_FRAME_CONFIG,
+  PORTRAIT_FRAME_DIMENSIONS,
+  PORTRAIT_FRAME_PRODUCT_ID,
   formatCountryLabel,
   formatCurrencyAmount,
-  formatCurrencyWithCode
+  formatCurrencyWithCode,
+  resolvePortraitFrameConfig
 } from '../shared/pricing';
 
 interface AdminPageProps {
@@ -98,6 +102,26 @@ export default function AdminPage({
   const [sgMagnetSgd, setSgMagnetSgd] = useState(
     (DEFAULT_MARKET_PRODUCT_BASE_PRICES.SG.magnet / 100).toFixed(2)
   );
+  const [pfPriceMyRm, setPfPriceMyRm] = useState(
+    (DEFAULT_PORTRAIT_FRAME_CONFIG.priceMySen / 100).toFixed(2)
+  );
+  const [pfPriceSgSgd, setPfPriceSgSgd] = useState(
+    (DEFAULT_PORTRAIT_FRAME_CONFIG.priceSgCents / 100).toFixed(2)
+  );
+  const [pfPeninsularRm, setPfPeninsularRm] = useState(
+    (DEFAULT_PORTRAIT_FRAME_CONFIG.deliveryPeninsularSen / 100).toFixed(2)
+  );
+  const [pfEastRm, setPfEastRm] = useState(
+    (DEFAULT_PORTRAIT_FRAME_CONFIG.deliveryEastMalaysiaSen / 100).toFixed(2)
+  );
+  const [pfSingaporeSgd, setPfSingaporeSgd] = useState(
+    typeof DEFAULT_PORTRAIT_FRAME_CONFIG.deliverySingaporeCents === 'number'
+      ? (DEFAULT_PORTRAIT_FRAME_CONFIG.deliverySingaporeCents / 100).toFixed(2)
+      : ''
+  );
+  const [pfDeliveryDays, setPfDeliveryDays] = useState(
+    String(DEFAULT_PORTRAIT_FRAME_CONFIG.deliveryDays)
+  );
   const [savingSettings, setSavingSettings] = useState(false);
   const [uploadingField, setUploadingField] = useState<string | null>(null);
 
@@ -150,7 +174,19 @@ export default function AdminPage({
   }, [filePreview]);
 
   const hydrateSettings = (loaded: EditableStoreSettings) => {
-    setSettings(loaded);
+    const resolvedFrame = resolvePortraitFrameConfig(loaded.portraitFrameConfig);
+    setSettings({
+      ...loaded,
+      productImages: {
+        keychain: loaded.productImages.keychain,
+        magnet: loaded.productImages.magnet,
+        bundle: loaded.productImages.bundle,
+        portrait_frame:
+          loaded.productImages.portrait_frame ||
+          '/assets/aistudio/Our_Family_Perler_Bead_Portrait_ee465ba0.png'
+      },
+      portraitFrameConfig: resolvedFrame
+    });
     setPeninsularRm((loaded.deliveryRatesSen.peninsular / 100).toFixed(2));
     setEastRm((loaded.deliveryRatesSen.eastMalaysia / 100).toFixed(2));
     setSingaporeSgd(
@@ -161,6 +197,16 @@ export default function AdminPage({
     const sgPrices = loaded.sgProductPricesCents || DEFAULT_MARKET_PRODUCT_BASE_PRICES.SG;
     setSgKeychainSgd((sgPrices.keychain / 100).toFixed(2));
     setSgMagnetSgd((sgPrices.magnet / 100).toFixed(2));
+    setPfPriceMyRm((resolvedFrame.priceMySen / 100).toFixed(2));
+    setPfPriceSgSgd((resolvedFrame.priceSgCents / 100).toFixed(2));
+    setPfPeninsularRm((resolvedFrame.deliveryPeninsularSen / 100).toFixed(2));
+    setPfEastRm((resolvedFrame.deliveryEastMalaysiaSen / 100).toFixed(2));
+    setPfSingaporeSgd(
+      typeof resolvedFrame.deliverySingaporeCents === 'number'
+        ? (resolvedFrame.deliverySingaporeCents / 100).toFixed(2)
+        : ''
+    );
+    setPfDeliveryDays(String(resolvedFrame.deliveryDays));
   };
 
   const fetchAdminData = useCallback(async (token: string) => {
@@ -695,6 +741,49 @@ export default function AdminPage({
       return;
     }
 
+    const pfMyVal = Math.round(Number.parseFloat(pfPriceMyRm) * 100);
+    const pfSgVal = Math.round(Number.parseFloat(pfPriceSgSgd) * 100);
+    const pfPenVal = Math.round(Number.parseFloat(pfPeninsularRm) * 100);
+    const pfEastVal = Math.round(Number.parseFloat(pfEastRm) * 100);
+    const pfDaysVal = Number.parseInt(pfDeliveryDays, 10);
+
+    if (!Number.isFinite(pfMyVal) || pfMyVal < 200 || pfMyVal > 500000) {
+      setDashboardError('Portrait Frame Malaysia price must be between RM 2.00 and RM 5,000.00.');
+      return;
+    }
+    if (!Number.isFinite(pfSgVal) || pfSgVal < 50 || pfSgVal > 500000) {
+      setDashboardError('Portrait Frame Singapore price must be between S$ 0.50 and S$ 5,000.00.');
+      return;
+    }
+    if (
+      !Number.isFinite(pfPenVal) ||
+      pfPenVal < 0 ||
+      pfPenVal > 100000 ||
+      !Number.isFinite(pfEastVal) ||
+      pfEastVal < 0 ||
+      pfEastVal > 100000
+    ) {
+      setDashboardError('Enter valid non-negative MYR amounts for Portrait Frame Malaysia delivery.');
+      return;
+    }
+
+    let pfSgDeliveryVal: number | null = null;
+    if (pfSingaporeSgd.trim() !== '') {
+      const parsedPfSg = Math.round(Number.parseFloat(pfSingaporeSgd) * 100);
+      if (!Number.isFinite(parsedPfSg) || parsedPfSg < 0 || parsedPfSg > 100000) {
+        setDashboardError(
+          'Enter a valid non-negative SGD amount for Portrait Frame Singapore delivery, or leave blank to disable.'
+        );
+        return;
+      }
+      pfSgDeliveryVal = parsedPfSg;
+    }
+
+    if (!Number.isInteger(pfDaysVal) || pfDaysVal < 1 || pfDaysVal > 90) {
+      setDashboardError('Portrait Frame delivery timeframe must be between 1 and 90 days.');
+      return;
+    }
+
     setSavingSettings(true);
     setDashboardError(null);
     setActionFeedback(null);
@@ -710,6 +799,14 @@ export default function AdminPage({
         sgProductPricesCents: {
           keychain: sgKcVal,
           magnet: sgMagVal
+        },
+        portraitFrameConfig: {
+          priceMySen: pfMyVal,
+          priceSgCents: pfSgVal,
+          deliveryPeninsularSen: pfPenVal,
+          deliveryEastMalaysiaSen: pfEastVal,
+          deliverySingaporeCents: pfSgDeliveryVal,
+          deliveryDays: pfDaysVal
         }
       };
 
@@ -756,6 +853,41 @@ export default function AdminPage({
   const correctionCount = orders.filter(o => o.paymentStatus === 'Receipt correction needed').length;
   const awaitingCount = orders.filter(o => o.paymentStatus === 'Awaiting payment').length;
   const paidCount = orders.filter(o => o.paymentStatus === 'Paid').length;
+
+  // Sales Report aggregation (strictly separated by currency MYR vs SGD and product category)
+  const salesReportCategories = [
+    { key: 'keychain', label: 'Custom Keychain' },
+    { key: 'magnet', label: 'Custom Fridge Magnet' },
+    { key: 'bundle', label: '2-Piece Bundle' },
+    { key: PORTRAIT_FRAME_PRODUCT_ID, label: 'Custom Portrait Frame' }
+  ] as const;
+
+  const salesReport = salesReportCategories.map(cat => {
+    const catOrders = orders.filter(o => o.productId === cat.key);
+    const catPaid = catOrders.filter(o => o.paymentStatus === 'Paid');
+    const paidMyrMinor = catPaid
+      .filter(o => (o.currency || (o.deliveryCountry === 'SG' ? 'SGD' : 'MYR')) === 'MYR')
+      .reduce((sum, o) => sum + o.totalSen, 0);
+    const paidSgdMinor = catPaid
+      .filter(o => (o.currency || (o.deliveryCountry === 'SG' ? 'SGD' : 'MYR')) === 'SGD')
+      .reduce((sum, o) => sum + o.totalSen, 0);
+    return {
+      ...cat,
+      totalOrders: catOrders.length,
+      paidOrders: catPaid.length,
+      paidMyrMinor,
+      paidSgdMinor
+    };
+  });
+
+  const totalPaidMyrMinor = salesReport.reduce((sum, r) => sum + r.paidMyrMinor, 0);
+  const totalPaidSgdMinor = salesReport.reduce((sum, r) => sum + r.paidSgdMinor, 0);
+  const totalPaidMyOrders = orders.filter(
+    o => o.paymentStatus === 'Paid' && (o.currency || (o.deliveryCountry === 'SG' ? 'SGD' : 'MYR')) === 'MYR'
+  ).length;
+  const totalPaidSgOrders = orders.filter(
+    o => o.paymentStatus === 'Paid' && (o.currency || (o.deliveryCountry === 'SG' ? 'SGD' : 'MYR')) === 'SGD'
+  ).length;
 
   // UNAUTHENTICATED GATE
   if (!authToken) {
@@ -1098,6 +1230,11 @@ export default function AdminPage({
                       Migration needed: run supabase/migrations/002_country_based_pricing.sql to enable Singapore (SGD) persistence.
                     </p>
                   )}
+                  {diagnostics.supabase.portraitFrameSchemaReady === false && (
+                    <p className="text-amber-900 font-semibold">
+                      Migration needed: run supabase/migrations/004_portrait_frame.sql to persist custom Portrait Frame settings and order personalisation text.
+                    </p>
+                  )}
                 </div>
               ) : (
                 <ul className="text-red-800 list-disc list-inside space-y-0.5">
@@ -1388,6 +1525,76 @@ export default function AdminPage({
       {/* TAB 1: ORDERS & MANUAL PAYMENT VERIFICATION */}
       {activeTab === 'orders' && (
         <div className="space-y-6">
+          {/* Sales Report Summary by Product & Currency */}
+          <section className="bg-white rounded-2xl border border-[#14233C]/12 p-5 sm:p-6 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 className="text-sm font-bold text-[#14233C]">Sales Report (Verified Paid Orders)</h2>
+                <p className="text-xs text-[#14233C]/65">
+                  Includes Keychains, Fridge Magnets, 2-Piece Bundles, and Custom Portrait Frames — reported separately in MYR and SGD.
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-3 text-xs">
+                <div className="px-3.5 py-2 rounded-xl bg-[#FAF6EE] border border-[#14233C]/10">
+                  <span className="text-[#14233C]/60 block text-[10px] font-semibold uppercase tracking-wide">
+                    Malaysia Paid ({totalPaidMyOrders})
+                  </span>
+                  <span className="font-extrabold text-[#14233C] text-sm tabular-nums">
+                    {formatCurrencyAmount(totalPaidMyrMinor, 'MYR')}
+                  </span>
+                </div>
+                <div className="px-3.5 py-2 rounded-xl bg-[#FAF6EE] border border-[#14233C]/10">
+                  <span className="text-[#14233C]/60 block text-[10px] font-semibold uppercase tracking-wide">
+                    Singapore Paid ({totalPaidSgOrders})
+                  </span>
+                  <span className="font-extrabold text-[#14233C] text-sm tabular-nums">
+                    {formatCurrencyAmount(totalPaidSgdMinor, 'SGD')}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs border-collapse">
+                <thead>
+                  <tr className="border-b border-[#14233C]/10 text-[#14233C]/60">
+                    <th className="py-2 pr-4 font-bold">Product Category</th>
+                    <th className="py-2 px-3 font-bold text-right">All Orders</th>
+                    <th className="py-2 px-3 font-bold text-right">Paid Orders</th>
+                    <th className="py-2 px-3 font-bold text-right">Paid Revenue (MYR)</th>
+                    <th className="py-2 pl-3 font-bold text-right">Paid Revenue (SGD)</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#14233C]/8">
+                  {salesReport.map(row => (
+                    <tr key={row.key} className="text-[#14233C]">
+                      <td className="py-2.5 pr-4 font-bold">
+                        {row.label}
+                        {row.key === PORTRAIT_FRAME_PRODUCT_ID && (
+                          <span className="ml-2 text-[10px] font-semibold text-amber-800 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded">
+                            {PORTRAIT_FRAME_DIMENSIONS}
+                          </span>
+                        )}
+                      </td>
+                      <td className="py-2.5 px-3 text-right tabular-nums text-[#14233C]/75">
+                        {row.totalOrders}
+                      </td>
+                      <td className="py-2.5 px-3 text-right tabular-nums font-semibold text-emerald-800">
+                        {row.paidOrders}
+                      </td>
+                      <td className="py-2.5 px-3 text-right tabular-nums font-semibold">
+                        {formatCurrencyAmount(row.paidMyrMinor, 'MYR')}
+                      </td>
+                      <td className="py-2.5 pl-3 text-right tabular-nums font-semibold">
+                        {formatCurrencyAmount(row.paidSgdMinor, 'SGD')}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
           {/* Filter Controls */}
           <div className="flex flex-wrap items-center justify-between gap-4">
             <div className="flex flex-wrap items-center gap-1 p-1 bg-white border border-[#14233C]/12 rounded-xl">
@@ -1483,7 +1690,17 @@ export default function AdminPage({
 
                           <p className="text-sm font-bold text-[#14233C]">
                             {order.productName} (Qty {order.itemQuantity}) — {order.customer.fullName}
+                            {order.productId === PORTRAIT_FRAME_PRODUCT_ID && (
+                              <span className="ml-2 inline-block text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded bg-[#14233C] text-amber-200 align-middle">
+                                Portrait Frame · {order.deliveryDays ?? 14}d
+                              </span>
+                            )}
                           </p>
+                          {order.personalisationText && (
+                            <p className="text-xs font-semibold text-amber-950 bg-amber-50 border border-amber-200/80 rounded-lg px-2.5 py-1 inline-block">
+                              Frame Personalisation: &ldquo;{order.personalisationText}&rdquo;
+                            </p>
+                          )}
                           <p className="text-xs text-[#14233C]/70">
                             {order.customer.email} · {order.customer.mobile} ·{' '}
                             {orderCountry === 'SG'
@@ -1925,12 +2142,13 @@ export default function AdminPage({
           <section className="bg-white rounded-2xl border border-[#14233C]/12 p-6 space-y-5">
             <h2 className="text-base font-bold text-[#14233C]">Product & Gallery Images</h2>
 
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
               {(
                 [
                   { key: 'keychain', label: 'Keychain Image' },
                   { key: 'magnet', label: 'Fridge Magnet Image' },
-                  { key: 'bundle', label: '2-Piece Bundle Image' }
+                  { key: 'bundle', label: '2-Piece Bundle Image' },
+                  { key: 'portrait_frame', label: 'Portrait Frame Image' }
                 ] as const
               ).map(item => (
                 <div key={item.key} className="p-4 rounded-xl bg-[#FAF6EE]/60 border border-[#14233C]/10 space-y-2.5">
@@ -2124,8 +2342,127 @@ export default function AdminPage({
                 />
               </div>
               <p className="sm:col-span-2 text-[11px] text-[#14233C]/65">
-                Singapore 2-Piece Bundles automatically receive 20% off these fixed SGD prices. Malaysia prices remain fixed in MYR (RM 29.90 / RM 31.90).
+                Singapore 2-Piece Bundles automatically receive 20% off these fixed SGD prices. Malaysia keychain &amp; magnet prices remain fixed in MYR (RM 29.90 / RM 31.90).
               </p>
+            </div>
+          </section>
+
+          {/* Custom Perler Bead Portrait Frame — Separate Pricing, Delivery & Lead Time */}
+          <section className="bg-white rounded-2xl border border-[#14233C]/12 p-6 space-y-5">
+            <div>
+              <div className="flex flex-wrap items-center gap-2">
+                <h2 className="text-base font-bold text-[#14233C]">
+                  Custom Portrait Frame — Pricing, Delivery &amp; Timeframe
+                </h2>
+                <span className="text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-[#14233C] text-amber-200">
+                  {PORTRAIT_FRAME_DIMENSIONS} · Wooden Frame Included
+                </span>
+              </div>
+              <p className="text-xs text-[#14233C]/70 mt-1">
+                Portrait Frame prices, protective packaging/shipping fees, and delivery lead time are configured independently from keychains and fridge magnets.
+              </p>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+              <div>
+                <label className="block text-xs font-bold text-[#14233C] mb-1.5">
+                  Malaysia Price (MYR)
+                </label>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="2.00"
+                  max="5000"
+                  required
+                  value={pfPriceMyRm}
+                  onChange={e => setPfPriceMyRm(e.target.value)}
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-[#FAF6EE] border border-[#14233C]/20 text-sm font-mono"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-bold text-[#14233C] mb-1.5">
+                  Singapore Price (SGD)
+                </label>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="0.50"
+                  max="5000"
+                  required
+                  value={pfPriceSgSgd}
+                  onChange={e => setPfPriceSgSgd(e.target.value)}
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-[#FAF6EE] border border-[#14233C]/20 text-sm font-mono"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-bold text-[#14233C] mb-1.5">
+                  Delivery Timeframe (Days)
+                </label>
+                <input
+                  type="number"
+                  step="1"
+                  min="1"
+                  max="90"
+                  required
+                  value={pfDeliveryDays}
+                  onChange={e => setPfDeliveryDays(e.target.value)}
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-[#FAF6EE] border border-[#14233C]/20 text-sm font-mono"
+                />
+                <p className="text-[11px] text-[#14233C]/60 mt-1">
+                  Initial default is 14 days after payment confirmation.
+                </p>
+              </div>
+            </div>
+
+            <div className="pt-4 border-t border-[#14233C]/10 grid grid-cols-1 sm:grid-cols-3 gap-4">
+              <div>
+                <label className="block text-xs font-bold text-[#14233C] mb-1.5">
+                  Portrait Frame — Peninsular MY Delivery (MYR)
+                </label>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  max="1000"
+                  required
+                  value={pfPeninsularRm}
+                  onChange={e => setPfPeninsularRm(e.target.value)}
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-[#FAF6EE] border border-[#14233C]/20 text-sm font-mono"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-bold text-[#14233C] mb-1.5">
+                  Portrait Frame — Sabah, Sarawak &amp; Labuan (MYR)
+                </label>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  max="1000"
+                  required
+                  value={pfEastRm}
+                  onChange={e => setPfEastRm(e.target.value)}
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-[#FAF6EE] border border-[#14233C]/20 text-sm font-mono"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-bold text-[#14233C] mb-1.5">
+                  Portrait Frame — Singapore Delivery (SGD)
+                </label>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  max="1000"
+                  placeholder="Leave blank to disable SG"
+                  value={pfSingaporeSgd}
+                  onChange={e => setPfSingaporeSgd(e.target.value)}
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-[#FAF6EE] border border-[#14233C]/20 text-sm font-mono"
+                />
+                <p className="text-[11px] text-[#14233C]/60 mt-1">
+                  Leave blank to disable Singapore shipping for Portrait Frames only.
+                </p>
+              </div>
             </div>
           </section>
 
