@@ -1,9 +1,12 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import type {
+  DeliveryCountry,
   EditableStoreSettings,
+  OrderPricingBreakdown,
   PaymentMethodKey,
   PaymentStatus,
-  SupabaseHealthDiagnostic
+  SupabaseHealthDiagnostic,
+  SupportedCurrency
 } from '../types/order';
 
 export interface SupabaseEnvConfig {
@@ -41,6 +44,11 @@ export interface StoreSettingsRow {
   gallery_items: EditableStoreSettings['galleryItems'];
   delivery_rate_peninsular_sen: number;
   delivery_rate_east_malaysia_sen: number;
+  delivery_rate_singapore_cents?: number | null;
+  sg_product_prices_cents?: {
+    keychain: number;
+    magnet: number;
+  } | null;
   whatsapp_support_number: string;
   tng_override_enabled: boolean | null;
   tng_override_recipient_name: string;
@@ -57,6 +65,9 @@ export interface OrderRow {
   id: string;
   reference: string;
   access_token: string;
+  delivery_country?: DeliveryCountry | null;
+  currency?: SupportedCurrency | null;
+  pricing_breakdown?: OrderPricingBreakdown | null;
   product_id: string;
   bundle_id: string | null;
   product_name: string;
@@ -94,6 +105,7 @@ export interface PaymentRow {
   id: string;
   order_id: string;
   order_reference: string;
+  delivery_country?: DeliveryCountry | null;
   payment_method: PaymentMethodKey;
   status:
     | 'pending'
@@ -281,6 +293,7 @@ export async function checkSupabaseHealth(forceRefresh = false): Promise<Supabas
   let databaseReady = true;
   let photosBucketReady = false;
   let receiptsBucketReady = false;
+  let countryPricingSchemaReady = false;
 
   try {
     const client = getSupabaseAdminClient();
@@ -306,6 +319,21 @@ export async function checkSupabaseHealth(forceRefresh = false): Promise<Supabas
       issues.push(
         `Missing Supabase tables (${missingTables.join(', ')}). Execute supabase/migrations/001_initial_schema.sql in the Supabase SQL Editor.`
       );
+    }
+
+    // 1b. Non-breaking check for 002_country_based_pricing.sql columns
+    if (databaseReady) {
+      const [ordersSchemaCheck, settingsSchemaCheck] = await Promise.all([
+        client
+          .from('orders')
+          .select('delivery_country,currency,pricing_breakdown', { head: true })
+          .limit(1),
+        client
+          .from('store_settings')
+          .select('delivery_rate_singapore_cents,sg_product_prices_cents', { head: true })
+          .limit(1)
+      ]);
+      countryPricingSchemaReady = !ordersSchemaCheck.error && !settingsSchemaCheck.error;
     }
 
     // 2. Verify private storage buckets exist and are NOT public
@@ -352,6 +380,7 @@ export async function checkSupabaseHealth(forceRefresh = false): Promise<Supabas
     databaseReady,
     photosBucketReady,
     receiptsBucketReady,
+    countryPricingSchemaReady,
     photosBucket: cfg.photosBucket,
     receiptsBucket: cfg.receiptsBucket,
     issues,
@@ -394,6 +423,33 @@ export async function movePrivateFile(opts: {
   if (error) {
     throw new Error(`Storage move failed (${opts.bucket}): ${sanitizeSupabaseError(error)}`);
   }
+}
+
+/**
+ * Copies a private storage object non-destructively so the pending upload remains intact
+ * until the database order insert succeeds. If a stale orphaned destination exists from
+ * a prior interrupted attempt (where no order row was persisted), replaces it safely.
+ */
+export async function copyPrivateFile(opts: {
+  bucket: string;
+  fromPath: string;
+  toPath: string;
+}): Promise<void> {
+  const client = getSupabaseAdminClient();
+  const { error } = await client.storage.from(opts.bucket).copy(opts.fromPath, opts.toPath);
+  if (!error) return;
+
+  const msg = sanitizeSupabaseError(error);
+  const alreadyExists = /already exists|duplicate|409/i.test(msg);
+  if (alreadyExists) {
+    // Only overwrite stale destination if the source pending object still exists
+    await removePrivateFile(opts.bucket, opts.toPath);
+    const retry = await client.storage.from(opts.bucket).copy(opts.fromPath, opts.toPath);
+    if (!retry.error) return;
+    throw new Error(`Storage copy failed (${opts.bucket}): ${sanitizeSupabaseError(retry.error)}`);
+  }
+
+  throw new Error(`Storage copy failed (${opts.bucket}): ${msg}`);
 }
 
 export async function removePrivateFile(bucket: string, storagePath: string): Promise<void> {
@@ -469,12 +525,44 @@ export async function fetchStoreSettingsRow(): Promise<StoreSettingsRow | null> 
   return (data as StoreSettingsRow | null) ?? null;
 }
 
+export class SupabaseQueryError extends Error {
+  code?: string;
+
+  constructor(message: string, code?: string) {
+    super(message);
+    this.name = 'SupabaseQueryError';
+    this.code = code;
+  }
+}
+
+export function isUniqueViolationError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const code = String((err as { code?: unknown }).code || '');
+  const msg = String((err as { message?: unknown }).message || '');
+  return (
+    code === '23505' ||
+    /duplicate key value violates unique constraint/i.test(msg)
+  );
+}
+
+function isMissingColumnError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const code = String((err as { code?: unknown }).code || '');
+  const msg = String((err as { message?: unknown }).message || '');
+  return (
+    code === '42703' ||
+    code === 'PGRST204' ||
+    /Could not find the '[^']+' column/i.test(msg) ||
+    /column "[^"]+" of relation "[^"]+" does not exist/i.test(msg)
+  );
+}
+
 export async function upsertStoreSettingsRow(
   settings: EditableStoreSettings,
   updatedByStaffId?: string | null
 ): Promise<StoreSettingsRow> {
   const client = getSupabaseAdminClient();
-  const payload = {
+  const basePayload = {
     id: 'default',
     logo_url: settings.logoUrl,
     hero_image_url: settings.heroImageUrl,
@@ -491,11 +579,32 @@ export async function upsertStoreSettingsRow(
     duitnow_override_qr_image: settings.qrOverrides.duitnow.qrImage,
     updated_by_staff_id: updatedByStaffId ?? null
   };
+  const extendedPayload = {
+    ...basePayload,
+    delivery_rate_singapore_cents: settings.deliveryRateSingaporeCents,
+    sg_product_prices_cents: settings.sgProductPricesCents
+  };
   const { data, error } = await client
     .from('store_settings')
-    .upsert(payload, { onConflict: 'id' })
+    .upsert(extendedPayload, { onConflict: 'id' })
     .select('*')
     .single();
+  if (error && isMissingColumnError(error)) {
+    if (settings.deliveryRateSingaporeCents !== null) {
+      throw new Error(
+        'SCHEMA_MIGRATION_REQUIRED: Run supabase/migrations/002_country_based_pricing.sql in the Supabase SQL Editor before saving Singapore delivery rates.'
+      );
+    }
+    const fallback = await client
+      .from('store_settings')
+      .upsert(basePayload, { onConflict: 'id' })
+      .select('*')
+      .single();
+    if (fallback.error || !fallback.data) {
+      throw new Error(`Failed to save store_settings: ${sanitizeSupabaseError(fallback.error)}`);
+    }
+    return fallback.data as StoreSettingsRow;
+  }
   if (error || !data) {
     throw new Error(`Failed to save store_settings: ${sanitizeSupabaseError(error)}`);
   }
@@ -575,8 +684,32 @@ export async function insertOrderRow(
 ): Promise<OrderRow> {
   const client = getSupabaseAdminClient();
   const { data, error } = await client.from('orders').insert(input).select('*').single();
+  if (error && isMissingColumnError(error)) {
+    if (input.delivery_country && input.delivery_country !== 'MY') {
+      throw new Error(
+        'SCHEMA_MIGRATION_REQUIRED: Run supabase/migrations/002_country_based_pricing.sql in the Supabase SQL Editor to persist Singapore (SGD) orders.'
+      );
+    }
+    const {
+      delivery_country: _dc,
+      currency: _cur,
+      pricing_breakdown: _pb,
+      ...legacyInput
+    } = input;
+    const fallback = await client.from('orders').insert(legacyInput).select('*').single();
+    if (fallback.error || !fallback.data) {
+      throw new SupabaseQueryError(
+        `Failed to insert order: ${sanitizeSupabaseError(fallback.error)}`,
+        (fallback.error as { code?: string } | null)?.code
+      );
+    }
+    return fallback.data as OrderRow;
+  }
   if (error || !data) {
-    throw new Error(`Failed to insert order: ${sanitizeSupabaseError(error)}`);
+    throw new SupabaseQueryError(
+      `Failed to insert order: ${sanitizeSupabaseError(error)}`,
+      (error as { code?: string } | null)?.code
+    );
   }
   return data as OrderRow;
 }
@@ -611,11 +744,65 @@ export async function updateOrderByReference(
   return data as OrderRow;
 }
 
+/**
+ * Atomic conditional update that only mutates an order if payment_status != 'Paid'.
+ * Returns null if the order was already marked Paid concurrently (e.g., via Stripe webhook).
+ */
+export async function updateOrderIfUnpaid(
+  reference: string,
+  patch: Partial<Omit<OrderRow, 'id' | 'reference' | 'created_at' | 'updated_at'>>
+): Promise<OrderRow | null> {
+  const client = getSupabaseAdminClient();
+  const { data, error } = await client
+    .from('orders')
+    .update(patch)
+    .eq('reference', reference)
+    .neq('payment_status', 'Paid')
+    .select('*')
+    .maybeSingle();
+  if (error && isMissingColumnError(error)) {
+    if (patch.delivery_country && patch.delivery_country !== 'MY') {
+      throw new Error(
+        'SCHEMA_MIGRATION_REQUIRED: Run supabase/migrations/002_country_based_pricing.sql in the Supabase SQL Editor to update delivery country to Singapore (SGD).'
+      );
+    }
+    const {
+      delivery_country: _dc,
+      currency: _cur,
+      pricing_breakdown: _pb,
+      ...legacyPatch
+    } = patch;
+    const fallback = await client
+      .from('orders')
+      .update(legacyPatch)
+      .eq('reference', reference)
+      .neq('payment_status', 'Paid')
+      .select('*')
+      .maybeSingle();
+    if (fallback.error) {
+      throw new Error(`Failed to update order ${reference}: ${sanitizeSupabaseError(fallback.error)}`);
+    }
+    return (fallback.data as OrderRow | null) ?? null;
+  }
+  if (error) {
+    throw new Error(`Failed to update order ${reference}: ${sanitizeSupabaseError(error)}`);
+  }
+  return (data as OrderRow | null) ?? null;
+}
+
 export async function insertPaymentRow(
   input: Omit<PaymentRow, 'id' | 'created_at' | 'updated_at'>
 ): Promise<PaymentRow> {
   const client = getSupabaseAdminClient();
   const { data, error } = await client.from('payments').insert(input).select('*').single();
+  if (error && isMissingColumnError(error)) {
+    const { delivery_country: _dc, ...legacyInput } = input;
+    const fallback = await client.from('payments').insert(legacyInput).select('*').single();
+    if (fallback.error || !fallback.data) {
+      throw new Error(`Failed to record payment: ${sanitizeSupabaseError(fallback.error)}`);
+    }
+    return fallback.data as PaymentRow;
+  }
   if (error || !data) {
     throw new Error(`Failed to record payment: ${sanitizeSupabaseError(error)}`);
   }

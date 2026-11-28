@@ -5,15 +5,35 @@ import fs from 'fs';
 import crypto from 'crypto';
 import Stripe from 'stripe';
 import type {
+  DeliveryCountry,
   EditableStoreSettings,
   PaymentMethodKey,
   StoreGalleryImage,
   StripeCheckoutDiagnostic,
-  SupabaseHealthDiagnostic
+  SupabaseHealthDiagnostic,
+  SupportedCurrency
 } from '../types/order';
+import {
+  COUNTRY_LABELS,
+  COUNTRY_UPDATE_NOTICE,
+  DEFAULT_MARKET_PRODUCT_BASE_PRICES,
+  buildMarketPricingConfig,
+  calculateAuthoritativeOrderPricing,
+  formatCountryLabel,
+  formatCurrencyAmount,
+  formatCurrencyWithCode,
+  getAllowedPaymentMethodsForCountry,
+  getCurrencyForCountry,
+  normalizeCurrency,
+  normalizeDeliveryCountry,
+  validateCountryCurrencyPair,
+  validateCustomerDeliveryAddress,
+  verifySavedOrderPricingIntegrity
+} from '../shared/pricing';
 import {
   checkSupabaseHealth,
   clearSupabaseHealthCache,
+  copyPrivateFile,
   createBootstrapStaffAccount,
   createShortLivedSignedUrl,
   createSignedPrivateUploadUrl,
@@ -29,13 +49,14 @@ import {
   hasProcessedStripeEvent,
   insertOrderRow,
   insertPaymentRow,
+  isUniqueViolationError,
   listActiveStaffAccounts,
   listHydratedOrders,
-  movePrivateFile,
   removePrivateFile,
   sanitizeSupabaseError,
   touchStaffLastLogin,
   updateOrderByReference,
+  updateOrderIfUnpaid,
   updatePaymentById,
   uploadPrivateFile,
   upsertOrderConfirmationEmail,
@@ -46,6 +67,8 @@ import {
 } from './supabase';
 import {
   computePasscodeVersion,
+  deriveOrderPhotoPathForUpload,
+  deriveOrderReferenceForUpload,
   signServerToken,
   verifyServerToken,
   type AdminSessionPayload,
@@ -95,46 +118,29 @@ if (!isServerlessRuntime) {
   }
 }
 
-// Shared product & bundle pricing configuration in integer sen (RM)
-const PRODUCT_CONFIG: Record<string, { name: string; priceSen: number; regularSen?: number }> = {
-  keychain: { name: 'Keychain', priceSen: 2990 },
-  magnet: { name: 'Fridge Magnet', priceSen: 3190 },
-  bundle_2_keychains: { name: '2-Piece Bundle (2 Keychains)', priceSen: 4784, regularSen: 5980 },
-  bundle_kc_magnet: { name: '2-Piece Bundle (1 Keychain + 1 Fridge Magnet)', priceSen: 4944, regularSen: 6180 },
-  bundle_2_magnets: { name: '2-Piece Bundle (2 Fridge Magnets)', priceSen: 5104, regularSen: 6380 }
-};
-
-const PENINSULAR_STATES = new Set([
-  'johor',
-  'kedah',
-  'kelantan',
-  'melaka',
-  'negeri sembilan',
-  'pahang',
-  'perak',
-  'perlis',
-  'penang',
-  'pulau pinang',
-  'selangor',
-  'terengganu',
-  'kuala lumpur',
-  'putrajaya'
-]);
-
-const EAST_MALAYSIA_STATES = new Set(['sabah', 'sarawak', 'labuan']);
 
 const ORDER_REF_REGEX = /^LPK-\d{4}-[A-Z0-9]{6,10}$/;
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024; // 10 MB
 const ADMIN_SESSION_TTL_MS = 8 * 60 * 60 * 1000; // 8 hours
 const LOGIN_WINDOW_MS = 15 * 60 * 1000; // 15 min
 const MAX_LOGIN_ATTEMPTS = 10;
-const PHOTO_UPLOAD_SESSION_TTL_MS = 30 * 60 * 1000; // 30 min
+const PHOTO_UPLOAD_SESSION_TTL_MS = 60 * 60 * 1000; // 60 min
 const MAX_UPLOAD_SESSIONS_PER_WINDOW = 30;
 
 const LEGACY_HERO_IMAGE_URL = '/src/assets/images/hero_bead_art_showcase_1795515646405.jpg';
 const LEGACY_KEYCHAIN_IMAGE_URL = '/src/assets/images/pet_bead_art_1795515646980.jpg';
 const LEGACY_MAGNET_IMAGE_URL = '/src/assets/images/couple_bead_art_1795515653017.jpg';
 const LEGACY_BUNDLE_IMAGE_URL = '/src/assets/images/family_bead_art_1795515653155.jpg';
+
+function resolveEnvSingaporeShippingCents(): number | null {
+  const raw = stripWrappingQuotes(process.env.SG_SHIPPING_FEE_CENTS || '');
+  if (!raw) return null;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 0 || parsed > 100000) {
+    return null;
+  }
+  return parsed;
+}
 
 function getDefaultStoreSettings(): EditableStoreSettings {
   return {
@@ -175,6 +181,8 @@ function getDefaultStoreSettings(): EditableStoreSettings {
       peninsular: 800,
       eastMalaysia: 1500
     },
+    deliveryRateSingaporeCents: resolveEnvSingaporeShippingCents(),
+    sgProductPricesCents: { ...DEFAULT_MARKET_PRODUCT_BASE_PRICES.SG },
     whatsappSupportNumber: (process.env.WHATSAPP_SUPPORT_NUMBER || '').replace(/\D/g, ''),
     qrOverrides: {
       tng: { enabled: null, recipientName: '', qrImage: '' },
@@ -190,6 +198,41 @@ function mapStoreSettingsRow(row?: StoreSettingsRow | null): EditableStoreSettin
   const rawKeychain = row.product_images?.keychain?.trim();
   const rawMagnet = row.product_images?.magnet?.trim();
   const rawBundle = row.product_images?.bundle?.trim();
+
+  const hasSgShippingColumn = Object.prototype.hasOwnProperty.call(
+    row,
+    'delivery_rate_singapore_cents'
+  );
+  let resolvedSgShippingCents: number | null;
+  if (hasSgShippingColumn) {
+    resolvedSgShippingCents =
+      typeof row.delivery_rate_singapore_cents === 'number' &&
+      Number.isInteger(row.delivery_rate_singapore_cents) &&
+      row.delivery_rate_singapore_cents >= 0
+        ? row.delivery_rate_singapore_cents
+        : null;
+  } else {
+    resolvedSgShippingCents = defaults.deliveryRateSingaporeCents;
+  }
+
+  const rawSgPrices = row.sg_product_prices_cents;
+  const sgProductPricesCents = {
+    keychain:
+      rawSgPrices &&
+      Number.isInteger(rawSgPrices.keychain) &&
+      rawSgPrices.keychain >= 100 &&
+      rawSgPrices.keychain <= 500000
+        ? rawSgPrices.keychain
+        : DEFAULT_MARKET_PRODUCT_BASE_PRICES.SG.keychain,
+    magnet:
+      rawSgPrices &&
+      Number.isInteger(rawSgPrices.magnet) &&
+      rawSgPrices.magnet >= 100 &&
+      rawSgPrices.magnet <= 500000
+        ? rawSgPrices.magnet
+        : DEFAULT_MARKET_PRODUCT_BASE_PRICES.SG.magnet
+  };
+
   return {
     logoUrl: row.logo_url?.trim() || defaults.logoUrl,
     heroImageUrl: !rawHero || rawHero === LEGACY_HERO_IMAGE_URL ? defaults.heroImageUrl : rawHero,
@@ -246,6 +289,8 @@ function mapStoreSettingsRow(row?: StoreSettingsRow | null): EditableStoreSettin
           ? row.delivery_rate_east_malaysia_sen
           : defaults.deliveryRatesSen.eastMalaysia
     },
+    deliveryRateSingaporeCents: resolvedSgShippingCents,
+    sgProductPricesCents,
     whatsappSupportNumber: (row.whatsapp_support_number || '').replace(/\D/g, '').slice(0, 20),
     qrOverrides: {
       tng: {
@@ -266,6 +311,94 @@ function mapStoreSettingsRow(row?: StoreSettingsRow | null): EditableStoreSettin
 // upload & staff sessions use stateless HMAC-SHA256 tokens so they work across serverless instances and restarts).
 const inFlightConfirmationEmails: Set<string> = new Set();
 const inFlightStripeEvents: Set<string> = new Set();
+const orderOperationLocks: Map<string, Promise<void>> = new Map();
+
+async function withOrderLock<T>(reference: string, fn: () => Promise<T>): Promise<T> {
+  const prev = orderOperationLocks.get(reference) || Promise.resolve();
+  let release!: () => void;
+  const next = new Promise<void>(resolve => {
+    release = resolve;
+  });
+  const chained = prev.then(() => next);
+  orderOperationLocks.set(reference, chained);
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (orderOperationLocks.get(reference) === chained) {
+      orderOperationLocks.delete(reference);
+    }
+  }
+}
+
+function getOrderDeliveryCountry(order: OrderRow): DeliveryCountry {
+  return normalizeDeliveryCountry(order.delivery_country) ?? 'MY';
+}
+
+function getOrderCurrency(order: OrderRow): SupportedCurrency {
+  const country = getOrderDeliveryCountry(order);
+  return normalizeCurrency(order.currency) ?? getCurrencyForCountry(country);
+}
+
+function getSettingsDeliveryRatesInput(settings: EditableStoreSettings) {
+  return {
+    peninsularSen: settings.deliveryRatesSen.peninsular,
+    eastMalaysiaSen: settings.deliveryRatesSen.eastMalaysia,
+    singaporeCents: settings.deliveryRateSingaporeCents
+  };
+}
+
+/**
+ * Inspects and expires any open/pending Stripe Checkout sessions for an unpaid order.
+ * If an existing session is ALREADY paid on Stripe, returns { alreadyPaid: true } so
+ * callers MUST abort mutations or duplicate session creation safely.
+ */
+async function expireOpenStripeSessionsForOrder(
+  order: OrderRow,
+  stripeClient: Stripe | null
+): Promise<{ alreadyPaid: boolean; paidSessionId?: string; expiredCount: number }> {
+  const payments = await fetchPaymentsForOrder(order.id);
+  const pendingCardPayments = payments.filter(
+    p => p.payment_method === 'card' && p.status === 'pending' && Boolean(p.stripe_session_id)
+  );
+  let expiredCount = 0;
+
+  for (const payment of pendingCardPayments) {
+    const sessionId = payment.stripe_session_id!;
+    if (stripeClient) {
+      try {
+        const existingSession = await stripeClient.checkout.sessions.retrieve(sessionId);
+        if (existingSession.payment_status === 'paid') {
+          return { alreadyPaid: true, paidSessionId: sessionId, expiredCount };
+        }
+        if (existingSession.status === 'open') {
+          await stripeClient.checkout.sessions.expire(sessionId);
+          await updatePaymentById(payment.id, { status: 'superseded' });
+          expiredCount += 1;
+        } else if (existingSession.status === 'expired') {
+          await updatePaymentById(payment.id, { status: 'expired' });
+        } else {
+          await updatePaymentById(payment.id, { status: 'superseded' });
+        }
+      } catch (err: any) {
+        const msg = sanitizeSensitiveText(err?.message || err);
+        // If Stripe reports the session is already expired/not open, mark superseded cleanly;
+        // otherwise rethrow so we never leave an active live session un-invalidated when changing country!
+        if (/already expired|status of 'expired'|cannot expire/i.test(msg)) {
+          await updatePaymentById(payment.id, { status: 'expired' }).catch(() => {});
+        } else {
+          throw new Error(`Could not invalidate prior Stripe Checkout session (${sessionId}): ${msg}`);
+        }
+      }
+    } else {
+      await updatePaymentById(payment.id, { status: 'superseded' }).catch(() => {});
+      expiredCount += 1;
+    }
+  }
+
+  return { alreadyPaid: false, expiredCount };
+}
 
 interface AdminSessionRecord {
   sid: string;
@@ -351,23 +484,6 @@ function escapeHtml(text: string): string {
     .replace(/'/g, '&#39;');
 }
 
-function formatRM(sen: number): string {
-  return `RM ${(sen / 100).toFixed(2)}`;
-}
-
-function getDeliveryConfigForState(
-  state: string,
-  settings: EditableStoreSettings
-): { zone: string; rateSen: number } | null {
-  const normalized = state.trim().toLowerCase();
-  if (PENINSULAR_STATES.has(normalized)) {
-    return { zone: 'Peninsular Malaysia', rateSen: settings.deliveryRatesSen.peninsular };
-  }
-  if (EAST_MALAYSIA_STATES.has(normalized)) {
-    return { zone: 'Sabah & Sarawak', rateSen: settings.deliveryRatesSen.eastMalaysia };
-  }
-  return null;
-}
 
 function createAdminSession(
   staffId: string | null,
@@ -397,9 +513,19 @@ function getPaymentMethodDisplayLabel(method?: PaymentMethodKey | null): string 
 function toPublicOrder(hydrated: HydratedOrder, photoUrl: string) {
   const { order, latestPayment, latestReceiptPayment, confirmationEmail } = hydrated;
   const activeManualPayment = latestReceiptPayment || latestPayment;
+  const deliveryCountry = getOrderDeliveryCountry(order);
+  const currency = getOrderCurrency(order);
+  const latestPaymentCurrency = latestPayment?.currency
+    ? normalizeCurrency(latestPayment.currency)
+    : null;
+
   return {
     reference: order.reference,
     accessToken: order.access_token,
+    deliveryCountry,
+    currency,
+    allowedPaymentMethods: getAllowedPaymentMethodsForCountry(deliveryCountry),
+    pricingBreakdown: order.pricing_breakdown ?? undefined,
     productId: order.product_id,
     bundleId: order.bundle_id ?? undefined,
     productName: order.product_name,
@@ -418,11 +544,13 @@ function toPublicOrder(hydrated: HydratedOrder, photoUrl: string) {
       address: order.customer_address,
       postcode: order.customer_postcode,
       city: order.customer_city,
-      state: order.customer_state
+      state: order.customer_state,
+      country: deliveryCountry
     },
     paymentStatus: order.payment_status,
     paymentMethod: order.payment_method ?? null,
     paymentMethodLabel: getPaymentMethodDisplayLabel(order.payment_method),
+    latestPaymentCurrency,
     transactionReference: activeManualPayment?.transaction_reference ?? undefined,
     receiptSubmitted: Boolean(latestReceiptPayment?.receipt_storage_path),
     receiptFileName: latestReceiptPayment?.receipt_original_filename ?? undefined,
@@ -957,6 +1085,18 @@ async function evaluateAllPaymentMethods(forceHealthRefresh = false) {
   const emailInfo = getEmailConfig();
 
   const stripeIssues = [stripeInfo.error, originInfo.issue].filter(Boolean).join(' ');
+  const sgConfigured =
+    typeof settings.deliveryRateSingaporeCents === 'number' &&
+    Number.isInteger(settings.deliveryRateSingaporeCents) &&
+    settings.deliveryRateSingaporeCents >= 0;
+  const sgEnvFee = resolveEnvSingaporeShippingCents();
+  const sgSource: 'settings' | 'env' | 'unconfigured' = !sgConfigured
+    ? 'unconfigured'
+    : supabase.countryPricingSchemaReady
+      ? 'settings'
+      : sgEnvFee !== null
+        ? 'env'
+        : 'settings';
 
   return {
     settings,
@@ -982,6 +1122,16 @@ async function evaluateAllPaymentMethods(forceHealthRefresh = false) {
         issue: stripeIssues || undefined,
         lastCheckoutError: lastStripeCheckoutDiagnostic
       },
+      singaporeShipping: {
+        configured: sgConfigured,
+        feeCents: sgConfigured ? settings.deliveryRateSingaporeCents : null,
+        source: sgSource,
+        issue: sgConfigured
+          ? supabase.countryPricingSchemaReady === false
+            ? 'Run supabase/migrations/002_country_based_pricing.sql in Supabase SQL Editor to persist Singapore (SGD) orders.'
+            : undefined
+          : 'Singapore delivery fee is not configured. Set a Singapore Delivery Fee (SGD) in Store & Payment Settings or SG_SHIPPING_FEE_CENTS on the server.'
+      },
       email: emailInfo,
       supabase
     }
@@ -991,12 +1141,21 @@ async function evaluateAllPaymentMethods(forceHealthRefresh = false) {
 function getPublicStorefrontConfig(settings: EditableStoreSettings) {
   const digits = settings.whatsappSupportNumber.replace(/\D/g, '');
   const whatsappUrl = digits.length >= 8 ? `https://wa.me/${digits}` : null;
+  const singaporeShippingConfigured =
+    typeof settings.deliveryRateSingaporeCents === 'number' &&
+    Number.isInteger(settings.deliveryRateSingaporeCents) &&
+    settings.deliveryRateSingaporeCents >= 0;
   return {
     logoUrl: settings.logoUrl,
     heroImageUrl: settings.heroImageUrl,
     productImages: settings.productImages,
     galleryItems: settings.galleryItems,
     deliveryRatesSen: settings.deliveryRatesSen,
+    deliveryRateSingaporeCents: singaporeShippingConfigured
+      ? settings.deliveryRateSingaporeCents
+      : null,
+    singaporeShippingConfigured,
+    marketPricing: buildMarketPricingConfig(settings.sgProductPricesCents),
     whatsappSupportNumber: digits,
     whatsappUrl,
     deliveryPromiseText: DELIVERY_PROMISE_TEXT
@@ -1099,7 +1258,20 @@ function sanitizeDisplayFilename(raw: unknown, fallbackBase: string, fallbackExt
 function buildConfirmationEmailContent(order: OrderRow, originUrl: string) {
   const orderLink = `${originUrl}/?order=${encodeURIComponent(order.reference)}&token=${encodeURIComponent(order.access_token)}`;
   const methodLabel = getPaymentMethodDisplayLabel(order.payment_method) || 'Confirmed payment';
-  const totalPaid = formatRM(order.total_sen);
+  const deliveryCountry = getOrderDeliveryCountry(order);
+  const currency = getOrderCurrency(order);
+  const countryLabel = formatCountryLabel(deliveryCountry);
+  const subtotalText = formatCurrencyAmount(order.subtotal_sen, currency);
+  const deliveryFeeText = formatCurrencyAmount(order.delivery_fee_sen, currency);
+  const savingsText =
+    order.savings_sen && order.savings_sen > 0
+      ? formatCurrencyAmount(order.savings_sen, currency)
+      : null;
+  const totalPaid = formatCurrencyWithCode(order.total_sen, currency);
+  const deliveryAddress =
+    deliveryCountry === 'SG'
+      ? `${order.customer_address}, Singapore ${order.customer_postcode}`
+      : `${order.customer_address}, ${order.customer_postcode} ${order.customer_city}, ${order.customer_state}, Malaysia`;
   const subject = `Order Confirmed — Little Pixel Keepsakes (${order.reference})`;
 
   const text = [
@@ -1108,7 +1280,13 @@ function buildConfirmationEmailContent(order: OrderRow, originUrl: string) {
     `Hi ${order.customer_full_name},`,
     '',
     `Order Reference: ${order.reference}`,
+    `Delivery Country: ${countryLabel}`,
+    `Delivery Address: ${deliveryAddress}`,
+    `Currency: ${currency}`,
     `Items: ${order.product_name} (Qty ${order.item_quantity})`,
+    `Items Subtotal: ${subtotalText}`,
+    ...(savingsText ? [`Bundle Savings (20% off): - ${savingsText}`] : []),
+    `Delivery Fee: ${deliveryFeeText}`,
     `Total Paid: ${totalPaid}`,
     `Payment Method: ${methodLabel}`,
     '',
@@ -1125,8 +1303,14 @@ function buildConfirmationEmailContent(order: OrderRow, originUrl: string) {
       <p style="font-size: 14px; line-height: 1.6; margin: 0 0 16px;">Hi ${escapeHtml(order.customer_full_name)},</p>
       <div style="background: #FFFFFF; border: 1px solid rgba(20,35,60,0.12); border-radius: 12px; padding: 16px; margin-bottom: 16px;">
         <p style="margin: 0 0 8px; font-size: 13px;"><strong>Order Reference:</strong> <span style="font-family: monospace;">${escapeHtml(order.reference)}</span></p>
+        <p style="margin: 0 0 8px; font-size: 13px;"><strong>Delivery Country:</strong> ${escapeHtml(countryLabel)}</p>
+        <p style="margin: 0 0 8px; font-size: 13px;"><strong>Delivery Address:</strong> ${escapeHtml(deliveryAddress)}</p>
+        <p style="margin: 0 0 8px; font-size: 13px;"><strong>Currency:</strong> ${escapeHtml(currency)}</p>
         <p style="margin: 0 0 8px; font-size: 13px;"><strong>Items:</strong> ${escapeHtml(order.product_name)} (Qty ${order.item_quantity})</p>
-        <p style="margin: 0 0 8px; font-size: 13px;"><strong>Total Paid:</strong> ${escapeHtml(totalPaid)}</p>
+        <p style="margin: 0 0 8px; font-size: 13px;"><strong>Items Subtotal:</strong> ${escapeHtml(subtotalText)}</p>
+        ${savingsText ? `<p style="margin: 0 0 8px; font-size: 13px; color: #047857;"><strong>Bundle Savings (20% off):</strong> - ${escapeHtml(savingsText)}</p>` : ''}
+        <p style="margin: 0 0 8px; font-size: 13px;"><strong>Delivery Fee:</strong> ${escapeHtml(deliveryFeeText)}</p>
+        <p style="margin: 0 0 8px; font-size: 14px;"><strong>Total Paid:</strong> ${escapeHtml(totalPaid)}</p>
         <p style="margin: 0; font-size: 13px;"><strong>Payment Method:</strong> ${escapeHtml(methodLabel)}</p>
       </div>
       <p style="font-size: 14px; line-height: 1.6; margin: 0 0 20px; font-weight: 600;">${escapeHtml(DELIVERY_PROMISE_TEXT)}</p>
@@ -1456,80 +1640,104 @@ export function createApiApp(): express.Express {
           return res.json({ received: true, ignored: 'invalid_reference' });
         }
 
-        const order = await fetchOrderByReference(reference);
-        if (!order) {
-          return res.json({ received: true, ignored: 'order_not_found' });
-        }
-
-        // Already confirmed Paid — idempotent no-op (never sends a duplicate confirmation email)
-        if (order.payment_status === 'Paid') {
-          return res.json({ received: true, duplicate: true });
-        }
-
-        // Strictly verify this Stripe session was created by this server for this exact order
-        const paymentRow = await fetchPaymentByStripeSessionId(session.id);
-        const sessionMatchesOrder = Boolean(
-          paymentRow &&
-            paymentRow.order_id === order.id &&
-            paymentRow.payment_method === 'card' &&
-            paymentRow.amount_sen === order.total_sen
-        );
-
-        if (paymentRow?.status === 'paid') {
-          return res.json({ received: true, duplicate: true });
-        }
-
-        const amountTotal = session.amount_total;
-        const currency = (session.currency || '').toLowerCase();
-        const paymentStatus = session.payment_status;
-
-        if (
-          sessionMatchesOrder &&
-          paymentRow &&
-          typeof amountTotal === 'number' &&
-          amountTotal === order.total_sen &&
-          currency === 'myr' &&
-          paymentStatus === 'paid'
-        ) {
-          const paidAt = new Date().toISOString();
-          const paymentIntentId =
-            typeof session.payment_intent === 'string'
-              ? session.payment_intent
-              : session.payment_intent?.id || null;
-
-          await updatePaymentById(paymentRow.id, {
-            status: 'paid',
-            stripe_payment_intent_id: paymentIntentId,
-            stripe_event_id: event.id,
-            paid_at: paidAt
-          });
-
-          const updatedOrder = await updateOrderByReference(reference, {
-            payment_status: 'Paid',
-            payment_method: 'card',
-            paid_at: paidAt,
-            correction_reason: null,
-            last_card_attempt_message: null
-          });
-
-          try {
-            await sendOrderConfirmationEmailOnce(updatedOrder, req);
-          } catch (emailErr) {
-            console.error(`Unexpected confirmation email error for order ${reference}:`, emailErr);
+        return await withOrderLock(reference, async () => {
+          const order = await fetchOrderByReference(reference);
+          if (!order) {
+            return res.json({ received: true, ignored: 'order_not_found' });
           }
-          console.log(`Order ${reference} confirmed Paid via verified Stripe webhook (${event.id}).`);
-          return res.json({ received: true });
-        } else {
-          console.warn(`Stripe webhook mismatch for order ${reference}`, {
-            eventId: event.id,
-            sessionMatchesOrder,
-            expectedAmount: order.total_sen,
-            receivedAmount: amountTotal,
-            receivedCurrency: currency,
-            paymentStatus
-          });
-          return res.json({ received: true, ignored: 'validation_mismatch' });
-        }
+
+          // Already confirmed Paid — idempotent no-op (never sends a duplicate confirmation email)
+          if (order.payment_status === 'Paid') {
+            return res.json({ received: true, duplicate: true });
+          }
+
+          const orderCountry = getOrderDeliveryCountry(order);
+          const expectedCurrencyLower = getOrderCurrency(order).toLowerCase();
+
+          // Strictly verify this Stripe session was created by this server for this exact order, country, currency & amount
+          const paymentRow = await fetchPaymentByStripeSessionId(session.id);
+          if (paymentRow?.status === 'paid') {
+            return res.json({ received: true, duplicate: true });
+          }
+
+          const paymentCurrencyLower = (paymentRow?.currency || '').toLowerCase();
+          const metadataCountry = session.metadata?.deliveryCountry
+            ? normalizeDeliveryCountry(session.metadata.deliveryCountry)
+            : null;
+          const countryMatches = !metadataCountry || metadataCountry === orderCountry;
+
+          const sessionMatchesOrder = Boolean(
+            paymentRow &&
+              paymentRow.order_id === order.id &&
+              paymentRow.payment_method === 'card' &&
+              paymentRow.status !== 'superseded' &&
+              paymentRow.amount_sen === order.total_sen &&
+              paymentCurrencyLower === expectedCurrencyLower &&
+              countryMatches
+          );
+
+          const amountTotal = session.amount_total;
+          const currency = (session.currency || '').toLowerCase();
+          const paymentStatus = session.payment_status;
+
+          if (
+            sessionMatchesOrder &&
+            paymentRow &&
+            typeof amountTotal === 'number' &&
+            amountTotal === order.total_sen &&
+            currency === expectedCurrencyLower &&
+            paymentStatus === 'paid'
+          ) {
+            const paidAt = new Date().toISOString();
+            const paymentIntentId =
+              typeof session.payment_intent === 'string'
+                ? session.payment_intent
+                : session.payment_intent?.id || null;
+
+            const updatedOrder = await updateOrderIfUnpaid(reference, {
+              payment_status: 'Paid',
+              payment_method: 'card',
+              paid_at: paidAt,
+              correction_reason: null,
+              last_card_attempt_message: null
+            });
+
+            if (!updatedOrder) {
+              return res.json({ received: true, duplicate: true });
+            }
+
+            await updatePaymentById(paymentRow.id, {
+              status: 'paid',
+              stripe_payment_intent_id: paymentIntentId,
+              stripe_event_id: event.id,
+              paid_at: paidAt
+            });
+
+            try {
+              await sendOrderConfirmationEmailOnce(updatedOrder, req);
+            } catch (emailErr) {
+              console.error(`Unexpected confirmation email error for order ${reference}:`, emailErr);
+            }
+            console.log(
+              `Order ${reference} (${orderCountry}/${expectedCurrencyLower.toUpperCase()}) confirmed Paid via verified Stripe webhook (${event.id}).`
+            );
+            return res.json({ received: true });
+          } else {
+            console.warn(`Stripe webhook mismatch for order ${reference}`, {
+              eventId: event.id,
+              sessionMatchesOrder,
+              paymentStatusRow: paymentRow?.status,
+              expectedCountry: orderCountry,
+              metadataCountry,
+              expectedCurrency: expectedCurrencyLower,
+              receivedCurrency: currency,
+              expectedAmount: order.total_sen,
+              receivedAmount: amountTotal,
+              paymentStatus
+            });
+            return res.json({ received: true, ignored: 'validation_mismatch' });
+          }
+        });
       }
 
       if (event.type === 'checkout.session.expired' || event.type === 'checkout.session.async_payment_failed') {
@@ -2091,21 +2299,71 @@ export function createApiApp(): express.Express {
   // ============================================================================
   app.post('/api/validate-delivery', async (req, res) => {
     const { settings } = await loadCurrentStoreSettings();
-    const { state } = req.body || {};
-    if (!state || typeof state !== 'string') {
-      return res.status(400).json({ valid: false, error: 'Please select a delivery state.' });
-    }
-    const delivery = getDeliveryConfigForState(state, settings);
-    if (!delivery) {
+    const { country, state, postcode, city, productId, bundleId, currency, quoteOnly } = req.body || {};
+
+    const deliveryCountry = normalizeDeliveryCountry(country);
+    if (!deliveryCountry) {
       return res.status(400).json({
         valid: false,
-        error: 'We currently deliver within Malaysia only. Please select a valid Malaysian state.'
+        code: 'UNSUPPORTED_COUNTRY',
+        error: 'Please select a supported delivery country: Malaysia (MY) or Singapore (SG).'
       });
     }
+
+    const currencyCheck = validateCountryCurrencyPair(deliveryCountry, currency);
+    if (!currencyCheck.valid) {
+      return res.status(400).json({
+        valid: false,
+        code: currencyCheck.code,
+        error: currencyCheck.error
+      });
+    }
+
+    // Validate country-specific postal code & state/city unless caller is only requesting a live country quote
+    if (!quoteOnly || (typeof postcode === 'string' && postcode.trim().length > 0)) {
+      const addrCheck = validateCustomerDeliveryAddress(
+        {
+          country: deliveryCountry,
+          postcode: typeof postcode === 'string' ? postcode : '',
+          city: typeof city === 'string' ? city : deliveryCountry === 'SG' ? 'Singapore' : '',
+          state: typeof state === 'string' ? state : deliveryCountry === 'SG' ? 'Singapore' : ''
+        },
+        { requireContactFields: false }
+      );
+      if (!addrCheck.valid) {
+        return res.status(400).json({
+          valid: false,
+          code: addrCheck.code || 'INVALID_DELIVERY_ADDRESS',
+          error: addrCheck.error || 'Please enter a valid delivery address and postal code.'
+        });
+      }
+    }
+
+    const pricing = calculateAuthoritativeOrderPricing({
+      country: deliveryCountry,
+      productId: typeof productId === 'string' && productId.trim() ? productId : 'keychain',
+      bundleId: typeof bundleId === 'string' ? bundleId : undefined,
+      state: typeof state === 'string' ? state : deliveryCountry === 'SG' ? 'Singapore' : '',
+      deliveryRates: getSettingsDeliveryRatesInput(settings),
+      sgProductPricesCents: settings.sgProductPricesCents
+    });
+
+    if (!pricing.ok) {
+      return res.status(pricing.httpStatus).json({
+        valid: false,
+        code: pricing.code,
+        error: pricing.error
+      });
+    }
+
     return res.json({
       valid: true,
-      zone: delivery.zone,
-      deliveryFeeSen: delivery.rateSen
+      deliveryCountry: pricing.deliveryCountry,
+      currency: pricing.currency,
+      zone: pricing.deliveryZone,
+      deliveryFeeSen: pricing.deliveryFeeMinor,
+      allowedPaymentMethods: pricing.allowedPaymentMethods,
+      pricing: pricing.breakdown
     });
   });
 
@@ -2116,13 +2374,8 @@ export function createApiApp(): express.Express {
     pruneTransientCaches();
 
     try {
-      const { productId, bundleId, uploadSessionToken, photoStoragePath, customer } = req.body || {};
-      const resolvedKey = productId === 'bundle' ? bundleId : productId;
-      const product = typeof resolvedKey === 'string' ? PRODUCT_CONFIG[resolvedKey] : undefined;
-
-      if (!product) {
-        return res.status(400).json({ error: 'Invalid product or bundle selection.' });
-      }
+      const { productId, bundleId, uploadSessionToken, photoStoragePath, customer, currency } =
+        req.body || {};
 
       // Require a cryptographically verified stateless upload session owning the private photo object
       const tokenStr = typeof uploadSessionToken === 'string' ? uploadSessionToken.trim() : '';
@@ -2135,7 +2388,9 @@ export function createApiApp(): express.Express {
         !verifiedSession.path.startsWith(`pending/${verifiedSession.sid}/`)
       ) {
         return res.status(400).json({
-          error: 'Please upload your keepsake photo before creating an order (upload session missing or expired).'
+          error:
+            'Please upload your keepsake photo before creating an order (upload session missing or expired).',
+          code: 'PHOTO_UPLOAD_REQUIRED'
         });
       }
       if (
@@ -2144,123 +2399,297 @@ export function createApiApp(): express.Express {
         !safeEqualStrings(photoStoragePath.trim(), verifiedSession.path)
       ) {
         return res.status(403).json({
-          error: 'Uploaded photo does not match your active checkout session.'
+          error: 'Uploaded photo does not match your active checkout session.',
+          code: 'PHOTO_SESSION_MISMATCH'
         });
       }
 
       if (!customer || typeof customer !== 'object') {
-        return res.status(400).json({ error: 'Customer details are required.' });
+        return res.status(400).json({
+          error: 'Customer and delivery country details are required.',
+          code: 'MISSING_CUSTOMER_DETAILS'
+        });
       }
 
-      const cleanCustomer = {
-        fullName: String(customer.fullName || '').trim().slice(0, 120),
-        email: String(customer.email || '').trim().slice(0, 160),
-        mobile: String(customer.mobile || '').trim().slice(0, 40),
-        address: String(customer.address || '').trim().slice(0, 300),
-        postcode: String(customer.postcode || '').trim().slice(0, 16),
-        city: String(customer.city || '').trim().slice(0, 80),
-        state: String(customer.state || '').trim().slice(0, 60)
-      };
+      // Strictly validate delivery country & country-specific address/postal format on backend
+      const addressCheck = validateCustomerDeliveryAddress(customer, { requireContactFields: true });
+      if (!addressCheck.valid || !addressCheck.normalized) {
+        return res.status(400).json({
+          error: addressCheck.error || 'Please complete all required customer and delivery fields.',
+          code: addressCheck.code || 'INVALID_DELIVERY_ADDRESS'
+        });
+      }
+      const cleanCustomer = addressCheck.normalized;
 
-      if (
-        !cleanCustomer.fullName ||
-        !cleanCustomer.email ||
-        !cleanCustomer.email.includes('@') ||
-        !cleanCustomer.mobile ||
-        !cleanCustomer.address ||
-        !cleanCustomer.postcode ||
-        !cleanCustomer.city ||
-        !cleanCustomer.state
-      ) {
-        return res.status(400).json({ error: 'Please complete all required customer and delivery fields.' });
+      // Reject unsupported or mismatched currency selections (never trust frontend currency/prices)
+      const currencyCheck = validateCountryCurrencyPair(cleanCustomer.country, currency);
+      if (!currencyCheck.valid) {
+        return res.status(400).json({
+          error: currencyCheck.error,
+          code: currencyCheck.code
+        });
       }
 
       const { settings } = await loadCurrentStoreSettings(health);
-      const delivery = getDeliveryConfigForState(cleanCustomer.state, settings);
-      if (!delivery) {
-        return res.status(400).json({ error: 'Invalid Malaysian delivery state.' });
+      const pricing = calculateAuthoritativeOrderPricing({
+        country: cleanCustomer.country,
+        productId,
+        bundleId,
+        state: cleanCustomer.state,
+        deliveryRates: getSettingsDeliveryRatesInput(settings),
+        sgProductPricesCents: settings.sgProductPricesCents
+      });
+
+      if (!pricing.ok) {
+        return res.status(pricing.httpStatus).json({
+          error: pricing.error,
+          code: pricing.code
+        });
       }
-
-      const subtotalSen = product.priceSen;
-      const regularSubtotalSen = product.regularSen ?? null;
-      const savingsSen = regularSubtotalSen ? regularSubtotalSen - subtotalSen : null;
-      const deliveryFeeSen = delivery.rateSen;
-      const totalSen = subtotalSen + deliveryFeeSen;
-
-      const year = new Date().getFullYear();
-      const rand = crypto.randomBytes(4).toString('hex').toUpperCase();
-      const reference = `LPK-${year}-${rand}`;
-      const accessToken = crypto.randomBytes(24).toString('base64url');
 
       const cfg = getSupabaseEnvConfig();
-      const ext = verifiedSession.mime === 'image/png' ? 'png' : 'jpg';
-      const finalPhotoPath = `orders/${reference}/${crypto.randomBytes(6).toString('hex')}.${ext}`;
+      const ext: 'jpg' | 'png' = verifiedSession.mime === 'image/png' ? 'png' : 'jpg';
+      const reference = deriveOrderReferenceForUpload(
+        verifiedSession.sid,
+        verifiedSession.path,
+        verifiedSession.iat
+      );
+      const finalPhotoPath = deriveOrderPhotoPathForUpload(
+        reference,
+        verifiedSession.sid,
+        verifiedSession.path,
+        ext
+      );
 
-      // Atomically move photo from pending/ into its permanent order-scoped private path (also prevents replay)
-      try {
-        await movePrivateFile({
-          bucket: cfg.photosBucket,
-          fromPath: verifiedSession.path,
-          toPath: finalPhotoPath
+      return await withOrderLock(`create-order:${reference}`, async () => {
+        const tryResumeExistingOrder = async () => {
+          const existing = await fetchHydratedOrderByReference(reference);
+          if (!existing) return null;
+
+          // Cryptographic photo ownership verification: ensure this exact verified upload created this order
+          if (!safeEqualStrings(existing.order.photo_storage_path, finalPhotoPath)) {
+            return res.status(409).json({
+              error:
+                'This uploaded photo has already been used for another order. Please upload a new photo.',
+              code: 'PHOTO_ALREADY_USED'
+            });
+          }
+
+          // Enforce single-use photo protection: block claiming an existing order's photo for a different order
+          const sameProduct =
+            existing.order.product_id === pricing.productId &&
+            (existing.order.bundle_id || null) === (pricing.bundleId || null);
+          const sameCustomerEmail =
+            existing.order.customer_email.trim().toLowerCase() ===
+            cleanCustomer.email.trim().toLowerCase();
+
+          // Pending file can be cleaned up best-effort now that the order row is confirmed in Supabase
+          void removePrivateFile(cfg.photosBucket, verifiedSession.path);
+
+          if (!sameProduct || !sameCustomerEmail) {
+            return res.status(409).json({
+              error:
+                'This uploaded photo was already used for an existing order. Please upload a new photo to place another order.',
+              code: 'PHOTO_ALREADY_USED'
+            });
+          }
+
+          // If the order is still awaiting payment and the customer updated delivery country/address before retrying,
+          // recalculate authoritative pricing & invalidate open Stripe sessions cleanly in place.
+          const existingCountry = getOrderDeliveryCountry(existing.order);
+          const existingCurrency = getOrderCurrency(existing.order);
+          const deliveryChanged =
+            existingCountry !== pricing.deliveryCountry ||
+            existingCurrency !== pricing.currency ||
+            existing.order.total_sen !== pricing.totalMinor ||
+            existing.order.customer_full_name !== cleanCustomer.fullName ||
+            existing.order.customer_mobile !== cleanCustomer.mobile ||
+            existing.order.customer_address !== cleanCustomer.address ||
+            existing.order.customer_postcode !== cleanCustomer.postcode ||
+            existing.order.customer_city !== cleanCustomer.city ||
+            existing.order.customer_state !== cleanCustomer.state;
+
+          if (existing.order.payment_status === 'Awaiting payment' && deliveryChanged) {
+            const countryOrTotalChanged =
+              existingCountry !== pricing.deliveryCountry ||
+              existingCurrency !== pricing.currency ||
+              existing.order.total_sen !== pricing.totalMinor;
+
+            if (countryOrTotalChanged) {
+              const stripeInfo = getStripeConfig(health);
+              const expiryResult = await expireOpenStripeSessionsForOrder(
+                existing.order,
+                stripeInfo.client
+              );
+              if (expiryResult.alreadyPaid) {
+                return res.json({
+                  success: true,
+                  resumed: true,
+                  order: toPublicOrder(existing, buildCustomerAuthorizedPhotoUrl(existing.order))
+                });
+              }
+            }
+
+            let updatedOrder: OrderRow | null;
+            try {
+              updatedOrder = await updateOrderIfUnpaid(reference, {
+                delivery_country: pricing.deliveryCountry,
+                currency: pricing.currency,
+                pricing_breakdown: pricing.breakdown,
+                subtotal_sen: pricing.subtotalMinor,
+                regular_subtotal_sen: pricing.regularSubtotalMinor,
+                savings_sen: pricing.savingsMinor,
+                delivery_fee_sen: pricing.deliveryFeeMinor,
+                total_sen: pricing.totalMinor,
+                customer_full_name: cleanCustomer.fullName,
+                customer_email: cleanCustomer.email,
+                customer_mobile: cleanCustomer.mobile,
+                customer_address: cleanCustomer.address,
+                customer_postcode: cleanCustomer.postcode,
+                customer_city: cleanCustomer.city,
+                customer_state: cleanCustomer.state,
+                payment_method:
+                  existingCountry !== pricing.deliveryCountry ? null : existing.order.payment_method,
+                last_card_attempt_message: null,
+                correction_reason:
+                  existingCountry !== pricing.deliveryCountry
+                    ? null
+                    : existing.order.correction_reason
+              });
+            } catch (updateErr) {
+              const updateMsg = sanitizeSupabaseError(updateErr);
+              if (updateMsg.includes('SCHEMA_MIGRATION_REQUIRED')) {
+                return res.status(503).json({
+                  error:
+                    'Database migration 002_country_based_pricing.sql must be executed in Supabase before placing Singapore (SGD) orders.',
+                  code: 'SCHEMA_MIGRATION_REQUIRED'
+                });
+              }
+              throw updateErr;
+            }
+
+            if (updatedOrder) {
+              const reloaded = await fetchHydratedOrderByReference(reference);
+              if (reloaded) {
+                return res.json({
+                  success: true,
+                  resumed: true,
+                  order: toPublicOrder(reloaded, buildCustomerAuthorizedPhotoUrl(reloaded.order))
+                });
+              }
+            }
+          }
+
+          return res.json({
+            success: true,
+            resumed: true,
+            order: toPublicOrder(existing, buildCustomerAuthorizedPhotoUrl(existing.order))
+          });
+        };
+
+        // Step 1: Idempotent resume — if an order was already created for this verified upload session
+        // (e.g. double click or retry after a network timeout), securely resume it without creating a duplicate.
+        const existingResponse = await tryResumeExistingOrder();
+        if (existingResponse) return existingResponse;
+
+        // Step 2: Copy pending photo NON-DESTRUCTIVELY into its permanent order-scoped private path.
+        // Keeping pending/ intact until the database insert succeeds ensures failed order creation
+        // can be retried safely without losing or prematurely consuming the customer's uploaded photo.
+        try {
+          await copyPrivateFile({
+            bucket: cfg.photosBucket,
+            fromPath: verifiedSession.path,
+            toPath: finalPhotoPath
+          });
+        } catch (copyErr) {
+          // Cross-instance serverless race check: another invocation may have just created the order and consumed pending/
+          const raceResume = await tryResumeExistingOrder();
+          if (raceResume) return raceResume;
+
+          console.error('Copy pending photo error:', sanitizeSupabaseError(copyErr));
+          return res.status(400).json({
+            error:
+              'Your uploaded photo could not be found or was already used for another order. Please re-upload your photo.',
+            code: 'PHOTO_MOVE_FAILED'
+          });
+        }
+
+        const accessToken = crypto.randomBytes(24).toString('base64url');
+        let insertedOrder: OrderRow;
+        try {
+          insertedOrder = await insertOrderRow({
+            reference,
+            access_token: accessToken,
+            delivery_country: pricing.deliveryCountry,
+            currency: pricing.currency,
+            pricing_breakdown: pricing.breakdown,
+            product_id: pricing.productId,
+            bundle_id: pricing.bundleId,
+            product_name: pricing.productName,
+            item_quantity: pricing.itemQuantity,
+            subtotal_sen: pricing.subtotalMinor,
+            regular_subtotal_sen: pricing.regularSubtotalMinor,
+            savings_sen: pricing.savingsMinor,
+            delivery_fee_sen: pricing.deliveryFeeMinor,
+            total_sen: pricing.totalMinor,
+            photo_storage_bucket: cfg.photosBucket,
+            photo_storage_path: finalPhotoPath,
+            photo_original_filename: verifiedSession.name,
+            photo_mime_type: verifiedSession.mime,
+            photo_size_bytes: verifiedSession.size,
+            customer_full_name: cleanCustomer.fullName,
+            customer_email: cleanCustomer.email,
+            customer_mobile: cleanCustomer.mobile,
+            customer_address: cleanCustomer.address,
+            customer_postcode: cleanCustomer.postcode,
+            customer_city: cleanCustomer.city,
+            customer_state: cleanCustomer.state,
+            payment_status: 'Awaiting payment',
+            payment_method: null,
+            paid_at: null,
+            verified_by_staff: false,
+            verified_by_staff_id: null,
+            verification_note: null,
+            correction_reason: null,
+            last_card_attempt_message: null
+          });
+        } catch (dbErr) {
+          // Cross-instance race: another serverless instance inserted the same deterministic reference concurrently
+          if (isUniqueViolationError(dbErr)) {
+            const concurrentResume = await tryResumeExistingOrder();
+            if (concurrentResume) return concurrentResume;
+          }
+
+          // Safe rollback: remove ONLY the copied order destination; leave verifiedSession.path in pending/ intact!
+          await removePrivateFile(cfg.photosBucket, finalPhotoPath);
+
+          const msg = sanitizeSupabaseError(dbErr);
+          if (msg.includes('SCHEMA_MIGRATION_REQUIRED')) {
+            return res.status(503).json({
+              error:
+                'Database migration 002_country_based_pricing.sql must be executed in Supabase before placing Singapore (SGD) orders.',
+              code: 'SCHEMA_MIGRATION_REQUIRED'
+            });
+          }
+          throw dbErr;
+        }
+
+        // Step 3: ONLY AFTER the order row is durably saved in Supabase, consume the pending upload
+        // so the photo remains single-use and cannot be claimed by another order.
+        await removePrivateFile(cfg.photosBucket, verifiedSession.path);
+
+        const hydrated: HydratedOrder = {
+          order: insertedOrder,
+          latestPayment: null,
+          latestReceiptPayment: null,
+          confirmationEmail: null
+        };
+
+        return res.json({
+          success: true,
+          resumed: false,
+          order: toPublicOrder(hydrated, buildCustomerAuthorizedPhotoUrl(insertedOrder))
         });
-      } catch (moveErr) {
-        console.error('Move pending photo error:', sanitizeSupabaseError(moveErr));
-        return res.status(400).json({
-          error: 'Your uploaded photo could not be found or was already used for another order. Please re-upload your photo.'
-        });
-      }
-
-      let insertedOrder: OrderRow;
-      try {
-        insertedOrder = await insertOrderRow({
-          reference,
-          access_token: accessToken,
-          product_id: productId,
-          bundle_id: productId === 'bundle' ? bundleId : null,
-          product_name: product.name,
-          item_quantity: productId === 'bundle' ? 2 : 1,
-          subtotal_sen: subtotalSen,
-          regular_subtotal_sen: regularSubtotalSen,
-          savings_sen: savingsSen,
-          delivery_fee_sen: deliveryFeeSen,
-          total_sen: totalSen,
-          photo_storage_bucket: cfg.photosBucket,
-          photo_storage_path: finalPhotoPath,
-          photo_original_filename: verifiedSession.name,
-          photo_mime_type: verifiedSession.mime,
-          photo_size_bytes: verifiedSession.size,
-          customer_full_name: cleanCustomer.fullName,
-          customer_email: cleanCustomer.email,
-          customer_mobile: cleanCustomer.mobile,
-          customer_address: cleanCustomer.address,
-          customer_postcode: cleanCustomer.postcode,
-          customer_city: cleanCustomer.city,
-          customer_state: cleanCustomer.state,
-          payment_status: 'Awaiting payment',
-          payment_method: null,
-          paid_at: null,
-          verified_by_staff: false,
-          verified_by_staff_id: null,
-          verification_note: null,
-          correction_reason: null,
-          last_card_attempt_message: null
-        });
-      } catch (dbErr) {
-        // Roll back moved file if DB insert failed
-        void removePrivateFile(cfg.photosBucket, finalPhotoPath);
-        throw dbErr;
-      }
-
-      const hydrated: HydratedOrder = {
-        order: insertedOrder,
-        latestPayment: null,
-        latestReceiptPayment: null,
-        confirmationEmail: null
-      };
-
-      return res.json({
-        success: true,
-        order: toPublicOrder(hydrated, buildCustomerAuthorizedPhotoUrl(insertedOrder))
       });
     } catch (err) {
       console.error('Order creation error:', sanitizeSupabaseError(err));
@@ -2269,7 +2698,7 @@ export function createApiApp(): express.Express {
   });
 
   // ============================================================================
-  // CUSTOMER AUTHORIZED ORDER STATUS & PRIVATE PHOTO ACCESS
+  // CUSTOMER AUTHORIZED ORDER STATUS, UNPAID DELIVERY COUNTRY UPDATE & PHOTO ACCESS
   // ============================================================================
   app.get('/api/orders/:reference', async (req, res) => {
     const health = await requireSupabaseReady(res);
@@ -2298,6 +2727,193 @@ export function createApiApp(): express.Express {
     } catch (err) {
       console.error(`Failed to fetch order ${reference}:`, sanitizeSupabaseError(err));
       return res.status(500).json({ error: 'Unable to load order from Supabase.' });
+    }
+  });
+
+  // Update delivery country / address on an UNPAID order before payment confirmation.
+  // Invalidates any open Stripe Checkout sessions, guards against concurrent payment confirmation,
+  // recalculates authoritative pricing, and blocks all mutations after payment confirmation.
+  app.patch('/api/orders/:reference/delivery', async (req, res) => {
+    const health = await requireSupabaseReady(res);
+    if (!health) return;
+
+    const { reference } = req.params;
+    if (!ORDER_REF_REGEX.test(reference)) {
+      return res.status(400).json({ error: 'Invalid order reference format.', code: 'INVALID_ORDER_REFERENCE' });
+    }
+
+    try {
+      return await withOrderLock(reference, async () => {
+        const order = await fetchOrderByReference(reference);
+        if (!order) {
+          return res.status(404).json({ error: 'Order not found.', code: 'ORDER_NOT_FOUND' });
+        }
+        if (!isOrderAuthorized(req, order)) {
+          return res.status(403).json({
+            error: 'Valid secure order link token is required to update delivery details.',
+            code: 'ORDER_UNAUTHORIZED'
+          });
+        }
+        if (order.payment_status === 'Paid') {
+          return res.status(409).json({
+            error: 'Delivery country, currency, and pricing cannot be changed after payment confirmation.',
+            code: 'ORDER_LOCKED_AFTER_PAYMENT'
+          });
+        }
+        if (order.payment_status === 'Pending verification') {
+          return res.status(409).json({
+            error: 'Delivery details cannot be changed while a payment receipt is pending verification.',
+            code: 'ORDER_LOCKED_PENDING_VERIFICATION'
+          });
+        }
+
+        const incomingCustomer =
+          req.body?.customer && typeof req.body.customer === 'object' ? req.body.customer : req.body || {};
+        const submittedCurrency = req.body?.currency;
+
+        const mergedCustomerInput = {
+          fullName:
+            typeof incomingCustomer.fullName === 'string' && incomingCustomer.fullName.trim()
+              ? incomingCustomer.fullName
+              : order.customer_full_name,
+          email:
+            typeof incomingCustomer.email === 'string' && incomingCustomer.email.trim()
+              ? incomingCustomer.email
+              : order.customer_email,
+          mobile:
+            typeof incomingCustomer.mobile === 'string' && incomingCustomer.mobile.trim()
+              ? incomingCustomer.mobile
+              : order.customer_mobile,
+          address:
+            typeof incomingCustomer.address === 'string'
+              ? incomingCustomer.address
+              : order.customer_address,
+          postcode:
+            typeof incomingCustomer.postcode === 'string'
+              ? incomingCustomer.postcode
+              : order.customer_postcode,
+          city:
+            typeof incomingCustomer.city === 'string' ? incomingCustomer.city : order.customer_city,
+          state:
+            typeof incomingCustomer.state === 'string' ? incomingCustomer.state : order.customer_state,
+          country: incomingCustomer.country
+        };
+
+        const addressCheck = validateCustomerDeliveryAddress(mergedCustomerInput, {
+          requireContactFields: true
+        });
+        if (!addressCheck.valid || !addressCheck.normalized) {
+          return res.status(400).json({
+            error: addressCheck.error || 'Please enter a valid delivery address and postal code.',
+            code: addressCheck.code || 'INVALID_DELIVERY_ADDRESS'
+          });
+        }
+        const cleanCustomer = addressCheck.normalized;
+
+        const currencyCheck = validateCountryCurrencyPair(cleanCustomer.country, submittedCurrency);
+        if (!currencyCheck.valid) {
+          return res.status(400).json({
+            error: currencyCheck.error,
+            code: currencyCheck.code
+          });
+        }
+
+        const { settings } = await loadCurrentStoreSettings(health);
+        const pricing = calculateAuthoritativeOrderPricing({
+          country: cleanCustomer.country,
+          productId: order.product_id,
+          bundleId: order.bundle_id,
+          state: cleanCustomer.state,
+          deliveryRates: getSettingsDeliveryRatesInput(settings),
+          sgProductPricesCents: settings.sgProductPricesCents
+        });
+
+        if (!pricing.ok) {
+          return res.status(pricing.httpStatus).json({
+            error: pricing.error,
+            code: pricing.code
+          });
+        }
+
+        const previousCountry = getOrderDeliveryCountry(order);
+        const previousCurrency = getOrderCurrency(order);
+        const previousTotal = order.total_sen;
+        const countryChanged = previousCountry !== pricing.deliveryCountry;
+        const totalChanged =
+          previousTotal !== pricing.totalMinor || previousCurrency !== pricing.currency;
+
+        // Expire any open Stripe Checkout sessions before mutating delivery country/currency/total.
+        // If an existing session was already paid concurrently, block the change cleanly!
+        const stripeInfo = getStripeConfig(health);
+        let expiredStripeSessions = 0;
+        if (countryChanged || totalChanged) {
+          const expiryResult = await expireOpenStripeSessionsForOrder(order, stripeInfo.client);
+          if (expiryResult.alreadyPaid) {
+            return res.status(409).json({
+              error:
+                'A card payment for this order has already been completed and is being confirmed. Delivery country and pricing can no longer be changed.',
+              code: 'PAYMENT_ALREADY_COMPLETED'
+            });
+          }
+          expiredStripeSessions = expiryResult.expiredCount;
+        }
+
+        const updated = await updateOrderIfUnpaid(reference, {
+          delivery_country: pricing.deliveryCountry,
+          currency: pricing.currency,
+          pricing_breakdown: pricing.breakdown,
+          subtotal_sen: pricing.subtotalMinor,
+          regular_subtotal_sen: pricing.regularSubtotalMinor,
+          savings_sen: pricing.savingsMinor,
+          delivery_fee_sen: pricing.deliveryFeeMinor,
+          total_sen: pricing.totalMinor,
+          customer_full_name: cleanCustomer.fullName,
+          customer_email: cleanCustomer.email,
+          customer_mobile: cleanCustomer.mobile,
+          customer_address: cleanCustomer.address,
+          customer_postcode: cleanCustomer.postcode,
+          customer_city: cleanCustomer.city,
+          customer_state: cleanCustomer.state,
+          payment_method: countryChanged ? null : order.payment_method,
+          last_card_attempt_message: null,
+          correction_reason: countryChanged ? null : order.correction_reason
+        });
+
+        if (!updated) {
+          return res.status(409).json({
+            error: 'Delivery country, currency, and pricing cannot be changed after payment confirmation.',
+            code: 'ORDER_LOCKED_AFTER_PAYMENT'
+          });
+        }
+
+        const hydrated = await fetchHydratedOrderByReference(reference);
+        if (!hydrated) {
+          return res.status(500).json({ error: 'Order updated but could not be reloaded.' });
+        }
+
+        return res.json({
+          success: true,
+          countryChanged,
+          totalChanged,
+          expiredStripeSessions,
+          notice: countryChanged || totalChanged ? COUNTRY_UPDATE_NOTICE : null,
+          order: toPublicOrder(hydrated, buildCustomerAuthorizedPhotoUrl(hydrated.order))
+        });
+      });
+    } catch (err) {
+      const msg = sanitizeSupabaseError(err);
+      if (msg.includes('SCHEMA_MIGRATION_REQUIRED')) {
+        return res.status(503).json({
+          error:
+            'Database migration 002_country_based_pricing.sql must be executed in Supabase before switching orders to Singapore (SGD).',
+          code: 'SCHEMA_MIGRATION_REQUIRED'
+        });
+      }
+      console.error(`Update delivery error for ${reference}:`, msg);
+      return res.status(500).json({
+        error: 'Could not update delivery details right now. Please try again.',
+        code: 'DELIVERY_UPDATE_FAILED'
+      });
     }
   });
 
@@ -2405,6 +3021,17 @@ export function createApiApp(): express.Express {
         return res.status(409).json({
           error: 'A payment receipt has already been submitted for this order and is pending verification.',
           code: 'ORDER_PENDING_VERIFICATION'
+        });
+      }
+
+      // Strictly block manual MYR QR payments for Singapore (SGD) orders
+      const orderCountry = getOrderDeliveryCountry(order);
+      const orderCurrency = getOrderCurrency(order);
+      if (orderCountry !== 'MY' || orderCurrency !== 'MYR') {
+        return res.status(400).json({
+          error:
+            'Manual QR payments (Touch ’n Go / Public Bank) are only available for Malaysia (MYR) delivery orders. Please pay by card via Stripe.',
+          code: 'QR_PAYMENT_NOT_ALLOWED_FOR_COUNTRY'
         });
       }
 
@@ -2528,6 +3155,16 @@ export function createApiApp(): express.Express {
         });
       }
 
+      const orderCountry = getOrderDeliveryCountry(order);
+      const orderCurrency = getOrderCurrency(order);
+      if (orderCountry !== 'MY' || orderCurrency !== 'MYR') {
+        return res.status(400).json({
+          error:
+            'Manual QR payments (Touch ’n Go / Public Bank) are only available for Malaysia (MYR) delivery orders. Please pay by card via Stripe.',
+          code: 'QR_PAYMENT_NOT_ALLOWED_FOR_COUNTRY'
+        });
+      }
+
       const cleanTxRef = typeof transactionReference === 'string' ? transactionReference.trim() : '';
       if (cleanTxRef.length < 3 || cleanTxRef.length > 100) {
         return res.status(400).json({
@@ -2579,6 +3216,7 @@ export function createApiApp(): express.Express {
         await insertPaymentRow({
           order_id: order.id,
           order_reference: order.reference,
+          delivery_country: 'MY',
           payment_method: intent.method,
           status: 'pending_verification',
           amount_sen: order.total_sen,
@@ -2657,6 +3295,16 @@ export function createApiApp(): express.Express {
         });
       }
 
+      const orderCountry = getOrderDeliveryCountry(order);
+      const orderCurrency = getOrderCurrency(order);
+      if (orderCountry !== 'MY' || orderCurrency !== 'MYR') {
+        return res.status(400).json({
+          error:
+            'Manual QR payments (Touch ’n Go / Public Bank) are only available for Malaysia (MYR) delivery orders. Please pay by card via Stripe.',
+          code: 'QR_PAYMENT_NOT_ALLOWED_FOR_COUNTRY'
+        });
+      }
+
       if (paymentMethod !== 'tng' && paymentMethod !== 'duitnow') {
         return res.status(400).json({ error: 'Please select a valid manual QR payment method.' });
       }
@@ -2724,6 +3372,7 @@ export function createApiApp(): express.Express {
         await insertPaymentRow({
           order_id: order.id,
           order_reference: order.reference,
+          delivery_country: 'MY',
           payment_method: qrMethod,
           status: 'pending_verification',
           amount_sen: order.total_sen,
@@ -2772,7 +3421,7 @@ export function createApiApp(): express.Express {
   });
 
   // ============================================================================
-  // STRIPE CHECKOUT SESSION
+  // STRIPE CHECKOUT SESSION (Country & Currency Enforced, Fixed Pricing, No Auto FX)
   // ============================================================================
   app.post('/api/create-stripe-session', async (req, res) => {
     const health = await requireSupabaseReady(res);
@@ -2812,283 +3461,334 @@ export function createApiApp(): express.Express {
       });
     }
 
-    let order: OrderRow | null;
-    try {
-      order = await fetchOrderByReference(reference);
-    } catch (dbErr) {
-      const msg = sanitizeSupabaseError(dbErr);
-      clearSupabaseHealthCache();
-      recordStripeCheckoutDiagnostic({
-        stage: 'order_lookup',
-        code: 'SUPABASE_ORDER_LOOKUP_FAILED',
-        mode: stripeInfo.mode,
-        httpStatus: 503,
-        message: msg
-      });
-      return res.status(503).json({
-        error: 'Unable to load your saved order right now. Please try again.',
-        code: 'SUPABASE_ORDER_LOOKUP_FAILED'
-      });
-    }
-
-    if (!order) {
-      return res.status(404).json({ error: 'Saved order not found.', code: 'ORDER_NOT_FOUND' });
-    }
-    if (!isOrderAuthorized(req, order)) {
-      return res.status(403).json({
-        error: 'Valid secure order link token is required to start card checkout.',
-        code: 'ORDER_UNAUTHORIZED'
-      });
-    }
-    if (order.payment_status === 'Paid') {
-      return res.status(409).json({
-        error: 'This order is already marked as Paid.',
-        code: 'ORDER_ALREADY_PAID'
-      });
-    }
-    if (order.payment_status === 'Pending verification') {
-      return res.status(409).json({
-        error: 'A QR payment receipt is already pending verification for this order.',
-        code: 'ORDER_PENDING_VERIFICATION'
-      });
-    }
-
-    if (
-      !Number.isInteger(order.subtotal_sen) ||
-      order.subtotal_sen < 0 ||
-      !Number.isInteger(order.delivery_fee_sen) ||
-      order.delivery_fee_sen < 0 ||
-      !Number.isInteger(order.total_sen) ||
-      order.subtotal_sen + order.delivery_fee_sen !== order.total_sen ||
-      order.total_sen < 200
-    ) {
-      recordStripeCheckoutDiagnostic({
-        stage: 'config',
-        code: 'INVALID_ORDER_AMOUNT',
-        mode: stripeInfo.mode,
-        httpStatus: 400,
-        message: `Order ${order.reference} has an invalid MYR amount for Stripe Checkout.`
-      });
-      return res.status(400).json({
-        error: 'Order total is invalid for card checkout. Please contact support.',
-        code: 'INVALID_ORDER_AMOUNT'
-      });
-    }
-
-    const originInfo = resolveTrustedOriginInfo(req);
-    const tokenParam = encodeURIComponent(order.access_token);
-    const refParam = encodeURIComponent(order.reference);
-    const successUrl = `${originInfo.origin}/?payment=success&order=${refParam}&token=${tokenParam}`;
-    const cancelUrl = `${originInfo.origin}/?payment=cancelled&order=${refParam}&token=${tokenParam}`;
-
-    try {
-      const parsedSuccess = new URL(successUrl);
-      const parsedCancel = new URL(cancelUrl);
-      if (
-        (parsedSuccess.protocol !== 'https:' && parsedSuccess.protocol !== 'http:') ||
-        (parsedCancel.protocol !== 'https:' && parsedCancel.protocol !== 'http:')
-      ) {
-        throw new Error('Redirect URLs must use https:// or http://.');
+    const stripeClient = stripeInfo.client;
+    return await withOrderLock(reference, async () => {
+      let order: OrderRow | null;
+      try {
+        order = await fetchOrderByReference(reference);
+      } catch (dbErr) {
+        const msg = sanitizeSupabaseError(dbErr);
+        clearSupabaseHealthCache();
+        recordStripeCheckoutDiagnostic({
+          stage: 'order_lookup',
+          code: 'SUPABASE_ORDER_LOOKUP_FAILED',
+          mode: stripeInfo.mode,
+          httpStatus: 503,
+          message: msg
+        });
+        return res.status(503).json({
+          error: 'Unable to load your saved order right now. Please try again.',
+          code: 'SUPABASE_ORDER_LOOKUP_FAILED'
+        });
       }
-    } catch (urlErr) {
-      const msg = sanitizeSensitiveText(urlErr);
-      recordStripeCheckoutDiagnostic({
-        stage: 'redirect_url',
-        code: 'INVALID_REDIRECT_URL',
-        mode: stripeInfo.mode,
-        httpStatus: 500,
-        originSource: originInfo.source,
-        message: `Invalid Stripe redirect URL resolved from ${originInfo.source}: ${msg}`
-      });
-      return res.status(500).json({
-        error: 'Checkout redirect URL is misconfigured on the server. Please contact support.',
-        code: 'INVALID_REDIRECT_URL'
-      });
-    }
 
-    let session: Stripe.Checkout.Session;
-    try {
-      session = await stripeInfo.client.checkout.sessions.create({
-        mode: 'payment',
-        allowed_payment_method_types: ['card'],
-        client_reference_id: order.reference,
-        customer_email: order.customer_email,
-        metadata: {
-          orderReference: order.reference,
-          productName: order.product_name,
-          expectedTotalSen: String(order.total_sen)
-        },
-        line_items: [
-          {
-            price_data: {
-              currency: 'myr',
-              product_data: {
-                name: `Little Pixel Keepsakes — ${order.product_name}`,
-                description: `Order Ref: ${order.reference} (Qty: ${order.item_quantity})`
-              },
-              unit_amount: order.subtotal_sen
-            },
-            quantity: 1
+      if (!order) {
+        return res.status(404).json({ error: 'Saved order not found.', code: 'ORDER_NOT_FOUND' });
+      }
+      if (!isOrderAuthorized(req, order)) {
+        return res.status(403).json({
+          error: 'Valid secure order link token is required to start card checkout.',
+          code: 'ORDER_UNAUTHORIZED'
+        });
+      }
+      if (order.payment_status === 'Paid') {
+        return res.status(409).json({
+          error: 'This order is already marked as Paid.',
+          code: 'ORDER_ALREADY_PAID'
+        });
+      }
+      if (order.payment_status === 'Pending verification') {
+        return res.status(409).json({
+          error: 'A QR payment receipt is already pending verification for this order.',
+          code: 'ORDER_PENDING_VERIFICATION'
+        });
+      }
+
+      // Retrieve current store settings & verify delivery country, currency, product price,
+      // bundle discount, shipping charges, and final payable total before opening Stripe
+      const { settings } = await loadCurrentStoreSettings(health);
+      const verified = verifySavedOrderPricingIntegrity({
+        order,
+        deliveryRates: getSettingsDeliveryRatesInput(settings),
+        sgProductPricesCents: settings.sgProductPricesCents
+      });
+
+      if (!verified.valid) {
+        recordStripeCheckoutDiagnostic({
+          stage: 'config',
+          code: verified.code,
+          mode: stripeInfo.mode,
+          httpStatus: verified.httpStatus,
+          message: `Order ${order.reference} failed pricing/currency verification: ${verified.error}`
+        });
+        return res.status(verified.httpStatus).json({
+          error: verified.error,
+          code: verified.code
+        });
+      }
+
+      // Expire any previous open Stripe Checkout sessions and guard against concurrent payment completion
+      try {
+        const expiryResult = await expireOpenStripeSessionsForOrder(order, stripeInfo.client);
+        if (expiryResult.alreadyPaid) {
+          return res.status(409).json({
+            error:
+              'A card payment for this order has already been completed and is being confirmed. Please refresh your order status.',
+            code: 'PAYMENT_ALREADY_COMPLETED'
+          });
+        }
+      } catch (expireErr) {
+        const msg = sanitizeSensitiveText(expireErr);
+        recordStripeCheckoutDiagnostic({
+          stage: 'stripe_api',
+          code: 'STRIPE_PRIOR_SESSION_CHECK_FAILED',
+          mode: stripeInfo.mode,
+          httpStatus: 502,
+          message: msg
+        });
+        return res.status(502).json({
+          error:
+            'Could not verify your previous checkout session status right now. Please wait a moment and try again.',
+          code: 'STRIPE_PRIOR_SESSION_CHECK_FAILED'
+        });
+      }
+
+      const originInfo = resolveTrustedOriginInfo(req);
+      const tokenParam = encodeURIComponent(order.access_token);
+      const refParam = encodeURIComponent(order.reference);
+      const successUrl = `${originInfo.origin}/?payment=success&order=${refParam}&token=${tokenParam}`;
+      const cancelUrl = `${originInfo.origin}/?payment=cancelled&order=${refParam}&token=${tokenParam}`;
+
+      try {
+        const parsedSuccess = new URL(successUrl);
+        const parsedCancel = new URL(cancelUrl);
+        if (
+          (parsedSuccess.protocol !== 'https:' && parsedSuccess.protocol !== 'http:') ||
+          (parsedCancel.protocol !== 'https:' && parsedCancel.protocol !== 'http:')
+        ) {
+          throw new Error('Redirect URLs must use https:// or http://.');
+        }
+      } catch (urlErr) {
+        const msg = sanitizeSensitiveText(urlErr);
+        recordStripeCheckoutDiagnostic({
+          stage: 'redirect_url',
+          code: 'INVALID_REDIRECT_URL',
+          mode: stripeInfo.mode,
+          httpStatus: 500,
+          originSource: originInfo.source,
+          message: `Invalid Stripe redirect URL resolved from ${originInfo.source}: ${msg}`
+        });
+        return res.status(500).json({
+          error: 'Checkout redirect URL is misconfigured on the server. Please contact support.',
+          code: 'INVALID_REDIRECT_URL'
+        });
+      }
+
+      const stripeCurrency = verified.currency.toLowerCase();
+      const deliveryLabel =
+        verified.deliveryCountry === 'SG'
+          ? 'Delivery (Singapore)'
+          : `Delivery (${verified.expected.deliveryZone}, Malaysia)`;
+
+      let session: Stripe.Checkout.Session;
+      try {
+        session = await stripeClient.checkout.sessions.create({
+          mode: 'payment',
+          allowed_payment_method_types: ['card'],
+          adaptive_pricing: { enabled: false },
+          client_reference_id: order.reference,
+          customer_email: order.customer_email,
+          metadata: {
+            orderReference: order.reference,
+            deliveryCountry: verified.deliveryCountry,
+            currency: verified.currency,
+            productName: order.product_name,
+            expectedSubtotalMinor: String(order.subtotal_sen),
+            expectedDeliveryFeeMinor: String(order.delivery_fee_sen),
+            expectedTotalMinor: String(order.total_sen),
+            expectedTotalSen: String(order.total_sen)
           },
-          {
-            price_data: {
-              currency: 'myr',
-              product_data: {
-                name: `Delivery (${order.customer_state})`,
-                description: DELIVERY_PROMISE_TEXT
+          line_items: [
+            {
+              price_data: {
+                currency: stripeCurrency,
+                product_data: {
+                  name: `Little Pixel Keepsakes — ${order.product_name}`,
+                  description: `Order Ref: ${order.reference} (Qty: ${order.item_quantity} · ${COUNTRY_LABELS[verified.deliveryCountry]})`
+                },
+                unit_amount: order.subtotal_sen
               },
-              unit_amount: order.delivery_fee_sen
+              quantity: 1
             },
-            quantity: 1
-          }
-        ],
-        success_url: successUrl,
-        cancel_url: cancelUrl
-      });
-    } catch (stripeErr: any) {
-      const stripeType = typeof stripeErr?.type === 'string' ? stripeErr.type : undefined;
-      const stripeCode =
-        typeof stripeErr?.code === 'string'
-          ? stripeErr.code
-          : typeof stripeErr?.raw?.code === 'string'
-            ? stripeErr.raw.code
-            : undefined;
-      const rawMessage = sanitizeSensitiveText(stripeErr?.message || stripeErr || 'Stripe API call failed');
+            {
+              price_data: {
+                currency: stripeCurrency,
+                product_data: {
+                  name: deliveryLabel,
+                  description: DELIVERY_PROMISE_TEXT
+                },
+                unit_amount: order.delivery_fee_sen
+              },
+              quantity: 1
+            }
+          ],
+          success_url: successUrl,
+          cancel_url: cancelUrl
+        });
+      } catch (stripeErr: any) {
+        const stripeType = typeof stripeErr?.type === 'string' ? stripeErr.type : undefined;
+        const stripeCode =
+          typeof stripeErr?.code === 'string'
+            ? stripeErr.code
+            : typeof stripeErr?.raw?.code === 'string'
+              ? stripeErr.raw.code
+              : undefined;
+        const rawMessage = sanitizeSensitiveText(stripeErr?.message || stripeErr || 'Stripe API call failed');
 
-      let httpStatus = 502;
-      let code = 'STRIPE_API_ERROR';
-      let customerError =
-        'Unable to initiate Stripe card checkout right now. You can retry or choose a QR payment method.';
+        let httpStatus = 502;
+        let code = 'STRIPE_API_ERROR';
+        let customerError =
+          verified.deliveryCountry === 'MY'
+            ? 'Unable to initiate Stripe card checkout right now. You can retry or choose a QR payment method.'
+            : 'Unable to initiate Stripe card checkout right now. Please try again in a moment.';
 
-      if (stripeType === 'StripeAuthenticationError' || stripeErr?.statusCode === 401) {
-        httpStatus = 503;
-        code = 'STRIPE_AUTH_ERROR';
-        customerError =
-          'Card payments are temporarily unavailable due to a payment gateway credential issue. Please choose a QR payment method or contact support.';
-      } else if (stripeType === 'StripePermissionError' || stripeErr?.statusCode === 403) {
-        httpStatus = 503;
-        code = 'STRIPE_PERMISSION_ERROR';
-        customerError =
-          'Card payments are temporarily unavailable due to a payment gateway permission configuration issue. Please choose a QR payment method or contact support.';
-      } else if (
-        stripeType === 'StripeConnectionError' ||
-        stripeCode === 'ETIMEDOUT' ||
-        stripeCode === 'ECONNRESET' ||
-        stripeCode === 'ENOTFOUND' ||
-        /timeout|timed out|socket hang up|network/i.test(rawMessage)
-      ) {
-        httpStatus = 504;
-        code = 'STRIPE_CONNECTION_ERROR';
-        customerError =
-          'Could not reach Stripe Checkout right now. Please wait a moment and try again, or choose a QR payment method.';
-      } else if (stripeType === 'StripeRateLimitError' || stripeErr?.statusCode === 429) {
-        httpStatus = 429;
-        code = 'STRIPE_RATE_LIMIT';
-        customerError =
-          'Card checkout is busy right now. Please wait a few seconds and try again, or use a QR payment method.';
-      } else if (stripeType === 'StripeInvalidRequestError' || stripeErr?.statusCode === 400) {
-        httpStatus = 502;
-        code = 'STRIPE_INVALID_REQUEST';
-        customerError =
-          'Unable to start Stripe card checkout due to a checkout configuration error. Please try a QR payment method or contact support.';
+        if (stripeType === 'StripeAuthenticationError' || stripeErr?.statusCode === 401) {
+          httpStatus = 503;
+          code = 'STRIPE_AUTH_ERROR';
+          customerError =
+            'Card payments are temporarily unavailable due to a payment gateway credential issue. Please try again later or contact support.';
+        } else if (stripeType === 'StripePermissionError' || stripeErr?.statusCode === 403) {
+          httpStatus = 503;
+          code = 'STRIPE_PERMISSION_ERROR';
+          customerError =
+            'Card payments are temporarily unavailable due to a payment gateway permission configuration issue. Please contact support.';
+        } else if (
+          stripeType === 'StripeConnectionError' ||
+          stripeCode === 'ETIMEDOUT' ||
+          stripeCode === 'ECONNRESET' ||
+          stripeCode === 'ENOTFOUND' ||
+          /timeout|timed out|socket hang up|network/i.test(rawMessage)
+        ) {
+          httpStatus = 504;
+          code = 'STRIPE_CONNECTION_ERROR';
+          customerError =
+            'Could not reach Stripe Checkout right now. Please wait a moment and try again.';
+        } else if (stripeType === 'StripeRateLimitError' || stripeErr?.statusCode === 429) {
+          httpStatus = 429;
+          code = 'STRIPE_RATE_LIMIT';
+          customerError =
+            'Card checkout is busy right now. Please wait a few seconds and try again.';
+        } else if (stripeType === 'StripeInvalidRequestError' || stripeErr?.statusCode === 400) {
+          httpStatus = 502;
+          code = 'STRIPE_INVALID_REQUEST';
+          customerError =
+            'Unable to start Stripe card checkout due to a checkout configuration error. Please contact support.';
+        }
+
+        const stripeParam =
+          typeof stripeErr?.param === 'string'
+            ? stripeErr.param
+            : typeof stripeErr?.raw?.param === 'string'
+              ? stripeErr.raw.param
+              : undefined;
+
+        recordStripeCheckoutDiagnostic({
+          stage: 'stripe_api',
+          code,
+          mode: stripeInfo.mode,
+          httpStatus,
+          stripeType,
+          stripeCode,
+          stripeParam,
+          originSource: originInfo.source,
+          message: rawMessage
+        });
+
+        return res.status(httpStatus).json({
+          error: customerError,
+          code
+        });
       }
 
-      const stripeParam =
-        typeof stripeErr?.param === 'string'
-          ? stripeErr.param
-          : typeof stripeErr?.raw?.param === 'string'
-            ? stripeErr.raw.param
-            : undefined;
+      if (!session?.id || !session?.url || !session.url.startsWith('https://')) {
+        recordStripeCheckoutDiagnostic({
+          stage: 'stripe_api',
+          code: 'STRIPE_MISSING_CHECKOUT_URL',
+          mode: stripeInfo.mode,
+          httpStatus: 502,
+          originSource: originInfo.source,
+          message: 'Stripe created a session without a valid HTTPS checkout URL.'
+        });
+        return res.status(502).json({
+          error: 'Stripe did not return a valid checkout URL. Please try again.',
+          code: 'STRIPE_MISSING_CHECKOUT_URL'
+        });
+      }
 
-      recordStripeCheckoutDiagnostic({
-        stage: 'stripe_api',
-        code,
+      try {
+        await insertPaymentRow({
+          order_id: order.id,
+          order_reference: order.reference,
+          delivery_country: verified.deliveryCountry,
+          payment_method: 'card',
+          status: 'pending',
+          amount_sen: order.total_sen,
+          currency: stripeCurrency,
+          transaction_reference: null,
+          receipt_storage_bucket: null,
+          receipt_storage_path: null,
+          receipt_original_filename: null,
+          receipt_mime_type: null,
+          receipt_size_bytes: null,
+          receipt_uploaded_at: null,
+          stripe_session_id: session.id,
+          stripe_payment_intent_id: null,
+          stripe_event_id: null,
+          verified_by_staff: false,
+          verified_by_staff_id: null,
+          verification_note: null,
+          rejection_reason: null,
+          paid_at: null
+        });
+      } catch (saveErr) {
+        const msg = sanitizeSupabaseError(saveErr);
+        recordStripeCheckoutDiagnostic({
+          stage: 'save_payment',
+          code: 'PAYMENT_RECORD_SAVE_FAILED',
+          mode: stripeInfo.mode,
+          httpStatus: 500,
+          originSource: originInfo.source,
+          message: msg
+        });
+        // Best-effort expire orphaned Stripe session so it cannot be paid without a matching DB payment row
+        void stripeClient.checkout.sessions.expire(session.id).catch(() => {});
+        return res.status(500).json({
+          error: 'Unable to record your card checkout session in the database. Please try again.',
+          code: 'PAYMENT_RECORD_SAVE_FAILED'
+        });
+      }
+
+      try {
+        await updateOrderByReference(reference, {
+          last_card_attempt_message: null
+        });
+      } catch (orderUpdateErr) {
+        console.warn(
+          `Non-fatal warning clearing last_card_attempt_message for ${reference}:`,
+          sanitizeSupabaseError(orderUpdateErr)
+        );
+      }
+
+      lastStripeCheckoutDiagnostic = null;
+      return res.json({
+        success: true,
+        url: session.url,
+        sessionId: session.id,
         mode: stripeInfo.mode,
-        httpStatus,
-        stripeType,
-        stripeCode,
-        stripeParam,
-        originSource: originInfo.source,
-        message: rawMessage
+        currency: verified.currency,
+        deliveryCountry: verified.deliveryCountry
       });
-
-      return res.status(httpStatus).json({
-        error: customerError,
-        code
-      });
-    }
-
-    if (!session?.id || !session?.url || !session.url.startsWith('https://')) {
-      recordStripeCheckoutDiagnostic({
-        stage: 'stripe_api',
-        code: 'STRIPE_MISSING_CHECKOUT_URL',
-        mode: stripeInfo.mode,
-        httpStatus: 502,
-        originSource: originInfo.source,
-        message: 'Stripe created a session without a valid HTTPS checkout URL.'
-      });
-      return res.status(502).json({
-        error: 'Stripe did not return a valid checkout URL. Please retry or choose a QR payment method.',
-        code: 'STRIPE_MISSING_CHECKOUT_URL'
-      });
-    }
-
-    try {
-      await insertPaymentRow({
-        order_id: order.id,
-        order_reference: order.reference,
-        payment_method: 'card',
-        status: 'pending',
-        amount_sen: order.total_sen,
-        currency: 'myr',
-        transaction_reference: null,
-        receipt_storage_bucket: null,
-        receipt_storage_path: null,
-        receipt_original_filename: null,
-        receipt_mime_type: null,
-        receipt_size_bytes: null,
-        receipt_uploaded_at: null,
-        stripe_session_id: session.id,
-        stripe_payment_intent_id: null,
-        stripe_event_id: null,
-        verified_by_staff: false,
-        verified_by_staff_id: null,
-        verification_note: null,
-        rejection_reason: null,
-        paid_at: null
-      });
-    } catch (saveErr) {
-      const msg = sanitizeSupabaseError(saveErr);
-      recordStripeCheckoutDiagnostic({
-        stage: 'save_payment',
-        code: 'PAYMENT_RECORD_SAVE_FAILED',
-        mode: stripeInfo.mode,
-        httpStatus: 500,
-        originSource: originInfo.source,
-        message: msg
-      });
-      // Best-effort expire orphaned Stripe session so it cannot be paid without a matching DB payment row
-      void stripeInfo.client.checkout.sessions.expire(session.id).catch(() => {});
-      return res.status(500).json({
-        error:
-          'Unable to record your card checkout session in the database. Please retry or choose a QR payment method.',
-        code: 'PAYMENT_RECORD_SAVE_FAILED'
-      });
-    }
-
-    try {
-      await updateOrderByReference(reference, {
-        last_card_attempt_message: null
-      });
-    } catch (orderUpdateErr) {
-      console.warn(
-        `Non-fatal warning clearing last_card_attempt_message for ${reference}:`,
-        sanitizeSupabaseError(orderUpdateErr)
-      );
-    }
-
-    lastStripeCheckoutDiagnostic = null;
-    return res.json({ success: true, url: session.url, sessionId: session.id, mode: stripeInfo.mode });
+    });
   });
 
   // ============================================================================
@@ -3360,6 +4060,45 @@ export function createApiApp(): express.Express {
         }
       }
 
+      if (incoming.deliveryRateSingaporeCents !== undefined) {
+        if (incoming.deliveryRateSingaporeCents === null) {
+          next.deliveryRateSingaporeCents = null;
+        } else if (
+          typeof incoming.deliveryRateSingaporeCents === 'number' &&
+          Number.isInteger(incoming.deliveryRateSingaporeCents) &&
+          incoming.deliveryRateSingaporeCents >= 0 &&
+          incoming.deliveryRateSingaporeCents <= 100000
+        ) {
+          next.deliveryRateSingaporeCents = incoming.deliveryRateSingaporeCents;
+        } else {
+          return res.status(400).json({
+            error:
+              'Singapore delivery fee must be between S$ 0.00 and S$ 1,000.00, or left blank to disable Singapore shipping.'
+          });
+        }
+      }
+
+      if (incoming.sgProductPricesCents && typeof incoming.sgProductPricesCents === 'object') {
+        const sgKc = incoming.sgProductPricesCents.keychain;
+        const sgMag = incoming.sgProductPricesCents.magnet;
+        if (typeof sgKc === 'number') {
+          if (!Number.isInteger(sgKc) || sgKc < 100 || sgKc > 500000) {
+            return res
+              .status(400)
+              .json({ error: 'Singapore Keychain price must be between S$ 1.00 and S$ 5,000.00.' });
+          }
+          next.sgProductPricesCents.keychain = sgKc;
+        }
+        if (typeof sgMag === 'number') {
+          if (!Number.isInteger(sgMag) || sgMag < 100 || sgMag > 500000) {
+            return res
+              .status(400)
+              .json({ error: 'Singapore Fridge Magnet price must be between S$ 1.00 and S$ 5,000.00.' });
+          }
+          next.sgProductPricesCents.magnet = sgMag;
+        }
+      }
+
       if (typeof incoming.whatsappSupportNumber === 'string') {
         const digits = incoming.whatsappSupportNumber.replace(/\D/g, '').slice(0, 20);
         if (digits && (digits.length < 8 || digits.length > 16)) {
@@ -3612,6 +4351,8 @@ export function createApiApp(): express.Express {
           return res.status(409).json({ error: 'Order is already marked as Paid.' });
         }
         if (
+          getOrderDeliveryCountry(order) !== 'MY' ||
+          getOrderCurrency(order) !== 'MYR' ||
           order.payment_status !== 'Pending verification' ||
           !latestReceiptPayment?.receipt_storage_path ||
           latestReceiptPayment.status !== 'pending_verification' ||
@@ -3620,7 +4361,7 @@ export function createApiApp(): express.Express {
         ) {
           return res.status(400).json({
             error:
-              'Only orders with a submitted TNG or Public Bank QR receipt pending verification can be marked paid by staff.'
+              'Only Malaysia (MYR) orders with a submitted TNG or Public Bank QR receipt pending verification can be marked paid by staff.'
           });
         }
 

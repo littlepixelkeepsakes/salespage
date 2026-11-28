@@ -14,6 +14,7 @@ import {
   CheckCircle2,
   Camera,
   Gift,
+  Globe,
   ArrowLeft,
   AlertCircle,
   ChevronDown,
@@ -27,56 +28,63 @@ import AdminPage from './components/AdminPage';
 import HowItWorksSection from './components/HowItWorksSection';
 import {
   DELIVERY_PROMISE_TEXT,
+  type DeliveryCountry,
   type MerchantPaymentConfig,
+  type OrderCustomer,
+  type OrderPricingBreakdown,
   type OrderPublic,
-  type PublicStorefrontConfig
+  type PaymentMethodKey,
+  type PublicStorefrontConfig,
+  type SupportedCurrency
 } from './types/order';
+import {
+  COUNTRY_LABELS,
+  COUNTRY_UPDATE_NOTICE,
+  CURRENCY_NAMES,
+  MALAYSIAN_STATES,
+  buildMarketPricingConfig,
+  calculateAuthoritativeOrderPricing,
+  formatCountryLabel,
+  formatCurrencyAmount,
+  formatCurrencyWithCode,
+  getAllowedPaymentMethodsForCountry,
+  getCurrencyForCountry,
+  validateCustomerDeliveryAddress
+} from './shared/pricing';
 
 interface ProductOption {
   id: string;
   name: string;
-  priceSen: number;
-  regularSen?: number;
-  savingsSen?: number;
+  priceMinor: number;
+  regularMinor?: number;
+  savingsMinor?: number;
   description: string;
   badge?: string;
 }
 
 interface BundleChoice {
-  id: string;
+  id: 'bundle_2_keychains' | 'bundle_kc_magnet' | 'bundle_2_magnets';
   name: string;
-  priceSen: number;
-  regularSen: number;
-  savingsSen: number;
+  priceMinor: number;
+  regularMinor: number;
+  savingsMinor: number;
   description: string;
 }
 
-const BUNDLE_CHOICES: BundleChoice[] = [
-  {
-    id: 'bundle_2_keychains',
-    name: '2 Keychains',
-    priceSen: 4784,
-    regularSen: 5980,
-    savingsSen: 1196,
-    description: 'Two handmade bead keychains from the same photo. Save RM11.96!'
-  },
-  {
-    id: 'bundle_kc_magnet',
-    name: '1 Keychain + 1 Fridge Magnet',
-    priceSen: 4944,
-    regularSen: 6180,
-    savingsSen: 1236,
-    description: 'One keychain and one fridge magnet from the same photo. Save RM12.36!'
-  },
-  {
-    id: 'bundle_2_magnets',
-    name: '2 Fridge Magnets',
-    priceSen: 5104,
-    regularSen: 6380,
-    savingsSen: 1276,
-    description: 'Two fridge magnets with strong neodymium backing. Save RM12.76!'
-  }
-];
+interface ValidatedDeliveryQuote {
+  deliveryCountry: DeliveryCountry;
+  currency: SupportedCurrency;
+  productName: string;
+  itemQuantity: number;
+  subtotalMinor: number;
+  regularSubtotalMinor: number | null;
+  savingsMinor: number | null;
+  deliveryZone: string;
+  deliveryFeeMinor: number;
+  totalMinor: number;
+  allowedPaymentMethods: PaymentMethodKey[];
+  breakdown: OrderPricingBreakdown;
+}
 
 const DEFAULT_STOREFRONT: PublicStorefrontConfig = {
   logoUrl: '/assets/aistudio/Beaded_heart_keepsakes_logo_4fef68e3.png',
@@ -116,16 +124,13 @@ const DEFAULT_STOREFRONT: PublicStorefrontConfig = {
     peninsular: 800,
     eastMalaysia: 1500
   },
+  deliveryRateSingaporeCents: null,
+  singaporeShippingConfigured: false,
+  marketPricing: buildMarketPricingConfig(),
   whatsappSupportNumber: '',
   whatsappUrl: null,
   deliveryPromiseText: DELIVERY_PROMISE_TEXT
 };
-
-const MALAYSIAN_STATES = [
-  'Johor', 'Kedah', 'Kelantan', 'Melaka', 'Negeri Sembilan', 
-  'Pahang', 'Perak', 'Perlis', 'Pulau Pinang', 'Sabah', 
-  'Sarawak', 'Selangor', 'Terengganu', 'Kuala Lumpur', 'Putrajaya', 'Labuan'
-];
 
 const FAQS = [
   {
@@ -375,7 +380,10 @@ function uploadBinaryWithProgress(params: {
 
 export default function App() {
   const [selectedProductId, setSelectedProductId] = useState<string>('keychain');
-  const [selectedBundleId, setSelectedBundleId] = useState<string>('bundle_kc_magnet');
+  const [selectedBundleId, setSelectedBundleId] = useState<
+    'bundle_2_keychains' | 'bundle_kc_magnet' | 'bundle_2_magnets'
+  >('bundle_kc_magnet');
+  const [browsingCountry, setBrowsingCountry] = useState<DeliveryCountry>('MY');
   const [openFaq, setOpenFaq] = useState<number | null>(0);
 
   // Flow State: 'sales' | 'upload' | 'details' | 'review' | 'payment' | 'admin'
@@ -393,19 +401,23 @@ export default function App() {
   const [uploadedFileInfo, setUploadedFileInfo] = useState<{ name: string; sizeBytes: number } | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const activeUploadIdRef = useRef<number>(0);
+  const orderSubmitLockRef = useRef<boolean>(false);
 
-  // Customer Details State
-  const [customer, setCustomer] = useState({
+  // Customer Details State (delivery country is required and drives pricing/currency/methods)
+  const [customer, setCustomer] = useState<OrderCustomer>({
     fullName: '',
     email: '',
     mobile: '',
     address: '',
     postcode: '',
     city: '',
-    state: 'Selangor'
+    state: 'Selangor',
+    country: 'MY'
   });
 
-  const [deliveryFeeSen, setDeliveryFeeSen] = useState<number>(800);
+  const [validatedQuote, setValidatedQuote] = useState<ValidatedDeliveryQuote | null>(null);
+  const [countryPriceUpdatedNotice, setCountryPriceUpdatedNotice] = useState<boolean>(false);
+  const [updatedTotalReviewed, setUpdatedTotalReviewed] = useState<boolean>(false);
   const [deliveryError, setDeliveryError] = useState<string | null>(null);
   const [calculatingDelivery, setCalculatingDelivery] = useState<boolean>(false);
 
@@ -413,6 +425,7 @@ export default function App() {
   const [submittingOrder, setSubmittingOrder] = useState<boolean>(false);
   const [currentOrder, setCurrentOrder] = useState<OrderPublic | null>(null);
   const [orderError, setOrderError] = useState<string | null>(null);
+  const [orderErrorCode, setOrderErrorCode] = useState<string | null>(null);
   const [loadingOrderRef, setLoadingOrderRef] = useState<boolean>(false);
   const [orderLookupError, setOrderLookupError] = useState<string | null>(null);
   const [paymentReturnNotice, setPaymentReturnNotice] = useState<'success_pending' | 'cancelled' | 'failed' | null>(null);
@@ -517,8 +530,11 @@ export default function App() {
           }
           setSupabaseError(data.supabaseError || null);
           if (data.storefront) {
-            setStorefront(data.storefront);
-            setDeliveryFeeSen(data.storefront.deliveryRatesSen.peninsular);
+            setStorefront({
+              ...DEFAULT_STOREFRONT,
+              ...data.storefront,
+              marketPricing: data.storefront.marketPricing || buildMarketPricingConfig()
+            });
           }
           if (data.merchantConfig) {
             setMerchantConfig(data.merchantConfig);
@@ -529,40 +545,105 @@ export default function App() {
       .finally(() => setMerchantConfigLoading(false));
   }, [fetchOrderByReference]);
 
-  // Products config
+  // Active display country: browsing market on sales/upload; validated delivery country on details/review
+  const activePricingCountry: DeliveryCountry =
+    orderStep === 'details' || orderStep === 'review' ? customer.country : browsingCountry;
+  const activeCurrency: SupportedCurrency = getCurrencyForCountry(activePricingCountry);
+  const activeMarketTable =
+    (storefront.marketPricing || buildMarketPricingConfig())[activePricingCountry];
+
+  const bundleChoices: BundleChoice[] = [
+    {
+      id: 'bundle_2_keychains',
+      name: '2 Keychains',
+      priceMinor: activeMarketTable.bundles.bundle_2_keychains.priceMinor,
+      regularMinor: activeMarketTable.bundles.bundle_2_keychains.regularMinor,
+      savingsMinor: activeMarketTable.bundles.bundle_2_keychains.savingsMinor,
+      description: `Two handmade bead keychains from the same photo. Save ${formatCurrencyAmount(
+        activeMarketTable.bundles.bundle_2_keychains.savingsMinor,
+        activeCurrency
+      )}!`
+    },
+    {
+      id: 'bundle_kc_magnet',
+      name: '1 Keychain + 1 Fridge Magnet',
+      priceMinor: activeMarketTable.bundles.bundle_kc_magnet.priceMinor,
+      regularMinor: activeMarketTable.bundles.bundle_kc_magnet.regularMinor,
+      savingsMinor: activeMarketTable.bundles.bundle_kc_magnet.savingsMinor,
+      description: `One keychain and one fridge magnet from the same photo. Save ${formatCurrencyAmount(
+        activeMarketTable.bundles.bundle_kc_magnet.savingsMinor,
+        activeCurrency
+      )}!`
+    },
+    {
+      id: 'bundle_2_magnets',
+      name: '2 Fridge Magnets',
+      priceMinor: activeMarketTable.bundles.bundle_2_magnets.priceMinor,
+      regularMinor: activeMarketTable.bundles.bundle_2_magnets.regularMinor,
+      savingsMinor: activeMarketTable.bundles.bundle_2_magnets.savingsMinor,
+      description: `Two fridge magnets with strong neodymium backing. Save ${formatCurrencyAmount(
+        activeMarketTable.bundles.bundle_2_magnets.savingsMinor,
+        activeCurrency
+      )}!`
+    }
+  ];
+
+  // Products config dynamically driven by active market pricing
   const products: ProductOption[] = [
     {
       id: 'keychain',
       name: 'Keychain',
-      priceSen: 2990,
-      description: 'Handcrafted bead keychain with secure metal ring. Perfect for bags, keys, and lanyards.',
+      priceMinor: activeMarketTable.products.keychain,
+      description: 'Handcrafted bead keychain with secure metal ring. Perfect for bags, keys, and lanyards.'
     },
     {
       id: 'magnet',
       name: 'Fridge Magnet',
-      priceSen: 3190,
-      description: 'Handcrafted bead magnet with strong neodymium magnet backing for refrigerators and magnetic boards.',
+      priceMinor: activeMarketTable.products.magnet,
+      description: 'Handcrafted bead magnet with strong neodymium magnet backing for refrigerators and magnetic boards.'
     },
     {
       id: 'bundle',
       name: '2-Piece Bundle',
-      priceSen: BUNDLE_CHOICES.find(b => b.id === selectedBundleId)?.priceSen || 4944,
-      regularSen: BUNDLE_CHOICES.find(b => b.id === selectedBundleId)?.regularSen || 6180,
-      savingsSen: BUNDLE_CHOICES.find(b => b.id === selectedBundleId)?.savingsSen || 1236,
+      priceMinor:
+        bundleChoices.find(b => b.id === selectedBundleId)?.priceMinor ||
+        activeMarketTable.bundles.bundle_kc_magnet.priceMinor,
+      regularMinor:
+        bundleChoices.find(b => b.id === selectedBundleId)?.regularMinor ||
+        activeMarketTable.bundles.bundle_kc_magnet.regularMinor,
+      savingsMinor:
+        bundleChoices.find(b => b.id === selectedBundleId)?.savingsMinor ||
+        activeMarketTable.bundles.bundle_kc_magnet.savingsMinor,
       description: 'Save 20% on a pair! Choose 2 keychains, 2 magnets, or a mixed pairing.',
       badge: 'Save 20%'
     }
   ];
 
   const currentProduct = products.find(p => p.id === selectedProductId) || products[0];
-  const activeBundle = BUNDLE_CHOICES.find(b => b.id === selectedBundleId);
+  const activeBundle = bundleChoices.find(b => b.id === selectedBundleId);
 
-  const activePriceSen = selectedProductId === 'bundle' && activeBundle ? activeBundle.priceSen : currentProduct.priceSen;
-  const activeRegularSen = selectedProductId === 'bundle' && activeBundle ? activeBundle.regularSen : undefined;
-  const activeSavingsSen = selectedProductId === 'bundle' && activeBundle ? activeBundle.savingsSen : undefined;
-  const itemQuantity = selectedProductId === 'bundle' ? 2 : 1;
+  const activePriceMinor =
+    selectedProductId === 'bundle' && activeBundle
+      ? activeBundle.priceMinor
+      : currentProduct.priceMinor;
+  const activeRegularMinor =
+    selectedProductId === 'bundle' && activeBundle ? activeBundle.regularMinor : undefined;
+  const activeSavingsMinor =
+    selectedProductId === 'bundle' && activeBundle ? activeBundle.savingsMinor : undefined;
 
-  const formatRM = (sen: number) => `RM ${(sen / 100).toFixed(2)}`;
+  // Live checkout pricing preview (recalculates immediately on delivery country/state change)
+  const liveCheckoutEstimate = calculateAuthoritativeOrderPricing({
+    country: customer.country,
+    productId: selectedProductId,
+    bundleId: selectedProductId === 'bundle' ? selectedBundleId : undefined,
+    state: customer.country === 'MY' ? customer.state : 'Singapore',
+    deliveryRates: {
+      peninsularSen: storefront.deliveryRatesSen.peninsular,
+      eastMalaysiaSen: storefront.deliveryRatesSen.eastMalaysia,
+      singaporeCents: storefront.deliveryRateSingaporeCents
+    },
+    sgProductPricesCents: storefront.marketPricing?.SG?.products
+  });
 
   const scrollToSelector = () => {
     const el = document.getElementById('product-selector');
@@ -572,8 +653,60 @@ export default function App() {
   };
 
   const handleStartOrder = () => {
+    setCustomer(prev => {
+      if (browsingCountry === 'SG') {
+        return {
+          ...prev,
+          country: 'SG',
+          postcode: prev.country !== 'SG' ? '' : prev.postcode,
+          city: 'Singapore',
+          state: 'Singapore'
+        };
+      }
+      return {
+        ...prev,
+        country: 'MY',
+        postcode: prev.country !== 'MY' ? '' : prev.postcode,
+        city: prev.city === 'Singapore' ? '' : prev.city,
+        state: prev.state && prev.state !== 'Singapore' ? prev.state : 'Selangor'
+      };
+    });
+    setValidatedQuote(null);
+    setCountryPriceUpdatedNotice(false);
+    setUpdatedTotalReviewed(false);
+    setDeliveryError(null);
+    setOrderError(null);
+    setOrderErrorCode(null);
     setOrderStep('upload');
     window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const handleDeliveryCountryChange = (nextCountry: DeliveryCountry) => {
+    if (nextCountry === customer.country) return;
+    setCustomer(prev => {
+      if (nextCountry === 'SG') {
+        return {
+          ...prev,
+          country: 'SG',
+          postcode: prev.country === 'MY' ? '' : prev.postcode,
+          city: 'Singapore',
+          state: 'Singapore'
+        };
+      }
+      return {
+        ...prev,
+        country: 'MY',
+        postcode: prev.country === 'SG' ? '' : prev.postcode,
+        city: prev.city === 'Singapore' ? '' : prev.city,
+        state: prev.state && prev.state !== 'Singapore' ? prev.state : 'Selangor'
+      };
+    });
+    setValidatedQuote(null);
+    setDeliveryError(null);
+    setOrderError(null);
+    setOrderErrorCode(null);
+    setCountryPriceUpdatedNotice(true);
+    setUpdatedTotalReviewed(false);
   };
 
   const ensureUploadSession = async (forceNew = false): Promise<string> => {
@@ -920,45 +1053,186 @@ export default function App() {
     setUploadError(null);
   };
 
-  // Validate Delivery & Proceed to Review
+  // Validate Country-Specific Delivery Address & Fetch Authoritative Quote
   const handleValidateDeliveryAndContinue = async (e: React.FormEvent) => {
     e.preventDefault();
-    setCalculatingDelivery(true);
     setDeliveryError(null);
+    setOrderError(null);
 
+    const clientCheck = validateCustomerDeliveryAddress(customer, {
+      requireContactFields: true
+    });
+    if (!clientCheck.valid || !clientCheck.normalized) {
+      setDeliveryError(clientCheck.error || 'Please check your delivery address details.');
+      return;
+    }
+
+    const normalizedCustomer = clientCheck.normalized;
+    const expectedCurrency = getCurrencyForCountry(normalizedCustomer.country);
+
+    setCalculatingDelivery(true);
     try {
       const res = await fetch('/api/validate-delivery', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ state: customer.state })
+        body: JSON.stringify({
+          country: normalizedCustomer.country,
+          state: normalizedCustomer.state,
+          postcode: normalizedCustomer.postcode,
+          city: normalizedCustomer.city,
+          currency: expectedCurrency,
+          productId: selectedProductId,
+          bundleId: selectedProductId === 'bundle' ? selectedBundleId : undefined
+        })
       });
       const parsed = await parseApiJsonResponse<{
         valid?: boolean;
+        deliveryCountry?: DeliveryCountry;
+        currency?: SupportedCurrency;
+        zone?: string;
         deliveryFeeSen?: number;
+        allowedPaymentMethods?: PaymentMethodKey[];
+        pricing?: OrderPricingBreakdown | null;
         error?: string;
       }>(res, 'Failed to validate delivery rate.');
 
-      if (parsed.ok && parsed.data?.valid && typeof parsed.data.deliveryFeeSen === 'number') {
-        setDeliveryFeeSen(parsed.data.deliveryFeeSen);
+      if (
+        parsed.ok &&
+        parsed.data?.valid &&
+        parsed.data.deliveryCountry &&
+        parsed.data.currency &&
+        parsed.data.pricing
+      ) {
+        const breakdown = parsed.data.pricing;
+        const nextQuote: ValidatedDeliveryQuote = {
+          deliveryCountry: parsed.data.deliveryCountry,
+          currency: parsed.data.currency,
+          productName: breakdown.productName,
+          itemQuantity: breakdown.itemQuantity,
+          subtotalMinor: breakdown.unitSubtotalMinor,
+          regularSubtotalMinor: breakdown.regularSubtotalMinor,
+          savingsMinor: breakdown.bundleSavingsMinor,
+          deliveryZone: breakdown.deliveryZone,
+          deliveryFeeMinor: breakdown.deliveryFeeMinor,
+          totalMinor: breakdown.totalMinor,
+          allowedPaymentMethods:
+            parsed.data.allowedPaymentMethods ||
+            getAllowedPaymentMethodsForCountry(parsed.data.deliveryCountry),
+          breakdown
+        };
+
+        setCustomer(normalizedCustomer);
+        setValidatedQuote(nextQuote);
+        if (nextQuote.deliveryCountry !== browsingCountry) {
+          setCountryPriceUpdatedNotice(true);
+          setUpdatedTotalReviewed(false);
+        }
         setCalculatingDelivery(false);
         setOrderStep('review');
         window.scrollTo({ top: 0, behavior: 'smooth' });
       } else {
-        setDeliveryError(parsed.error || 'Invalid delivery state.');
+        setDeliveryError(parsed.error || 'Invalid delivery address or country.');
         setCalculatingDelivery(false);
       }
     } catch {
-      setDeliveryError('Failed to validate delivery rate.');
+      setDeliveryError('Failed to validate delivery rate. Please try again.');
       setCalculatingDelivery(false);
     }
   };
 
-  // Create Order and Proceed to Payment Page
+  // Create Order and Proceed to Payment Page (backend computes authoritative pricing & handles idempotent retries)
   const handleConfirmAndCreateOrder = async () => {
+    if (orderSubmitLockRef.current) return;
+
+    if (countryPriceUpdatedNotice && !updatedTotalReviewed) {
+      setOrderError('Please confirm that you have reviewed the updated total before proceeding to payment.');
+      setOrderErrorCode(null);
+      return;
+    }
+
+    const clientCheck = validateCustomerDeliveryAddress(customer, {
+      requireContactFields: true
+    });
+    if (!clientCheck.valid || !clientCheck.normalized) {
+      setOrderError(clientCheck.error || 'Please verify your delivery address details.');
+      setOrderErrorCode(null);
+      return;
+    }
+
+    orderSubmitLockRef.current = true;
     setSubmittingOrder(true);
     setOrderError(null);
+    setOrderErrorCode(null);
 
     try {
+      const targetCountry = clientCheck.normalized.country;
+      const targetCurrency = getCurrencyForCountry(targetCountry);
+
+      // If an order was already created in this checkout session, securely resume/update it
+      // using its authorised order session instead of creating a duplicate order.
+      if (currentOrder?.reference && currentOrder?.accessToken) {
+        if (currentOrder.paymentStatus !== 'Awaiting payment') {
+          setOrderStep('payment');
+          window.history.replaceState(
+            {},
+            '',
+            `/?order=${encodeURIComponent(currentOrder.reference)}&token=${encodeURIComponent(currentOrder.accessToken)}`
+          );
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+          return;
+        }
+
+        const expectedBundleId = selectedProductId === 'bundle' ? selectedBundleId : undefined;
+        const matchesSameSelection =
+          currentOrder.productId === selectedProductId &&
+          (currentOrder.bundleId || undefined) === expectedBundleId;
+
+        if (matchesSameSelection) {
+          const patchRes = await fetch(
+            `/api/orders/${encodeURIComponent(currentOrder.reference)}/delivery`,
+            {
+              method: 'PATCH',
+              headers: {
+                'Content-Type': 'application/json',
+                'x-order-token': currentOrder.accessToken
+              },
+              body: JSON.stringify({
+                accessToken: currentOrder.accessToken,
+                customer: clientCheck.normalized,
+                currency: targetCurrency
+              })
+            }
+          );
+          const patchParsed = await parseApiJsonResponse<{
+            success?: boolean;
+            order?: OrderPublic;
+            error?: string;
+            code?: string;
+          }>(patchRes, 'Could not update your existing order.');
+
+          if (patchParsed.ok && patchParsed.data?.success && patchParsed.data.order) {
+            const resumedOrder = patchParsed.data.order;
+            setCurrentOrder(resumedOrder);
+            setBrowsingCountry(resumedOrder.deliveryCountry);
+            setCountryPriceUpdatedNotice(false);
+            setUpdatedTotalReviewed(false);
+            setPaymentReturnNotice(null);
+            setOrderStep('payment');
+            window.history.replaceState(
+              {},
+              '',
+              `/?order=${encodeURIComponent(resumedOrder.reference)}&token=${encodeURIComponent(resumedOrder.accessToken)}`
+            );
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+            return;
+          }
+
+          setOrderError(patchParsed.error || 'Could not update your existing order.');
+          setOrderErrorCode(patchParsed.code || null);
+          return;
+        }
+      }
+
       const res = await fetch('/api/create-order', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -967,18 +1241,24 @@ export default function App() {
           bundleId: selectedProductId === 'bundle' ? selectedBundleId : undefined,
           uploadSessionToken,
           photoStoragePath: uploadedPhotoStoragePath,
-          customer
+          customer: clientCheck.normalized,
+          currency: targetCurrency
         })
       });
       const parsed = await parseApiJsonResponse<{
         success?: boolean;
+        resumed?: boolean;
         order?: OrderPublic;
         error?: string;
+        code?: string;
       }>(res, 'Failed to create order.');
 
       if (parsed.ok && parsed.data?.success && parsed.data.order) {
         const createdOrder = parsed.data.order;
         setCurrentOrder(createdOrder);
+        setBrowsingCountry(createdOrder.deliveryCountry);
+        setCountryPriceUpdatedNotice(false);
+        setUpdatedTotalReviewed(false);
         setPaymentReturnNotice(null);
         setUploadSessionToken(null);
         setUploadedPhotoStoragePath(null);
@@ -986,7 +1266,8 @@ export default function App() {
         setUploadStatus('idle');
         setUploadProgress(0);
         setUploadStageLabel('');
-        setSubmittingOrder(false);
+        setOrderError(null);
+        setOrderErrorCode(null);
         setOrderStep('payment');
         window.history.replaceState(
           {},
@@ -995,11 +1276,15 @@ export default function App() {
         );
         window.scrollTo({ top: 0, behavior: 'smooth' });
       } else {
+        // Keep uploadSessionToken & uploadedPhotoStoragePath intact so failed attempts can be retried safely
         setOrderError(parsed.error || 'Failed to create order.');
-        setSubmittingOrder(false);
+        setOrderErrorCode(parsed.code || null);
       }
     } catch {
-      setOrderError('Server error while saving order.');
+      setOrderError('Server error while saving order. Please try again — your uploaded photo is still attached.');
+      setOrderErrorCode(null);
+    } finally {
+      orderSubmitLockRef.current = false;
       setSubmittingOrder(false);
     }
   };
@@ -1011,10 +1296,30 @@ export default function App() {
   }, [currentOrder?.reference, currentOrder?.accessToken, fetchOrderByReference]);
 
   const handleReturnHome = () => {
+    const leavingCompletedOrder = Boolean(currentOrder);
     setOrderStep('sales');
     setCurrentOrder(null);
     setPaymentReturnNotice(null);
     setOrderLookupError(null);
+    setOrderError(null);
+    setOrderErrorCode(null);
+    if (leavingCompletedOrder) {
+      if (photoPreview && photoPreview.startsWith('blob:')) {
+        URL.revokeObjectURL(photoPreview);
+      }
+      setPhotoFile(null);
+      setPhotoPreview(null);
+      setUploadSessionToken(null);
+      setUploadedPhotoStoragePath(null);
+      setUploadedFileInfo(null);
+      setUploadStatus('idle');
+      setUploadProgress(0);
+      setUploadStageLabel('');
+      setUploadError(null);
+      setValidatedQuote(null);
+      setCountryPriceUpdatedNotice(false);
+      setUpdatedTotalReviewed(false);
+    }
     window.history.replaceState({}, '', '/');
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
@@ -1176,12 +1481,52 @@ export default function App() {
 
           {/* Product Selector Section */}
           <section id="product-selector" className="py-16 px-4 sm:px-8 max-w-5xl mx-auto">
-            <div className="text-center space-y-3 mb-12">
+            <div className="text-center space-y-3 mb-10">
               <span className="text-xs font-bold uppercase tracking-widest text-[#FF8D76]">Step 1 of Your Order</span>
               <h2 className="text-3xl sm:text-4xl font-extrabold text-[#14233C]">Choose Your Keepsake Style</h2>
-              <p className="text-[#14233C]/70 max-w-lg mx-auto text-sm sm:text-base">
-                Select your preferred keepsake format. Prices in Malaysian Ringgit (RM).
+              <p className="text-[#14233C]/70 max-w-xl mx-auto text-sm sm:text-base">
+                Select your delivery region to view prices in {CURRENCY_NAMES[activeCurrency]}. Final pricing and currency are always enforced by your verified delivery country at checkout.
               </p>
+
+              {/* Market / Currency Switcher (MYR / SGD) */}
+              <div className="pt-2 flex flex-col items-center gap-2">
+                <div
+                  role="group"
+                  aria-label="Select browsing delivery country and currency"
+                  className="inline-flex items-center gap-1 p-1 rounded-2xl bg-white border border-[#14233C]/15 shadow-sm"
+                >
+                  {(['MY', 'SG'] as const).map(countryCode => {
+                    const isActive = browsingCountry === countryCode;
+                    const curr = getCurrencyForCountry(countryCode);
+                    return (
+                      <button
+                        key={countryCode}
+                        type="button"
+                        onClick={() => setBrowsingCountry(countryCode)}
+                        aria-pressed={isActive}
+                        className={`inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-bold transition-colors ${
+                          isActive
+                            ? 'bg-[#14233C] text-[#FAF6EE]'
+                            : 'text-[#14233C]/75 hover:text-[#14233C] hover:bg-[#FAF6EE]'
+                        }`}
+                      >
+                        <Globe className="w-3.5 h-3.5 shrink-0" />
+                        <span>
+                          {COUNTRY_LABELS[countryCode]} ({curr})
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+                <p className="text-[11px] font-medium text-[#14233C]/65">
+                  {browsingCountry === 'SG'
+                    ? storefront.singaporeShippingConfigured &&
+                      typeof storefront.deliveryRateSingaporeCents === 'number'
+                      ? `Singapore delivery (${formatCurrencyAmount(storefront.deliveryRateSingaporeCents, 'SGD')} shipping) · Stripe Card payment only`
+                      : 'Singapore shipping rate is currently being configured by the shop. Malaysia delivery is available.'
+                    : `Malaysia delivery (${formatCurrencyAmount(storefront.deliveryRatesSen.peninsular, 'MYR')} Peninsular / ${formatCurrencyAmount(storefront.deliveryRatesSen.eastMalaysia, 'MYR')} East MY) · TNG, Public Bank QR & Stripe Card`}
+                </p>
+              </div>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
@@ -1236,12 +1581,14 @@ export default function App() {
                     </div>
 
                     <div className="pt-6 mt-6 border-t border-[#14233C]/10 flex items-baseline justify-between">
-                      <span className="text-xs font-semibold text-[#14233C]/60">Price</span>
+                      <span className="text-xs font-semibold text-[#14233C]/60">Price ({activeCurrency})</span>
                       <div className="text-right">
-                        <span className="text-2xl font-black text-[#14233C]">{formatRM(product.priceSen)}</span>
-                        {product.regularSen && (
-                          <div className="text-xs text-emerald-600 font-bold">
-                            Save {formatRM(product.savingsSen || 0)} (20% OFF)
+                        <span className="text-2xl font-black text-[#14233C] tabular-nums">
+                          {formatCurrencyAmount(product.priceMinor, activeCurrency)}
+                        </span>
+                        {product.regularMinor && (
+                          <div className="text-xs text-emerald-600 font-bold tabular-nums">
+                            Save {formatCurrencyAmount(product.savingsMinor || 0, activeCurrency)} (20% OFF)
                           </div>
                         )}
                       </div>
@@ -1262,7 +1609,7 @@ export default function App() {
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                  {BUNDLE_CHOICES.map((choice) => {
+                  {bundleChoices.map((choice) => {
                     const isBundleSelected = selectedBundleId === choice.id;
                     return (
                       <div
@@ -1285,8 +1632,12 @@ export default function App() {
                         </div>
 
                         <div className="pt-4 mt-4 border-t border-[#14233C]/10 flex items-center justify-between">
-                          <span className="text-xs text-emerald-600 font-bold">Save {formatRM(choice.savingsSen)}</span>
-                          <span className="text-lg font-black text-[#14233C]">{formatRM(choice.priceSen)}</span>
+                          <span className="text-xs text-emerald-600 font-bold tabular-nums">
+                            Save {formatCurrencyAmount(choice.savingsMinor, activeCurrency)}
+                          </span>
+                          <span className="text-lg font-black text-[#14233C] tabular-nums">
+                            {formatCurrencyAmount(choice.priceMinor, activeCurrency)}
+                          </span>
                         </div>
                       </div>
                     );
@@ -1297,7 +1648,9 @@ export default function App() {
 
             <div className="bg-[#14233C] text-[#FAF6EE] rounded-3xl p-6 sm:p-8 shadow-2xl flex flex-col sm:flex-row items-center justify-between gap-6">
               <div className="space-y-2 text-center sm:text-left">
-                <span className="text-xs font-bold text-[#FF8D76] uppercase tracking-wider">Your Keepsake Summary</span>
+                <span className="text-xs font-bold text-[#FF8D76] uppercase tracking-wider">
+                  Your Keepsake Summary · {formatCountryLabel(browsingCountry)}
+                </span>
                 <h3 className="text-2xl font-extrabold">
                   {currentProduct.name} {selectedProductId === 'bundle' && activeBundle ? `(${activeBundle.name})` : ''}
                 </h3>
@@ -1308,12 +1661,16 @@ export default function App() {
 
               <div className="flex flex-col sm:items-end gap-3 w-full sm:w-auto">
                 <div className="text-center sm:text-right">
-                  <span className="text-xs text-[#FAF6EE]/70 block">Item Subtotal</span>
+                  <span className="text-xs text-[#FAF6EE]/70 block">Item Subtotal ({activeCurrency})</span>
                   <div className="flex items-baseline justify-center sm:justify-end gap-2">
-                    {activeRegularSen && (
-                      <span className="text-sm line-through text-[#FAF6EE]/50 font-semibold">{formatRM(activeRegularSen)}</span>
+                    {activeRegularMinor && (
+                      <span className="text-sm line-through text-[#FAF6EE]/50 font-semibold tabular-nums">
+                        {formatCurrencyAmount(activeRegularMinor, activeCurrency)}
+                      </span>
                     )}
-                    <span className="text-3xl font-black text-[#FF8D76]">{formatRM(activePriceSen)}</span>
+                    <span className="text-3xl font-black text-[#FF8D76] tabular-nums">
+                      {formatCurrencyAmount(activePriceMinor, activeCurrency)}
+                    </span>
                   </div>
                 </div>
 
@@ -1560,117 +1917,497 @@ export default function App() {
       {/* CHECKOUT FLOW: DETAILS */}
       {orderStep === 'details' && (
         <div className="py-12 px-4 sm:px-8 max-w-2xl mx-auto space-y-8 animate-fadeIn">
-          <button onClick={() => setOrderStep('upload')} className="text-xs font-bold text-[#14233C] flex items-center gap-1.5">
+          <button
+            type="button"
+            onClick={() => setOrderStep('upload')}
+            className="text-xs font-bold text-[#14233C] flex items-center gap-1.5 hover:text-[#E05A40]"
+          >
             <ArrowLeft className="w-4 h-4" /><span>Back to Photo Upload</span>
           </button>
           <form onSubmit={handleValidateDeliveryAndContinue} className="bg-white rounded-3xl p-6 sm:p-10 shadow-xl border border-[#14233C]/10 space-y-6">
-            <h2 className="text-2xl font-black text-[#14233C]">Customer & Delivery Details</h2>
-            <div className="space-y-4">
-              <div>
-                <label className="text-xs font-bold">Full Name</label>
-                <input type="text" required value={customer.fullName} onChange={e => setCustomer({...customer, fullName: e.target.value})} className="w-full px-4 py-3 rounded-xl bg-[#FAF6EE] border text-sm" />
-              </div>
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="text-xs font-bold">Email</label>
-                  <input type="email" required value={customer.email} onChange={e => setCustomer({...customer, email: e.target.value})} className="w-full px-4 py-3 rounded-xl bg-[#FAF6EE] border text-sm" />
-                </div>
-                <div>
-                  <label className="text-xs font-bold">Mobile Phone</label>
-                  <input type="tel" required value={customer.mobile} onChange={e => setCustomer({...customer, mobile: e.target.value})} className="w-full px-4 py-3 rounded-xl bg-[#FAF6EE] border text-sm" />
-                </div>
-              </div>
-              <div>
-                <label className="text-xs font-bold">Street Address</label>
-                <textarea required rows={2} value={customer.address} onChange={e => setCustomer({...customer, address: e.target.value})} className="w-full px-4 py-3 rounded-xl bg-[#FAF6EE] border text-sm" />
-              </div>
-              <div className="grid grid-cols-3 gap-4">
-                <div>
-                  <label className="text-xs font-bold">Postcode</label>
-                  <input type="text" required value={customer.postcode} onChange={e => setCustomer({...customer, postcode: e.target.value})} className="w-full px-4 py-3 rounded-xl bg-[#FAF6EE] border text-sm" />
-                </div>
-                <div>
-                  <label className="text-xs font-bold">City</label>
-                  <input type="text" required value={customer.city} onChange={e => setCustomer({...customer, city: e.target.value})} className="w-full px-4 py-3 rounded-xl bg-[#FAF6EE] border text-sm" />
-                </div>
-                <div>
-                  <label className="text-xs font-bold">State</label>
-                  <select value={customer.state} onChange={e => setCustomer({...customer, state: e.target.value})} className="w-full px-4 py-3 rounded-xl bg-[#FAF6EE] border text-sm">
-                    {MALAYSIAN_STATES.map(st => <option key={st} value={st}>{st}</option>)}
-                  </select>
-                </div>
-              </div>
-              {deliveryError && <p className="text-xs font-bold text-red-600">{deliveryError}</p>}
+            <div className="space-y-1">
+              <h2 className="text-2xl font-black text-[#14233C]">Customer & Delivery Details</h2>
+              <p className="text-xs text-[#14233C]/70">
+                Your delivery country determines product pricing, currency ({getCurrencyForCountry(customer.country)}), shipping charges, and available payment methods.
+              </p>
             </div>
-            <button type="submit" disabled={calculatingDelivery} className="w-full bg-[#14233C] text-white font-bold py-4 rounded-2xl text-sm">
-              {calculatingDelivery ? 'Validating delivery...' : 'Review Order & Delivery Fee'}
+
+            {countryPriceUpdatedNotice && (
+              <div
+                role="status"
+                aria-live="polite"
+                className="flex items-start gap-2.5 p-3.5 rounded-2xl bg-amber-50 border border-amber-200 text-amber-950 text-xs"
+              >
+                <AlertCircle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                <div className="space-y-0.5">
+                  <p className="font-bold">{COUNTRY_UPDATE_NOTICE}</p>
+                  <p className="text-amber-900/85">
+                    Prices are now shown in {CURRENCY_NAMES[getCurrencyForCountry(customer.country)]}. Please review the updated total on the next screen before proceeding to payment.
+                  </p>
+                </div>
+              </div>
+            )}
+
+            <div className="space-y-4">
+              {/* Required Delivery Country Field */}
+              <div>
+                <label htmlFor="checkout-country" className="block text-xs font-bold text-[#14233C] mb-1.5">
+                  Delivery Country <span className="text-[#E05A40]">*</span>
+                </label>
+                <select
+                  id="checkout-country"
+                  required
+                  value={customer.country}
+                  onChange={e => handleDeliveryCountryChange(e.target.value as DeliveryCountry)}
+                  className="w-full px-4 py-3 rounded-xl bg-[#FAF6EE] border border-[#14233C]/20 text-sm font-semibold text-[#14233C] focus:outline-none focus:border-[#14233C]"
+                >
+                  <option value="MY">Malaysia (MY) — Priced in MYR</option>
+                  <option value="SG">Singapore (SG) — Priced in SGD (Stripe Card only)</option>
+                </select>
+                <p className="text-[11px] text-[#14233C]/65 mt-1">
+                  {customer.country === 'SG'
+                    ? 'Singapore orders are priced in SGD and support Stripe credit/debit card payment only.'
+                    : 'Malaysia orders are priced in MYR and support Touch ’n Go eWallet QR, Public Bank QR Pay, and Stripe Card.'}
+                </p>
+              </div>
+
+              <div>
+                <label htmlFor="checkout-fullname" className="block text-xs font-bold text-[#14233C] mb-1">
+                  Full Name
+                </label>
+                <input
+                  id="checkout-fullname"
+                  type="text"
+                  required
+                  value={customer.fullName}
+                  onChange={e => setCustomer({ ...customer, fullName: e.target.value })}
+                  className="w-full px-4 py-3 rounded-xl bg-[#FAF6EE] border border-[#14233C]/20 text-sm text-[#14233C] focus:outline-none focus:border-[#14233C]"
+                />
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label htmlFor="checkout-email" className="block text-xs font-bold text-[#14233C] mb-1">
+                    Email
+                  </label>
+                  <input
+                    id="checkout-email"
+                    type="email"
+                    required
+                    value={customer.email}
+                    onChange={e => setCustomer({ ...customer, email: e.target.value })}
+                    className="w-full px-4 py-3 rounded-xl bg-[#FAF6EE] border border-[#14233C]/20 text-sm text-[#14233C] focus:outline-none focus:border-[#14233C]"
+                  />
+                </div>
+                <div>
+                  <label htmlFor="checkout-mobile" className="block text-xs font-bold text-[#14233C] mb-1">
+                    Mobile Phone
+                  </label>
+                  <input
+                    id="checkout-mobile"
+                    type="tel"
+                    required
+                    placeholder={customer.country === 'SG' ? '+65 9123 4567' : '+60 12-345 6789'}
+                    value={customer.mobile}
+                    onChange={e => setCustomer({ ...customer, mobile: e.target.value })}
+                    className="w-full px-4 py-3 rounded-xl bg-[#FAF6EE] border border-[#14233C]/20 text-sm text-[#14233C] focus:outline-none focus:border-[#14233C]"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label htmlFor="checkout-address" className="block text-xs font-bold text-[#14233C] mb-1">
+                  {customer.country === 'SG' ? 'Block, Street Name & Unit Number' : 'Street Address'}
+                </label>
+                <textarea
+                  id="checkout-address"
+                  required
+                  rows={2}
+                  placeholder={
+                    customer.country === 'SG'
+                      ? 'e.g. Blk 123 Orchard Road, #08-45'
+                      : 'e.g. No. 12, Jalan SS15/4'
+                  }
+                  value={customer.address}
+                  onChange={e => setCustomer({ ...customer, address: e.target.value })}
+                  className="w-full px-4 py-3 rounded-xl bg-[#FAF6EE] border border-[#14233C]/20 text-sm text-[#14233C] focus:outline-none focus:border-[#14233C]"
+                />
+              </div>
+
+              {customer.country === 'MY' ? (
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                  <div>
+                    <label htmlFor="checkout-postcode" className="block text-xs font-bold text-[#14233C] mb-1">
+                      Postcode (5 digits)
+                    </label>
+                    <input
+                      id="checkout-postcode"
+                      type="text"
+                      inputMode="numeric"
+                      pattern="\d{5}"
+                      maxLength={5}
+                      required
+                      placeholder="47500"
+                      value={customer.postcode}
+                      onChange={e =>
+                        setCustomer({
+                          ...customer,
+                          postcode: e.target.value.replace(/\D/g, '').slice(0, 5)
+                        })
+                      }
+                      className="w-full px-4 py-3 rounded-xl bg-[#FAF6EE] border border-[#14233C]/20 text-sm text-[#14233C] font-mono focus:outline-none focus:border-[#14233C]"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="checkout-city" className="block text-xs font-bold text-[#14233C] mb-1">
+                      City
+                    </label>
+                    <input
+                      id="checkout-city"
+                      type="text"
+                      required
+                      placeholder="Subang Jaya"
+                      value={customer.city}
+                      onChange={e => setCustomer({ ...customer, city: e.target.value })}
+                      className="w-full px-4 py-3 rounded-xl bg-[#FAF6EE] border border-[#14233C]/20 text-sm text-[#14233C] focus:outline-none focus:border-[#14233C]"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="checkout-state" className="block text-xs font-bold text-[#14233C] mb-1">
+                      State
+                    </label>
+                    <select
+                      id="checkout-state"
+                      required
+                      value={customer.state}
+                      onChange={e => setCustomer({ ...customer, state: e.target.value })}
+                      className="w-full px-4 py-3 rounded-xl bg-[#FAF6EE] border border-[#14233C]/20 text-sm text-[#14233C] focus:outline-none focus:border-[#14233C]"
+                    >
+                      {MALAYSIAN_STATES.map(st => (
+                        <option key={st} value={st}>
+                          {st}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div>
+                    <label htmlFor="checkout-sg-postcode" className="block text-xs font-bold text-[#14233C] mb-1">
+                      Singapore Postal Code (6 digits)
+                    </label>
+                    <input
+                      id="checkout-sg-postcode"
+                      type="text"
+                      inputMode="numeric"
+                      pattern="\d{6}"
+                      maxLength={6}
+                      required
+                      placeholder="238801"
+                      value={customer.postcode}
+                      onChange={e =>
+                        setCustomer({
+                          ...customer,
+                          postcode: e.target.value.replace(/\D/g, '').slice(0, 6)
+                        })
+                      }
+                      className="w-full px-4 py-3 rounded-xl bg-[#FAF6EE] border border-[#14233C]/20 text-sm text-[#14233C] font-mono focus:outline-none focus:border-[#14233C]"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="checkout-sg-region" className="block text-xs font-bold text-[#14233C] mb-1">
+                      City / Region
+                    </label>
+                    <input
+                      id="checkout-sg-region"
+                      type="text"
+                      readOnly
+                      value="Singapore"
+                      className="w-full px-4 py-3 rounded-xl bg-[#FAF6EE]/60 border border-[#14233C]/15 text-sm text-[#14233C]/75"
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* Live Recalculated Total Preview */}
+              <div className="p-4 rounded-2xl bg-[#FAF6EE] border border-[#14233C]/12 space-y-2 text-xs">
+                <div className="flex items-center justify-between font-bold text-[#14233C]">
+                  <span>
+                    Estimated Order Total ({formatCountryLabel(customer.country)} · {getCurrencyForCountry(customer.country)})
+                  </span>
+                  {liveCheckoutEstimate.ok && (
+                    <span className="text-base font-black text-[#E05A40] tabular-nums">
+                      {formatCurrencyAmount(liveCheckoutEstimate.totalMinor, liveCheckoutEstimate.currency)}
+                    </span>
+                  )}
+                </div>
+
+                {liveCheckoutEstimate.ok ? (
+                  <div className="space-y-1 text-[#14233C]/75">
+                    <div className="flex justify-between">
+                      <span>{liveCheckoutEstimate.productName}</span>
+                      <span className="tabular-nums font-semibold">
+                        {formatCurrencyAmount(liveCheckoutEstimate.subtotalMinor, liveCheckoutEstimate.currency)}
+                      </span>
+                    </div>
+                    {liveCheckoutEstimate.savingsMinor ? (
+                      <div className="flex justify-between text-emerald-700 font-semibold">
+                        <span>Bundle 20% Discount</span>
+                        <span className="tabular-nums">
+                          - {formatCurrencyAmount(liveCheckoutEstimate.savingsMinor, liveCheckoutEstimate.currency)}
+                        </span>
+                      </div>
+                    ) : null}
+                    <div className="flex justify-between">
+                      <span>Delivery ({liveCheckoutEstimate.deliveryZone})</span>
+                      <span className="tabular-nums font-semibold">
+                        {formatCurrencyAmount(liveCheckoutEstimate.deliveryFeeMinor, liveCheckoutEstimate.currency)}
+                      </span>
+                    </div>
+                  </div>
+                ) : (
+                  <div role="alert" className="flex items-start gap-2 text-red-800 font-semibold pt-1">
+                    <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                    <span>{liveCheckoutEstimate.error}</span>
+                  </div>
+                )}
+              </div>
+
+              {deliveryError && (
+                <div role="alert" className="flex items-start gap-2 p-3 rounded-xl bg-red-50 border border-red-200 text-xs font-bold text-red-700">
+                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                  <span>{deliveryError}</span>
+                </div>
+              )}
+            </div>
+
+            <button
+              type="submit"
+              disabled={calculatingDelivery || !liveCheckoutEstimate.ok}
+              className="w-full bg-[#14233C] text-white font-bold py-4 rounded-2xl text-sm hover:bg-[#1e3357] disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            >
+              {calculatingDelivery ? 'Validating delivery & recalculating total…' : 'Review Order & Final Total'}
             </button>
           </form>
         </div>
       )}
 
       {/* CHECKOUT FLOW: REVIEW */}
-      {orderStep === 'review' && (
-        <div className="py-12 px-4 sm:px-8 max-w-2xl mx-auto space-y-8 animate-fadeIn">
-          <button onClick={() => setOrderStep('details')} className="text-xs font-bold text-[#14233C] flex items-center gap-1.5">
-            <ArrowLeft className="w-4 h-4" /><span>Back to Details</span>
-          </button>
-          <div className="bg-white rounded-3xl p-6 sm:p-10 shadow-xl border border-[#14233C]/10 space-y-6">
-            <h2 className="text-2xl font-black text-[#14233C]">Order Summary & Review</h2>
+      {orderStep === 'review' && (() => {
+        const reviewCountry = validatedQuote?.deliveryCountry || customer.country;
+        const reviewCurrency = validatedQuote?.currency || getCurrencyForCountry(reviewCountry);
+        const reviewProductName =
+          validatedQuote?.productName ||
+          `${currentProduct.name}${selectedProductId === 'bundle' && activeBundle ? ` (${activeBundle.name})` : ''}`;
+        const reviewSubtotal = validatedQuote?.subtotalMinor ?? activePriceMinor;
+        const reviewRegular = validatedQuote?.regularSubtotalMinor ?? activeRegularMinor ?? null;
+        const reviewSavings = validatedQuote?.savingsMinor ?? activeSavingsMinor ?? null;
+        const reviewDeliveryZone =
+          validatedQuote?.deliveryZone ||
+          (reviewCountry === 'SG' ? 'Singapore' : customer.state);
+        const reviewDeliveryFee =
+          validatedQuote?.deliveryFeeMinor ??
+          (liveCheckoutEstimate.ok ? liveCheckoutEstimate.deliveryFeeMinor : 0);
+        const reviewTotal = validatedQuote?.totalMinor ?? reviewSubtotal + reviewDeliveryFee;
 
-            {photoPreview && (
-              <div className="flex items-center justify-between gap-4 p-4 rounded-2xl bg-[#FAF6EE]/70 border border-[#14233C]/10">
-                <div className="flex items-center gap-3 min-w-0">
-                  <img
-                    src={photoPreview}
-                    alt="Selected keepsake photo"
-                    className="w-16 h-16 rounded-xl object-cover border border-[#14233C]/10 shrink-0"
-                  />
-                  <div className="min-w-0">
-                    <p className="text-xs font-bold text-[#14233C]">Uploaded Photo Ready</p>
-                    <p className="text-[11px] text-[#14233C]/65 truncate">
-                      {photoFile?.name || 'Saved photo'}
-                    </p>
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setOrderStep('upload')}
-                  className="text-xs font-bold text-[#E05A40] hover:underline whitespace-nowrap shrink-0"
+        return (
+          <div className="py-12 px-4 sm:px-8 max-w-2xl mx-auto space-y-8 animate-fadeIn">
+            <button
+              type="button"
+              onClick={() => setOrderStep('details')}
+              className="text-xs font-bold text-[#14233C] flex items-center gap-1.5 hover:text-[#E05A40]"
+            >
+              <ArrowLeft className="w-4 h-4" /><span>Back to Delivery Details</span>
+            </button>
+            <div className="bg-white rounded-3xl p-6 sm:p-10 shadow-xl border border-[#14233C]/10 space-y-6">
+              <div className="space-y-1">
+                <h2 className="text-2xl font-black text-[#14233C]">Order Summary & Review</h2>
+                <p className="text-xs text-[#14233C]/70">
+                  Delivery Country: <strong className="text-[#14233C]">{formatCountryLabel(reviewCountry)}</strong>
+                  {' · '}
+                  Currency: <strong className="text-[#14233C]">{reviewCurrency}</strong>
+                </p>
+              </div>
+
+              {countryPriceUpdatedNotice && (
+                <div
+                  role="alert"
+                  className="p-4 rounded-2xl bg-amber-50 border border-amber-300 text-amber-950 text-xs space-y-3"
                 >
-                  Replace Photo
-                </button>
-              </div>
-            )}
-
-            <div className="bg-[#FAF6EE] p-5 rounded-2xl space-y-3">
-              <div className="flex justify-between font-bold">
-                <span>{currentProduct.name} {selectedProductId === 'bundle' && activeBundle ? `(${activeBundle.name})` : ''}</span>
-                <span>{formatRM(activePriceSen)}</span>
-              </div>
-              {activeSavingsSen && (
-                <div className="flex justify-between text-xs font-bold text-emerald-700">
-                  <span>Bundle 20% Discount</span>
-                  <span>- {formatRM(activeSavingsSen)}</span>
+                  <div className="flex items-start gap-2.5">
+                    <AlertCircle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                    <div className="space-y-1">
+                      <p className="font-extrabold">{COUNTRY_UPDATE_NOTICE}</p>
+                      <p className="text-amber-900/90 leading-relaxed">
+                        All item prices, bundle discounts, and delivery fees have been recalculated for{' '}
+                        <strong>{formatCountryLabel(reviewCountry)}</strong> in{' '}
+                        <strong>{CURRENCY_NAMES[reviewCurrency]}</strong>.
+                      </p>
+                    </div>
+                  </div>
+                  <label className="flex items-start gap-2.5 pt-2 border-t border-amber-200/80 cursor-pointer font-bold text-[#14233C]">
+                    <input
+                      type="checkbox"
+                      checked={updatedTotalReviewed}
+                      onChange={e => {
+                        setUpdatedTotalReviewed(e.target.checked);
+                        setOrderError(null);
+                      }}
+                      className="mt-0.5 w-4 h-4 accent-[#14233C] rounded"
+                    />
+                    <span>
+                      I have reviewed the updated total of{' '}
+                      <span className="tabular-nums text-[#E05A40]">
+                        {formatCurrencyWithCode(reviewTotal, reviewCurrency)}
+                      </span>{' '}
+                      for {COUNTRY_LABELS[reviewCountry]} delivery.
+                    </span>
+                  </label>
                 </div>
               )}
-              <div className="flex justify-between text-xs text-[#14233C]/70">
-                <span>Delivery Fee ({customer.state})</span>
-                <span>{formatRM(deliveryFeeSen)}</span>
+
+              {photoPreview && (
+                <div className="flex items-center justify-between gap-4 p-4 rounded-2xl bg-[#FAF6EE]/70 border border-[#14233C]/10">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <img
+                      src={photoPreview}
+                      alt="Selected keepsake photo"
+                      className="w-16 h-16 rounded-xl object-cover border border-[#14233C]/10 shrink-0"
+                    />
+                    <div className="min-w-0">
+                      <p className="text-xs font-bold text-[#14233C]">Uploaded Photo Ready</p>
+                      <p className="text-[11px] text-[#14233C]/65 truncate">
+                        {photoFile?.name || 'Saved photo'}
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setOrderStep('upload')}
+                    className="text-xs font-bold text-[#E05A40] hover:underline whitespace-nowrap shrink-0"
+                  >
+                    Replace Photo
+                  </button>
+                </div>
+              )}
+
+              <div className="bg-[#FAF6EE] p-5 rounded-2xl space-y-3 text-sm">
+                <div className="flex justify-between font-bold text-[#14233C]">
+                  <span>{reviewProductName}</span>
+                  <span className="tabular-nums">
+                    {formatCurrencyAmount(reviewSubtotal, reviewCurrency)}
+                  </span>
+                </div>
+                {reviewRegular && reviewSavings ? (
+                  <>
+                    <div className="flex justify-between text-xs text-[#14233C]/60">
+                      <span>Regular item price</span>
+                      <span className="line-through tabular-nums">
+                        {formatCurrencyAmount(reviewRegular, reviewCurrency)}
+                      </span>
+                    </div>
+                    <div className="flex justify-between text-xs font-bold text-emerald-700">
+                      <span>Bundle 20% Discount</span>
+                      <span className="tabular-nums">
+                        - {formatCurrencyAmount(reviewSavings, reviewCurrency)}
+                      </span>
+                    </div>
+                  </>
+                ) : null}
+                <div className="flex justify-between text-xs text-[#14233C]/75">
+                  <span>Delivery Fee ({reviewDeliveryZone})</span>
+                  <span className="tabular-nums font-semibold">
+                    {formatCurrencyAmount(reviewDeliveryFee, reviewCurrency)}
+                  </span>
+                </div>
+                <div className="flex justify-between pt-3 border-t border-[#14233C]/12 font-black text-lg text-[#E05A40]">
+                  <span>Final Payable Amount ({reviewCurrency})</span>
+                  <span className="tabular-nums">
+                    {formatCurrencyAmount(reviewTotal, reviewCurrency)}
+                  </span>
+                </div>
               </div>
-              <div className="flex justify-between pt-3 border-t font-black text-lg text-[#E05A40]">
-                <span>Total Amount Due</span>
-                <span>{formatRM(activePriceSen + deliveryFeeSen)}</span>
+
+              <div className="p-4 rounded-2xl bg-[#FAF6EE]/60 border border-[#14233C]/10 text-xs text-[#14233C]/80 space-y-1">
+                <p className="font-bold text-[#14233C]">Delivery Address & Available Payment Methods</p>
+                <p className="font-medium text-[#14233C]">{customer.fullName}</p>
+                <p>
+                  {customer.address}, {customer.postcode}{' '}
+                  {reviewCountry === 'SG'
+                    ? 'Singapore'
+                    : `${customer.city}, ${customer.state}, Malaysia`}
+                </p>
+                <p className="pt-1 text-[11px] text-[#14233C]/70">
+                  {reviewCountry === 'SG'
+                    ? 'Available payment method: Stripe credit/debit card (charged in SGD).'
+                    : 'Available payment methods: Touch ’n Go eWallet QR, Public Bank QR Pay, or Stripe credit/debit card (charged in MYR).'}
+                </p>
               </div>
+
+              <p className="text-xs text-[#14233C]/70 leading-relaxed">{DELIVERY_PROMISE_TEXT}</p>
+              {orderError && (
+                <div
+                  role="alert"
+                  className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-xs font-bold text-red-700 space-y-2.5"
+                >
+                  <div className="flex items-start gap-2">
+                    <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                    <span>{orderError}</span>
+                  </div>
+                  {(orderErrorCode === 'PHOTO_MOVE_FAILED' ||
+                    orderErrorCode === 'PHOTO_UPLOAD_REQUIRED' ||
+                    orderErrorCode === 'PHOTO_ALREADY_USED') && (
+                    <div className="flex flex-wrap items-center gap-2 pt-1">
+                      {photoFile && orderErrorCode !== 'PHOTO_ALREADY_USED' ? (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setOrderError(null);
+                            setOrderErrorCode(null);
+                            setOrderStep('upload');
+                            void uploadSelectedPhoto(photoFile);
+                          }}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#14233C] text-white text-xs font-bold hover:bg-[#1e3357] transition-colors"
+                        >
+                          <RefreshCw className="w-3.5 h-3.5" />
+                          <span>Re-upload Photo</span>
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setOrderError(null);
+                            setOrderErrorCode(null);
+                            handleRemovePhoto();
+                            setOrderStep('upload');
+                          }}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#14233C] text-white text-xs font-bold hover:bg-[#1e3357] transition-colors"
+                        >
+                          <Camera className="w-3.5 h-3.5" />
+                          <span>Upload New Photo</span>
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+              <button
+                type="button"
+                disabled={submittingOrder || (countryPriceUpdatedNotice && !updatedTotalReviewed)}
+                onClick={handleConfirmAndCreateOrder}
+                className="w-full bg-[#FF8D76] text-[#14233C] font-black py-4 rounded-2xl shadow-lg text-sm hover:bg-[#ff7b60] disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              >
+                {submittingOrder
+                  ? 'Saving Order…'
+                  : countryPriceUpdatedNotice && !updatedTotalReviewed
+                    ? 'Review Updated Total Above to Continue'
+                    : 'Continue to Payment Options'}
+              </button>
             </div>
-            <p className="text-xs text-[#14233C]/70 leading-relaxed">{DELIVERY_PROMISE_TEXT}</p>
-            {orderError && <p className="text-xs font-bold text-red-600">{orderError}</p>}
-            <button disabled={submittingOrder} onClick={handleConfirmAndCreateOrder} className="w-full bg-[#FF8D76] text-[#14233C] font-black py-4 rounded-2xl shadow-lg text-sm">
-              {submittingOrder ? 'Saving Order...' : 'Continue to Payment Options'}
-            </button>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* PAYMENT & CUSTOMER ORDER STATUS PAGE (LINKED TO SAVED ORDER VIA SECURE TOKEN) */}
       {orderStep === 'payment' && currentOrder && (
@@ -1679,6 +2416,7 @@ export default function App() {
             order={currentOrder}
             merchantConfig={merchantConfig}
             merchantConfigLoading={merchantConfigLoading}
+            singaporeShippingConfigured={storefront.singaporeShippingConfigured}
             whatsappUrl={storefront.whatsappUrl}
             returnNotice={paymentReturnNotice}
             onOrderUpdated={updated => {
@@ -1698,9 +2436,12 @@ export default function App() {
             onBackToShop={handleReturnHome}
             onOpenOrderPayment={handleOpenOrderPaymentFromAdmin}
             onStorefrontUpdated={(nextStorefront, nextMerchant) => {
-              setStorefront(nextStorefront);
+              setStorefront({
+                ...DEFAULT_STOREFRONT,
+                ...nextStorefront,
+                marketPricing: nextStorefront.marketPricing || buildMarketPricingConfig()
+              });
               setMerchantConfig(nextMerchant);
-              setDeliveryFeeSen(nextStorefront.deliveryRatesSen.peninsular);
             }}
           />
         </div>

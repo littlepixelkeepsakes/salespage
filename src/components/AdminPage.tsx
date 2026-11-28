@@ -9,6 +9,7 @@ import {
   Download,
   Eye,
   FileText,
+  Globe,
   Image as ImageIcon,
   Lock,
   LogOut,
@@ -27,6 +28,12 @@ import type {
   OrderPublic,
   PublicStorefrontConfig
 } from '../types/order';
+import {
+  DEFAULT_MARKET_PRODUCT_BASE_PRICES,
+  formatCountryLabel,
+  formatCurrencyAmount,
+  formatCurrencyWithCode
+} from '../shared/pricing';
 
 interface AdminPageProps {
   onBackToShop: () => void;
@@ -36,8 +43,6 @@ interface AdminPageProps {
     merchantConfig: MerchantPaymentConfig
   ) => void;
 }
-
-const formatRM = (sen: number) => `RM ${(sen / 100).toFixed(2)}`;
 
 const getAccountToCheck = (order: OrderPublic): { accountTag: string; instruction: string } => {
   if (order.paymentMethod === 'tng') {
@@ -85,6 +90,13 @@ export default function AdminPage({
   const [settings, setSettings] = useState<EditableStoreSettings | null>(null);
   const [peninsularRm, setPeninsularRm] = useState('8.00');
   const [eastRm, setEastRm] = useState('15.00');
+  const [singaporeSgd, setSingaporeSgd] = useState('');
+  const [sgKeychainSgd, setSgKeychainSgd] = useState(
+    (DEFAULT_MARKET_PRODUCT_BASE_PRICES.SG.keychain / 100).toFixed(2)
+  );
+  const [sgMagnetSgd, setSgMagnetSgd] = useState(
+    (DEFAULT_MARKET_PRODUCT_BASE_PRICES.SG.magnet / 100).toFixed(2)
+  );
   const [savingSettings, setSavingSettings] = useState(false);
   const [uploadingField, setUploadingField] = useState<string | null>(null);
 
@@ -138,6 +150,14 @@ export default function AdminPage({
     setSettings(loaded);
     setPeninsularRm((loaded.deliveryRatesSen.peninsular / 100).toFixed(2));
     setEastRm((loaded.deliveryRatesSen.eastMalaysia / 100).toFixed(2));
+    setSingaporeSgd(
+      typeof loaded.deliveryRateSingaporeCents === 'number'
+        ? (loaded.deliveryRateSingaporeCents / 100).toFixed(2)
+        : ''
+    );
+    const sgPrices = loaded.sgProductPricesCents || DEFAULT_MARKET_PRODUCT_BASE_PRICES.SG;
+    setSgKeychainSgd((sgPrices.keychain / 100).toFixed(2));
+    setSgMagnetSgd((sgPrices.magnet / 100).toFixed(2));
   };
 
   const fetchAdminData = useCallback(async (token: string) => {
@@ -568,7 +588,26 @@ export default function AdminPage({
     const penVal = Math.round(Number.parseFloat(peninsularRm) * 100);
     const eastVal = Math.round(Number.parseFloat(eastRm) * 100);
     if (!Number.isFinite(penVal) || penVal < 0 || !Number.isFinite(eastVal) || eastVal < 0) {
-      setDashboardError('Enter valid non-negative RM amounts for delivery rates.');
+      setDashboardError('Enter valid non-negative MYR amounts for Malaysia delivery rates.');
+      return;
+    }
+
+    let sgDeliveryVal: number | null = null;
+    if (singaporeSgd.trim() !== '') {
+      const parsedSg = Math.round(Number.parseFloat(singaporeSgd) * 100);
+      if (!Number.isFinite(parsedSg) || parsedSg < 0 || parsedSg > 100000) {
+        setDashboardError(
+          'Enter a valid non-negative SGD amount for Singapore delivery, or leave blank to disable Singapore shipping.'
+        );
+        return;
+      }
+      sgDeliveryVal = parsedSg;
+    }
+
+    const sgKcVal = Math.round(Number.parseFloat(sgKeychainSgd) * 100);
+    const sgMagVal = Math.round(Number.parseFloat(sgMagnetSgd) * 100);
+    if (!Number.isFinite(sgKcVal) || sgKcVal < 50 || !Number.isFinite(sgMagVal) || sgMagVal < 50) {
+      setDashboardError('Enter valid SGD product prices (minimum S$ 0.50) for Singapore.');
       return;
     }
 
@@ -582,6 +621,11 @@ export default function AdminPage({
         deliveryRatesSen: {
           peninsular: penVal,
           eastMalaysia: eastVal
+        },
+        deliveryRateSingaporeCents: sgDeliveryVal,
+        sgProductPricesCents: {
+          keychain: sgKcVal,
+          magnet: sgMagVal
         }
       };
 
@@ -868,7 +912,7 @@ export default function AdminPage({
           <h2 className="text-sm font-bold text-[#14233C]">
             Payment Methods, Private Storage & Email Readiness
           </h2>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-3 text-xs">
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 text-xs">
             {[diagnostics.tng, diagnostics.duitnow].map(item => (
               <div
                 key={item.key}
@@ -877,7 +921,7 @@ export default function AdminPage({
                 <div className="flex items-center justify-between gap-2">
                   <span className="font-bold text-[#14233C]">{item.label}</span>
                   <span className={`font-bold ${item.configured ? 'text-emerald-800' : 'text-amber-800'}`}>
-                    {item.configured ? 'Active' : 'Disabled'}
+                    {item.configured ? 'Active (MYR)' : 'Disabled'}
                   </span>
                 </div>
                 {item.configured ? (
@@ -897,7 +941,7 @@ export default function AdminPage({
 
             <div className="p-3.5 rounded-xl bg-[#FAF6EE]/70 border border-[#14233C]/10 space-y-1.5">
               <div className="flex items-center justify-between gap-2">
-                <span className="font-bold text-[#14233C]">Stripe Card</span>
+                <span className="font-bold text-[#14233C]">Stripe Card (MYR & SGD)</span>
                 <span
                   className={`font-bold ${
                     diagnostics.stripe.configured ? 'text-emerald-800' : 'text-amber-800'
@@ -924,6 +968,30 @@ export default function AdminPage({
               )}
             </div>
 
+            {diagnostics.singaporeShipping && (
+              <div className="p-3.5 rounded-xl bg-[#FAF6EE]/70 border border-[#14233C]/10 space-y-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-bold text-[#14233C]">Singapore Shipping (SGD)</span>
+                  <span
+                    className={`font-bold ${
+                      diagnostics.singaporeShipping.configured ? 'text-emerald-800' : 'text-amber-800'
+                    }`}
+                  >
+                    {diagnostics.singaporeShipping.configured &&
+                    typeof diagnostics.singaporeShipping.feeCents === 'number'
+                      ? formatCurrencyAmount(diagnostics.singaporeShipping.feeCents, 'SGD')
+                      : 'Not Configured'}
+                  </span>
+                </div>
+                <p className="text-[#14233C]/70 break-words">
+                  {diagnostics.singaporeShipping.configured
+                    ? `Source: ${diagnostics.singaporeShipping.source === 'env' ? 'SG_SHIPPING_FEE_CENTS env' : 'Store settings'}. Singapore orders use Stripe Card in SGD only.`
+                    : diagnostics.singaporeShipping.issue ||
+                      'Set a Singapore delivery fee in Store & QR Settings to enable Singapore checkout.'}
+                </p>
+              </div>
+            )}
+
             <div className="p-3.5 rounded-xl bg-[#FAF6EE]/70 border border-[#14233C]/10 space-y-1.5">
               <div className="flex items-center justify-between gap-2">
                 <span className="font-bold text-[#14233C]">Supabase</span>
@@ -936,10 +1004,17 @@ export default function AdminPage({
                 </span>
               </div>
               {diagnostics.supabase.configured ? (
-                <p className="text-[#14233C]/70 break-words">
-                  PostgreSQL & private buckets ({diagnostics.supabase.photosBucket},{' '}
-                  {diagnostics.supabase.receiptsBucket}) ready.
-                </p>
+                <div className="space-y-1">
+                  <p className="text-[#14233C]/70 break-words">
+                    PostgreSQL & private buckets ({diagnostics.supabase.photosBucket},{' '}
+                    {diagnostics.supabase.receiptsBucket}) ready.
+                  </p>
+                  {diagnostics.supabase.countryPricingSchemaReady === false && (
+                    <p className="text-amber-900 font-semibold">
+                      Migration needed: run supabase/migrations/002_country_based_pricing.sql to enable Singapore (SGD) persistence.
+                    </p>
+                  )}
+                </div>
               ) : (
                 <ul className="text-red-800 list-disc list-inside space-y-0.5">
                   {diagnostics.supabase.issues.map((issue, idx) => (
@@ -1014,6 +1089,9 @@ export default function AdminPage({
                 const isPaid = order.paymentStatus === 'Paid';
                 const isConfirming = confirmingRef === order.reference;
 
+                const orderCountry = order.deliveryCountry || order.customer?.country || 'MY';
+                const orderCurrency = order.currency || (orderCountry === 'SG' ? 'SGD' : 'MYR');
+
                 return (
                   <article
                     key={order.reference}
@@ -1034,6 +1112,13 @@ export default function AdminPage({
                           <div className="flex flex-wrap items-center gap-2 text-xs text-[#14233C]/65">
                             <span className="font-mono font-bold text-[#14233C] text-sm">
                               {order.reference}
+                            </span>
+                            <span aria-hidden="true">·</span>
+                            <span className="inline-flex items-center gap-1 font-bold text-[#14233C]">
+                              <Globe className="w-3.5 h-3.5 text-[#E05A40]" />
+                              <span>
+                                {formatCountryLabel(orderCountry)} · {orderCurrency}
+                              </span>
                             </span>
                             <span aria-hidden="true">·</span>
                             <span>{new Date(order.createdAt).toLocaleString()}</span>
@@ -1060,18 +1145,27 @@ export default function AdminPage({
                             {order.productName} (Qty {order.itemQuantity}) — {order.customer.fullName}
                           </p>
                           <p className="text-xs text-[#14233C]/70">
-                            {order.customer.email} · {order.customer.mobile} · {order.customer.city},{' '}
-                            {order.customer.state}
+                            {order.customer.email} · {order.customer.mobile} ·{' '}
+                            {orderCountry === 'SG'
+                              ? `${order.customer.postcode} Singapore`
+                              : `${order.customer.postcode} ${order.customer.city}, ${order.customer.state}, Malaysia`}
+                          </p>
+                          <p className="text-[11px] text-[#14233C]/65 tabular-nums">
+                            Items {formatCurrencyAmount(order.subtotalSen, orderCurrency)}
+                            {order.savingsSen
+                              ? ` (saved ${formatCurrencyAmount(order.savingsSen, orderCurrency)})`
+                              : ''}
+                            {' + '}Shipping {formatCurrencyAmount(order.deliveryFeeSen, orderCurrency)}
                           </p>
                         </div>
                       </div>
 
                       <div className="md:text-right shrink-0">
                         <p className="text-[11px] font-semibold text-[#14233C]/60">
-                          {isPaid ? 'Total Paid' : 'Amount Due'}
+                          {isPaid ? `Total Paid (${orderCurrency})` : `Amount Due (${orderCurrency})`}
                         </p>
                         <p className="text-xl font-extrabold tabular-nums text-[#E05A40]">
-                          {formatRM(order.totalSen)}
+                          {formatCurrencyAmount(order.totalSen, orderCurrency)}
                         </p>
                         {isPaid && (
                           <p
@@ -1099,11 +1193,18 @@ export default function AdminPage({
                     {/* Payment Method, Transaction Reference, Receipt & Actions */}
                     <div className="pt-4 border-t border-[#14233C]/10 grid grid-cols-1 md:grid-cols-12 gap-4 items-center text-xs">
                       <div className="md:col-span-4 space-y-0.5">
-                        <p className="text-[#14233C]/60 font-semibold">Payment Method / Account</p>
+                        <p className="text-[#14233C]/60 font-semibold">
+                          Payment Method / Currency ({orderCurrency})
+                        </p>
                         <p className="text-sm font-extrabold text-[#14233C]">
                           {accountInfo.accountTag}
                         </p>
-                        <p className="text-[#14233C]/70">{accountInfo.instruction}</p>
+                        <p className="text-[#14233C]/70">
+                          {accountInfo.instruction}
+                          {order.latestPaymentCurrency
+                            ? ` · Recorded in ${order.latestPaymentCurrency}`
+                            : ''}
+                        </p>
                       </div>
 
                       <div className="md:col-span-4 space-y-0.5">
@@ -1251,7 +1352,7 @@ export default function AdminPage({
                           <p className="text-[#14233C]/80">
                             Check that{' '}
                             <strong className="tabular-nums text-[#E05A40]">
-                              {formatRM(order.totalSen)}
+                              {formatCurrencyWithCode(order.totalSen, orderCurrency)}
                             </strong>{' '}
                             actually arrived in <strong>{accountInfo.accountTag}</strong> matching
                             reference <strong className="font-mono">{order.transactionReference}</strong>.
@@ -1545,13 +1646,21 @@ export default function AdminPage({
             </div>
           </section>
 
-          {/* Delivery Rates */}
-          <section className="bg-white rounded-2xl border border-[#14233C]/12 p-6 space-y-4">
-            <h2 className="text-base font-bold text-[#14233C]">Delivery Rates (RM)</h2>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          {/* Country-Based Delivery Rates & Regional Product Pricing */}
+          <section className="bg-white rounded-2xl border border-[#14233C]/12 p-6 space-y-5">
+            <div>
+              <h2 className="text-base font-bold text-[#14233C]">
+                Delivery Rates & Regional Pricing (MYR & SGD)
+              </h2>
+              <p className="text-xs text-[#14233C]/70 mt-0.5">
+                Delivery country determines authoritative product pricing, currency, and shipping charges on the backend.
+              </p>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
               <div>
                 <label className="block text-xs font-bold text-[#14233C] mb-1.5">
-                  Peninsular Malaysia Delivery Fee (RM)
+                  Peninsular Malaysia Delivery (MYR)
                 </label>
                 <input
                   type="number"
@@ -1566,7 +1675,7 @@ export default function AdminPage({
               </div>
               <div>
                 <label className="block text-xs font-bold text-[#14233C] mb-1.5">
-                  Sabah, Sarawak & Labuan Delivery Fee (RM)
+                  Sabah, Sarawak & Labuan Delivery (MYR)
                 </label>
                 <input
                   type="number"
@@ -1579,6 +1688,60 @@ export default function AdminPage({
                   className="w-full px-3.5 py-2.5 rounded-xl bg-[#FAF6EE] border border-[#14233C]/20 text-sm font-mono"
                 />
               </div>
+              <div>
+                <label className="block text-xs font-bold text-[#14233C] mb-1.5">
+                  Singapore Delivery Fee (SGD)
+                </label>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  max="1000"
+                  placeholder="Leave blank to disable SG"
+                  value={singaporeSgd}
+                  onChange={e => setSingaporeSgd(e.target.value)}
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-[#FAF6EE] border border-[#14233C]/20 text-sm font-mono"
+                />
+                <p className="text-[11px] text-[#14233C]/60 mt-1">
+                  Leave blank to block Singapore checkout until configured (never falls back to free shipping).
+                </p>
+              </div>
+            </div>
+
+            <div className="pt-4 border-t border-[#14233C]/10 grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-xs font-bold text-[#14233C] mb-1.5">
+                  Singapore Keychain Price (SGD)
+                </label>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="0.50"
+                  max="1000"
+                  required
+                  value={sgKeychainSgd}
+                  onChange={e => setSgKeychainSgd(e.target.value)}
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-[#FAF6EE] border border-[#14233C]/20 text-sm font-mono"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-bold text-[#14233C] mb-1.5">
+                  Singapore Fridge Magnet Price (SGD)
+                </label>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="0.50"
+                  max="1000"
+                  required
+                  value={sgMagnetSgd}
+                  onChange={e => setSgMagnetSgd(e.target.value)}
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-[#FAF6EE] border border-[#14233C]/20 text-sm font-mono"
+                />
+              </div>
+              <p className="sm:col-span-2 text-[11px] text-[#14233C]/65">
+                Singapore 2-Piece Bundles automatically receive 20% off these fixed SGD prices. Malaysia prices remain fixed in MYR (RM 29.90 / RM 31.90).
+              </p>
             </div>
           </section>
 

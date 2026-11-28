@@ -11,6 +11,43 @@ export type PaymentStatus =
 
 export type PaymentMethodKey = 'tng' | 'duitnow' | 'card';
 
+export type DeliveryCountry = 'MY' | 'SG';
+export type SupportedCurrency = 'MYR' | 'SGD';
+
+export interface OrderPricingBreakdown {
+  deliveryCountry: DeliveryCountry;
+  currency: SupportedCurrency;
+  productKey: string;
+  productName: string;
+  itemQuantity: number;
+  unitSubtotalMinor: number;
+  regularSubtotalMinor: number | null;
+  bundleDiscountPercent: number;
+  bundleSavingsMinor: number | null;
+  deliveryZone: string;
+  deliveryFeeMinor: number;
+  totalMinor: number;
+}
+
+export interface MarketPriceTable {
+  country: DeliveryCountry;
+  currency: SupportedCurrency;
+  products: {
+    keychain: number;
+    magnet: number;
+  };
+  bundles: {
+    bundle_2_keychains: { priceMinor: number; regularMinor: number; savingsMinor: number };
+    bundle_kc_magnet: { priceMinor: number; regularMinor: number; savingsMinor: number };
+    bundle_2_magnets: { priceMinor: number; regularMinor: number; savingsMinor: number };
+  };
+}
+
+export interface MarketPricingConfig {
+  MY: MarketPriceTable;
+  SG: MarketPriceTable;
+}
+
 export interface OrderCustomer {
   fullName: string;
   email: string;
@@ -19,11 +56,16 @@ export interface OrderCustomer {
   postcode: string;
   city: string;
   state: string;
+  country: DeliveryCountry;
 }
 
 export interface OrderPublic {
   reference: string;
   accessToken: string;
+  deliveryCountry: DeliveryCountry;
+  currency: SupportedCurrency;
+  allowedPaymentMethods: PaymentMethodKey[];
+  pricingBreakdown?: OrderPricingBreakdown;
   productId: string;
   bundleId?: string;
   productName: string;
@@ -39,6 +81,7 @@ export interface OrderPublic {
   paymentStatus: PaymentStatus;
   paymentMethod?: PaymentMethodKey | null;
   paymentMethodLabel?: string | null;
+  latestPaymentCurrency?: SupportedCurrency | null;
   transactionReference?: string;
   receiptSubmitted: boolean;
   receiptFileName?: string;
@@ -106,6 +149,11 @@ export interface EditableStoreSettings {
     peninsular: number;
     eastMalaysia: number;
   };
+  deliveryRateSingaporeCents: number | null;
+  sgProductPricesCents: {
+    keychain: number;
+    magnet: number;
+  };
   whatsappSupportNumber: string;
   qrOverrides: {
     tng: {
@@ -134,6 +182,9 @@ export interface PublicStorefrontConfig {
     peninsular: number;
     eastMalaysia: number;
   };
+  deliveryRateSingaporeCents: number | null;
+  singaporeShippingConfigured: boolean;
+  marketPricing: MarketPricingConfig;
   whatsappSupportNumber: string;
   whatsappUrl: string | null;
   deliveryPromiseText: string;
@@ -144,6 +195,7 @@ export interface SupabaseHealthDiagnostic {
   databaseReady: boolean;
   photosBucketReady: boolean;
   receiptsBucketReady: boolean;
+  countryPricingSchemaReady?: boolean;
   photosBucket: string | null;
   receiptsBucket: string | null;
   issues: string[];
@@ -174,6 +226,12 @@ export interface AdminConfigDiagnostics {
     redirectOriginSource?: 'app_url' | 'request_headers' | 'fallback_localhost';
     issue?: string;
     lastCheckoutError?: StripeCheckoutDiagnostic | null;
+  };
+  singaporeShipping: {
+    configured: boolean;
+    feeCents: number | null;
+    source: 'settings' | 'env' | 'unconfigured';
+    issue?: string;
   };
   email: {
     configured: boolean;

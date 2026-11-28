@@ -30,6 +30,44 @@ export function computePasscodeVersion(secretMaterial: string): string {
     .slice(0, 16);
 }
 
+/**
+ * Deterministically derives a unique, unforgeable order reference from a verified
+ * upload session (sid + pendingPath) using the server HMAC signing key.
+ * Enables cross-instance idempotency and single-use photo binding across serverless invocations.
+ */
+export function deriveOrderReferenceForUpload(
+  sid: string,
+  pendingPath: string,
+  issuedAtMs: number
+): string {
+  const year = new Date(Number.isFinite(issuedAtMs) ? issuedAtMs : Date.now()).getUTCFullYear();
+  const code = crypto
+    .createHmac('sha256', getSigningKey())
+    .update(`lpk-order-ref:v1:${sid}:${pendingPath}`)
+    .digest('hex')
+    .slice(0, 8)
+    .toUpperCase();
+  return `LPK-${year}-${code}`;
+}
+
+/**
+ * Deterministically derives the permanent private storage path for an order's photo
+ * from its verified upload session so ownership can be verified even across retries.
+ */
+export function deriveOrderPhotoPathForUpload(
+  reference: string,
+  sid: string,
+  pendingPath: string,
+  ext: 'jpg' | 'png'
+): string {
+  const fileHash = crypto
+    .createHmac('sha256', getSigningKey())
+    .update(`lpk-order-photo:v1:${reference}:${sid}:${pendingPath}`)
+    .digest('hex')
+    .slice(0, 12);
+  return `orders/${reference}/${fileHash}.${ext}`;
+}
+
 export interface PhotoSessionPayload {
   typ: 'photo_session';
   sid: string;

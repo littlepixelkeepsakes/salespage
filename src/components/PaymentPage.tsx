@@ -7,7 +7,9 @@ import {
   Copy,
   CreditCard,
   Download,
+  Edit3,
   FileText,
+  Globe,
   Link2,
   Lock,
   MessageCircle,
@@ -19,15 +21,31 @@ import {
 import {
   DELIVERY_PROMISE_TEXT,
   PAID_CONFIRMATION_HEADING,
+  type DeliveryCountry,
   type MerchantPaymentConfig,
+  type OrderCustomer,
   type OrderPublic,
-  type PaymentMethodKey
+  type PaymentMethodKey,
+  type SupportedCurrency
 } from '../types/order';
+import {
+  COUNTRY_LABELS,
+  COUNTRY_UPDATE_NOTICE,
+  CURRENCY_NAMES,
+  MALAYSIAN_STATES,
+  formatCountryLabel,
+  formatCurrencyAmount,
+  formatCurrencyWithCode,
+  getAllowedPaymentMethodsForCountry,
+  getCurrencyForCountry,
+  validateCustomerDeliveryAddress
+} from '../shared/pricing';
 
 interface PaymentPageProps {
   order: OrderPublic;
   merchantConfig: MerchantPaymentConfig | null;
   merchantConfigLoading: boolean;
+  singaporeShippingConfigured?: boolean;
   whatsappUrl: string | null;
   returnNotice: 'success_pending' | 'cancelled' | 'failed' | null;
   onOrderUpdated: (updated: OrderPublic) => void;
@@ -37,8 +55,6 @@ interface PaymentPageProps {
 
 const MAX_RECEIPT_SIZE_BYTES = 10 * 1024 * 1024;
 const RECEIPT_UPLOAD_TIMEOUT_MS = 90_000;
-
-const formatRM = (sen: number) => `RM ${(sen / 100).toFixed(2)}`;
 
 const formatReceiptSize = (bytes: number): string => {
   if (!Number.isFinite(bytes) || bytes <= 0) return '0 KB';
@@ -162,20 +178,37 @@ export default function PaymentPage({
   order,
   merchantConfig,
   merchantConfigLoading,
+  singaporeShippingConfigured = true,
   whatsappUrl,
   returnNotice,
   onOrderUpdated,
   onRefreshOrder,
   onReturnHome
 }: PaymentPageProps) {
-  // Evaluate each payment option independently — only show options that are enabled and configured
+  const orderCountry: DeliveryCountry = order.deliveryCountry || order.customer?.country || 'MY';
+  const orderCurrency: SupportedCurrency = order.currency || getCurrencyForCountry(orderCountry);
+  const allowedByCountry: PaymentMethodKey[] =
+    order.allowedPaymentMethods && order.allowedPaymentMethods.length > 0
+      ? order.allowedPaymentMethods
+      : getAllowedPaymentMethodsForCountry(orderCountry);
+
+  // Evaluate each payment option strictly within the country's allowed methods
+  // Singapore (SG) -> Stripe card only. Malaysia (MY) -> TNG, Public Bank QR, Stripe card.
   const availableMethods = useMemo<PaymentMethodKey[]>(() => {
     const methods: PaymentMethodKey[] = [];
-    if (merchantConfig?.tng?.configured) methods.push('tng');
-    if (merchantConfig?.duitnow?.configured) methods.push('duitnow');
-    if (merchantConfig?.stripe?.configured) methods.push('card');
+    if (orderCountry === 'MY') {
+      if (allowedByCountry.includes('tng') && merchantConfig?.tng?.configured) {
+        methods.push('tng');
+      }
+      if (allowedByCountry.includes('duitnow') && merchantConfig?.duitnow?.configured) {
+        methods.push('duitnow');
+      }
+    }
+    if (allowedByCountry.includes('card') && merchantConfig?.stripe?.configured) {
+      methods.push('card');
+    }
     return methods;
-  }, [merchantConfig]);
+  }, [merchantConfig, orderCountry, allowedByCountry]);
 
   const [activeMethod, setActiveMethod] = useState<PaymentMethodKey | null>(() => {
     if (
@@ -211,6 +244,23 @@ export default function PaymentPage({
   const [cardError, setCardError] = useState<string | null>(null);
   const [stripeCheckoutUrl, setStripeCheckoutUrl] = useState<string | null>(null);
 
+  // Delivery country/address update state (for unpaid orders before payment)
+  const [editingDelivery, setEditingDelivery] = useState(false);
+  const [deliveryDraft, setDeliveryDraft] = useState<OrderCustomer>({
+    fullName: order.customer.fullName,
+    email: order.customer.email,
+    mobile: order.customer.mobile,
+    address: order.customer.address,
+    postcode: order.customer.postcode,
+    city: order.customer.city,
+    state: order.customer.state,
+    country: orderCountry
+  });
+  const [updatingDelivery, setUpdatingDelivery] = useState(false);
+  const [deliveryUpdateError, setDeliveryUpdateError] = useState<string | null>(null);
+  const [countryUpdatedNotice, setCountryUpdatedNotice] = useState<string | null>(null);
+  const [requiresReviewConfirmation, setRequiresReviewConfirmation] = useState(false);
+
   // Webhook confirmation polling when returning from Stripe ?payment=success
   const [waitingForWebhook, setWaitingForWebhook] = useState(
     returnNotice === 'success_pending' &&
@@ -219,6 +269,30 @@ export default function PaymentPage({
   );
   const [checkingStatus, setCheckingStatus] = useState(false);
   const [pollAttempts, setPollAttempts] = useState(0);
+
+  // Keep draft synced when order updates externally
+  useEffect(() => {
+    setDeliveryDraft({
+      fullName: order.customer.fullName,
+      email: order.customer.email,
+      mobile: order.customer.mobile,
+      address: order.customer.address,
+      postcode: order.customer.postcode,
+      city: order.customer.city,
+      state: order.customer.state,
+      country: orderCountry
+    });
+  }, [
+    order.reference,
+    order.customer.fullName,
+    order.customer.email,
+    order.customer.mobile,
+    order.customer.address,
+    order.customer.postcode,
+    order.customer.city,
+    order.customer.state,
+    orderCountry
+  ]);
 
   // Initialize active method once merchantConfig finishes loading; keep user selection afterwards
   useEffect(() => {
@@ -363,9 +437,96 @@ export default function PaymentPage({
     order.paymentStatus === 'Awaiting payment' ||
     order.paymentStatus === 'Receipt correction needed';
 
-  const handleManualQrSubmit = async (e: React.FormEvent) => {
+  const handleDraftCountryChange = (nextCountry: DeliveryCountry) => {
+    setDeliveryUpdateError(null);
+    setDeliveryDraft(prev => {
+      if (nextCountry === 'SG') {
+        return {
+          ...prev,
+          country: 'SG',
+          postcode: prev.country === 'MY' ? '' : prev.postcode,
+          city: 'Singapore',
+          state: 'Singapore'
+        };
+      }
+      return {
+        ...prev,
+        country: 'MY',
+        postcode: prev.country === 'SG' ? '' : prev.postcode,
+        city: prev.city === 'Singapore' ? '' : prev.city,
+        state: prev.state && prev.state !== 'Singapore' ? prev.state : 'Selangor'
+      };
+    });
+  };
+
+  const handleSaveDeliveryUpdate = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!canSubmitPayment) return;
+    setDeliveryUpdateError(null);
+
+    const validated = validateCustomerDeliveryAddress(deliveryDraft, {
+      requireContactFields: true
+    });
+    if (!validated.valid || !validated.normalized) {
+      setDeliveryUpdateError(validated.error || 'Please check your delivery address details.');
+      return;
+    }
+
+    setUpdatingDelivery(true);
+    try {
+      const targetCurrency = getCurrencyForCountry(validated.normalized.country);
+      const res = await fetch(`/api/orders/${encodeURIComponent(order.reference)}/delivery`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-order-token': order.accessToken
+        },
+        body: JSON.stringify({
+          accessToken: order.accessToken,
+          customer: validated.normalized,
+          currency: targetCurrency
+        })
+      });
+
+      const parsed = await parseReceiptApiJson<{
+        success?: boolean;
+        order?: OrderPublic;
+        countryChanged?: boolean;
+        totalChanged?: boolean;
+        notice?: string | null;
+        error?: string;
+        code?: string;
+      }>(res, 'Could not update delivery details.');
+
+      if (parsed.ok && parsed.data?.success && parsed.data.order) {
+        setStripeCheckoutUrl(null);
+        setCardError(null);
+        setReceiptError(null);
+        setEditingDelivery(false);
+        onOrderUpdated(parsed.data.order);
+        if (parsed.data.countryChanged || parsed.data.totalChanged) {
+          setCountryUpdatedNotice(parsed.data.notice || COUNTRY_UPDATE_NOTICE);
+          setRequiresReviewConfirmation(true);
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+        }
+      } else {
+        setDeliveryUpdateError(parsed.error || 'Could not update delivery details.');
+        if (parsed.status === 409) {
+          await onRefreshOrder();
+          setEditingDelivery(false);
+        }
+      }
+    } catch {
+      setDeliveryUpdateError('Network error while updating delivery details. Please try again.');
+    } finally {
+      setUpdatingDelivery(false);
+    }
+  };
+
+  const handleManualQrSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!canSubmitPayment || requiresReviewConfirmation) return;
+    if (orderCountry !== 'MY') return;
     if (activeMethod !== 'tng' && activeMethod !== 'duitnow') return;
 
     const cleanRef = transactionRef.trim();
@@ -508,7 +669,7 @@ export default function PaymentPage({
   };
 
   const handleStartStripeCheckout = async () => {
-    if (!canSubmitPayment) return;
+    if (!canSubmitPayment || requiresReviewConfirmation) return;
     setCardLoading(true);
     setCardError(null);
     setStripeCheckoutUrl(null);
@@ -804,58 +965,270 @@ export default function PaymentPage({
             </div>
           </div>
 
-          {/* Itemized RM Pricing Breakdown */}
+          {/* Itemized Country-Based Pricing Breakdown */}
           <dl className="space-y-3 pt-5 border-t border-[#14233C]/10 text-sm">
+            <div className="flex items-center justify-between gap-4 text-xs text-[#14233C]/70 pb-1">
+              <dt className="inline-flex items-center gap-1.5 font-semibold text-[#14233C]">
+                <Globe className="w-3.5 h-3.5 text-[#E05A40]" />
+                <span>Delivery Country & Currency</span>
+              </dt>
+              <dd className="font-bold text-[#14233C]">
+                {formatCountryLabel(orderCountry)} · {orderCurrency}
+              </dd>
+            </div>
+
             {order.regularSubtotalSen && order.savingsSen ? (
               <>
                 <div className="flex items-center justify-between gap-4 text-[#14233C]/75">
                   <dt>Regular item total</dt>
                   <dd className="tabular-nums font-medium line-through text-[#14233C]/50">
-                    {formatRM(order.regularSubtotalSen)}
+                    {formatCurrencyAmount(order.regularSubtotalSen, orderCurrency)}
                   </dd>
                 </div>
                 <div className="flex items-center justify-between gap-4 text-emerald-800 font-semibold">
                   <dt>Bundle savings (20% off)</dt>
-                  <dd className="tabular-nums">- {formatRM(order.savingsSen)}</dd>
+                  <dd className="tabular-nums">
+                    - {formatCurrencyAmount(order.savingsSen, orderCurrency)}
+                  </dd>
                 </div>
                 <div className="flex items-center justify-between gap-4 text-[#14233C]">
                   <dt className="font-medium">Bundle subtotal</dt>
-                  <dd className="tabular-nums font-semibold">{formatRM(order.subtotalSen)}</dd>
+                  <dd className="tabular-nums font-semibold">
+                    {formatCurrencyAmount(order.subtotalSen, orderCurrency)}
+                  </dd>
                 </div>
               </>
             ) : (
               <div className="flex items-center justify-between gap-4 text-[#14233C]">
                 <dt className="font-medium">Item subtotal</dt>
-                <dd className="tabular-nums font-semibold">{formatRM(order.subtotalSen)}</dd>
+                <dd className="tabular-nums font-semibold">
+                  {formatCurrencyAmount(order.subtotalSen, orderCurrency)}
+                </dd>
               </div>
             )}
 
             <div className="flex items-center justify-between gap-4 text-[#14233C]/75">
-              <dt>Delivery fee ({order.customer.state})</dt>
-              <dd className="tabular-nums font-medium">{formatRM(order.deliveryFeeSen)}</dd>
+              <dt>
+                Delivery fee ({orderCountry === 'SG' ? 'Singapore' : order.customer.state})
+              </dt>
+              <dd className="tabular-nums font-medium">
+                {formatCurrencyAmount(order.deliveryFeeSen, orderCurrency)}
+              </dd>
             </div>
 
             <div className="flex items-baseline justify-between gap-4 pt-4 border-t border-[#14233C]/12">
               <dt className="text-sm font-bold text-[#14233C]">
-                {isPaid ? 'Total Paid' : 'Exact Amount Due'}
+                {isPaid ? `Total Paid (${orderCurrency})` : `Exact Amount Due (${orderCurrency})`}
               </dt>
               <dd className="text-2xl font-extrabold tabular-nums text-[#E05A40]">
-                {formatRM(order.totalSen)}
+                {formatCurrencyAmount(order.totalSen, orderCurrency)}
               </dd>
             </div>
           </dl>
 
-          {/* Delivery Details Summary */}
-          <div className="pt-5 border-t border-[#14233C]/10 space-y-1.5 text-xs text-[#14233C]/75">
-            <p className="font-bold text-[#14233C]">Delivery Recipient</p>
-            <p className="font-medium text-[#14233C]">{order.customer.fullName}</p>
-            <p>
-              {order.customer.email} · {order.customer.mobile}
-            </p>
-            <p>
-              {order.customer.address}, {order.customer.postcode} {order.customer.city},{' '}
-              {order.customer.state}
-            </p>
+          {/* Delivery Details Summary + Unpaid Country/Address Editor */}
+          <div className="pt-5 border-t border-[#14233C]/10 space-y-2 text-xs text-[#14233C]/75">
+            <div className="flex items-center justify-between gap-2">
+              <p className="font-bold text-[#14233C]">Delivery Recipient</p>
+              {canSubmitPayment && !editingDelivery && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDeliveryUpdateError(null);
+                    setEditingDelivery(true);
+                  }}
+                  className="inline-flex items-center gap-1 text-[11px] font-bold text-[#E05A40] hover:underline"
+                >
+                  <Edit3 className="w-3 h-3" />
+                  <span>Change Country / Address</span>
+                </button>
+              )}
+            </div>
+
+            {!editingDelivery ? (
+              <div className="space-y-1">
+                <p className="font-medium text-[#14233C]">{order.customer.fullName}</p>
+                <p>
+                  {order.customer.email} · {order.customer.mobile}
+                </p>
+                <p>
+                  {order.customer.address}, {order.customer.postcode}{' '}
+                  {orderCountry === 'SG'
+                    ? 'Singapore'
+                    : `${order.customer.city}, ${order.customer.state}, Malaysia`}
+                </p>
+                <p className="font-semibold text-[#14233C]">
+                  Country: {formatCountryLabel(orderCountry)}
+                </p>
+                {isPaid && (
+                  <p className="text-[11px] text-emerald-800 font-medium pt-1">
+                    Delivery country, currency, and pricing are locked after payment confirmation.
+                  </p>
+                )}
+              </div>
+            ) : (
+              <form
+                onSubmit={handleSaveDeliveryUpdate}
+                className="space-y-3 p-3.5 rounded-xl bg-[#FAF6EE] border border-[#14233C]/15"
+              >
+                <p className="text-[11px] font-bold text-[#14233C]">
+                  Update Delivery Country or Address (Recalculates Total)
+                </p>
+                <div>
+                  <label className="block text-[11px] font-bold text-[#14233C] mb-1">
+                    Delivery Country *
+                  </label>
+                  <select
+                    required
+                    value={deliveryDraft.country}
+                    onChange={e => handleDraftCountryChange(e.target.value as DeliveryCountry)}
+                    className="w-full px-3 py-2 rounded-lg bg-white border border-[#14233C]/20 text-xs font-semibold text-[#14233C]"
+                  >
+                    <option value="MY">Malaysia (MY) — MYR</option>
+                    <option value="SG">
+                      Singapore (SG) — SGD (Stripe Card only)
+                      {!singaporeShippingConfigured ? ' — Rate Not Configured' : ''}
+                    </option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-bold text-[#14233C] mb-1">
+                    {deliveryDraft.country === 'SG'
+                      ? 'Block, Street & Unit Number'
+                      : 'Street Address'}
+                  </label>
+                  <textarea
+                    required
+                    rows={2}
+                    value={deliveryDraft.address}
+                    onChange={e => setDeliveryDraft({ ...deliveryDraft, address: e.target.value })}
+                    className="w-full px-3 py-2 rounded-lg bg-white border border-[#14233C]/20 text-xs text-[#14233C]"
+                  />
+                </div>
+
+                {deliveryDraft.country === 'MY' ? (
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                    <div>
+                      <label className="block text-[11px] font-bold text-[#14233C] mb-1">
+                        Postcode (5d)
+                      </label>
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        pattern="\d{5}"
+                        maxLength={5}
+                        required
+                        value={deliveryDraft.postcode}
+                        onChange={e =>
+                          setDeliveryDraft({
+                            ...deliveryDraft,
+                            postcode: e.target.value.replace(/\D/g, '').slice(0, 5)
+                          })
+                        }
+                        className="w-full px-2.5 py-2 rounded-lg bg-white border border-[#14233C]/20 text-xs font-mono text-[#14233C]"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-bold text-[#14233C] mb-1">
+                        City
+                      </label>
+                      <input
+                        type="text"
+                        required
+                        value={deliveryDraft.city}
+                        onChange={e =>
+                          setDeliveryDraft({ ...deliveryDraft, city: e.target.value })
+                        }
+                        className="w-full px-2.5 py-2 rounded-lg bg-white border border-[#14233C]/20 text-xs text-[#14233C]"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-bold text-[#14233C] mb-1">
+                        State
+                      </label>
+                      <select
+                        required
+                        value={deliveryDraft.state}
+                        onChange={e =>
+                          setDeliveryDraft({ ...deliveryDraft, state: e.target.value })
+                        }
+                        className="w-full px-2.5 py-2 rounded-lg bg-white border border-[#14233C]/20 text-xs text-[#14233C]"
+                      >
+                        {MALAYSIAN_STATES.map(st => (
+                          <option key={st} value={st}>
+                            {st}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label className="block text-[11px] font-bold text-[#14233C] mb-1">
+                        Postal Code (6 digits)
+                      </label>
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        pattern="\d{6}"
+                        maxLength={6}
+                        required
+                        placeholder="238801"
+                        value={deliveryDraft.postcode}
+                        onChange={e =>
+                          setDeliveryDraft({
+                            ...deliveryDraft,
+                            postcode: e.target.value.replace(/\D/g, '').slice(0, 6)
+                          })
+                        }
+                        className="w-full px-2.5 py-2 rounded-lg bg-white border border-[#14233C]/20 text-xs font-mono text-[#14233C]"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-bold text-[#14233C] mb-1">
+                        Region
+                      </label>
+                      <input
+                        type="text"
+                        readOnly
+                        value="Singapore"
+                        className="w-full px-2.5 py-2 rounded-lg bg-[#FAF6EE] border border-[#14233C]/15 text-xs text-[#14233C]/75"
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {deliveryUpdateError && (
+                  <p role="alert" className="text-[11px] font-bold text-red-700">
+                    {deliveryUpdateError}
+                  </p>
+                )}
+
+                <div className="flex items-center gap-2 pt-1">
+                  <button
+                    type="submit"
+                    disabled={updatingDelivery}
+                    className="flex-1 py-2 px-3 rounded-lg bg-[#14233C] text-white text-xs font-bold hover:bg-[#1e3357] disabled:opacity-60"
+                  >
+                    {updatingDelivery ? 'Recalculating…' : 'Save & Recalculate Total'}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={updatingDelivery}
+                    onClick={() => {
+                      setEditingDelivery(false);
+                      setDeliveryUpdateError(null);
+                    }}
+                    className="px-3 py-2 rounded-lg border border-[#14233C]/20 bg-white text-xs font-semibold text-[#14233C]"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </form>
+            )}
+
             <p className="pt-2 text-[11px] font-medium text-[#14233C]/70">
               {DELIVERY_PROMISE_TEXT}
             </p>
@@ -908,9 +1281,15 @@ export default function PaymentPage({
                   </dd>
                 </div>
                 <div>
-                  <dt className="text-[#14233C]/60">Total Paid</dt>
+                  <dt className="text-[#14233C]/60">Delivery Country</dt>
+                  <dd className="font-bold text-[#14233C] mt-0.5">
+                    {formatCountryLabel(orderCountry)}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-[#14233C]/60">Total Paid ({orderCurrency})</dt>
                   <dd className="font-extrabold tabular-nums text-emerald-800 text-sm mt-0.5">
-                    {formatRM(order.totalSen)}
+                    {formatCurrencyWithCode(order.totalSen, orderCurrency)}
                   </dd>
                 </div>
                 <div>
@@ -997,9 +1376,9 @@ export default function PaymentPage({
                   </dd>
                 </div>
                 <div>
-                  <dt className="text-[#14233C]/60">Amount Submitted</dt>
+                  <dt className="text-[#14233C]/60">Amount Submitted ({orderCurrency})</dt>
                   <dd className="font-bold tabular-nums text-[#14233C] mt-0.5">
-                    {formatRM(order.totalSen)}
+                    {formatCurrencyWithCode(order.totalSen, orderCurrency)}
                   </dd>
                 </div>
               </dl>
@@ -1038,8 +1417,8 @@ export default function PaymentPage({
                   </h2>
                   <p className="text-sm text-[#14233C]/75 leading-relaxed">
                     We only confirm card orders once Stripe sends a verified payment notification
-                    matching your order reference and exact MYR total. This usually takes a few
-                    seconds.
+                    matching your order reference, delivery country ({formatCountryLabel(orderCountry)}),
+                    and exact {orderCurrency} total. This usually takes a few seconds.
                   </p>
                 </div>
               </div>
@@ -1105,9 +1484,48 @@ export default function PaymentPage({
                   </div>
                 )}
 
-              {/* Select Payment Method — Three Independent Options */}
+              {/* Required Review Confirmation Banner after Delivery Country Change */}
+              {countryUpdatedNotice && (
+                <div
+                  role="alert"
+                  className="p-4 rounded-xl bg-amber-50 border border-amber-300 text-amber-950 text-xs space-y-3"
+                >
+                  <div className="flex items-start gap-2.5">
+                    <AlertCircle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                    <div className="space-y-1">
+                      <p className="font-extrabold">{countryUpdatedNotice}</p>
+                      <p className="leading-relaxed">
+                        Updated total for{' '}
+                        <strong>{formatCountryLabel(orderCountry)}</strong>:{' '}
+                        <strong className="tabular-nums text-[#E05A40]">
+                          {formatCurrencyWithCode(order.totalSen, orderCurrency)}
+                        </strong>
+                        . Any previous unpaid checkout session was invalidated automatically.
+                      </p>
+                    </div>
+                  </div>
+                  {requiresReviewConfirmation && (
+                    <button
+                      type="button"
+                      onClick={() => setRequiresReviewConfirmation(false)}
+                      className="w-full sm:w-auto px-4 py-2 rounded-lg bg-[#14233C] text-white text-xs font-bold hover:bg-[#1e3357] transition-colors"
+                    >
+                      I’ve Reviewed the Updated Total — Continue to Payment
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {/* Select Payment Method — Filtered Strictly by Delivery Country */}
               <div className="space-y-2.5">
-                <h2 className="text-base font-bold text-[#14233C]">Select Payment Method</h2>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h2 className="text-base font-bold text-[#14233C]">Select Payment Method</h2>
+                  <span className="text-[11px] font-semibold text-[#14233C]/65">
+                    {orderCountry === 'SG'
+                      ? 'Singapore (SGD) · Stripe Card Only'
+                      : 'Malaysia (MYR)'}
+                  </span>
+                </div>
 
                 {merchantConfigLoading ? (
                   <div className="py-6 text-xs text-[#14233C]/60">Loading available payment methods…</div>
@@ -1118,7 +1536,8 @@ export default function PaymentPage({
                   >
                     <AlertCircle className="w-4 h-4 text-[#E05A40] shrink-0 mt-0.5" />
                     <p>
-                      No payment methods are currently enabled for checkout. Your order{' '}
+                      No payment methods are currently enabled for{' '}
+                      <strong>{COUNTRY_LABELS[orderCountry]}</strong> checkout. Your order{' '}
                       <span className="font-mono font-bold text-[#14233C]">{order.reference}</span>{' '}
                       is saved — please contact the shop to complete payment.
                     </p>
@@ -1135,7 +1554,7 @@ export default function PaymentPage({
                           : 'grid-cols-1'
                     }`}
                   >
-                    {merchantConfig?.tng?.configured && (
+                    {availableMethods.includes('tng') && merchantConfig?.tng?.configured && (
                       <button
                         type="button"
                         role="tab"
@@ -1158,7 +1577,7 @@ export default function PaymentPage({
                       </button>
                     )}
 
-                    {merchantConfig?.duitnow?.configured && (
+                    {availableMethods.includes('duitnow') && merchantConfig?.duitnow?.configured && (
                       <button
                         type="button"
                         role="tab"
@@ -1181,7 +1600,7 @@ export default function PaymentPage({
                       </button>
                     )}
 
-                    {merchantConfig?.stripe?.configured && (
+                    {availableMethods.includes('card') && merchantConfig?.stripe?.configured && (
                       <button
                         type="button"
                         role="tab"
@@ -1199,7 +1618,7 @@ export default function PaymentPage({
                       >
                         <CreditCard className="w-4 h-4 shrink-0" />
                         <span className="text-xs font-bold leading-snug">
-                          Credit or Debit Card
+                          Credit or Debit Card ({orderCurrency})
                         </span>
                       </button>
                     )}
@@ -1207,8 +1626,10 @@ export default function PaymentPage({
                 )}
               </div>
 
-              {/* MANUAL QR PANEL — Shows ONLY the currently selected QR option */}
-              {(activeMethod === 'tng' || activeMethod === 'duitnow') && activeQrConfig && (
+              {/* MANUAL QR PANEL — Malaysia (MYR) ONLY */}
+              {orderCountry === 'MY' &&
+                (activeMethod === 'tng' || activeMethod === 'duitnow') &&
+                activeQrConfig && (
                 <div key={activeMethod} role="tabpanel" className="pt-5 border-t border-[#14233C]/10 space-y-6">
                   {/* QR + Merchant Transfer Details */}
                   <div className="grid grid-cols-1 md:grid-cols-12 gap-6 items-start">
@@ -1263,7 +1684,7 @@ export default function PaymentPage({
                         <li>
                           Pay the exact saved order total of{' '}
                           <strong className="tabular-nums text-[#E05A40]">
-                            {formatRM(order.totalSen)}
+                            {formatCurrencyWithCode(order.totalSen, orderCurrency)}
                           </strong>
                           .
                         </li>
@@ -1285,10 +1706,10 @@ export default function PaymentPage({
                           </dd>
                         </div>
                         <div className="flex items-center justify-between gap-3">
-                          <dt className="text-[#14233C]/65">Exact Order Total</dt>
+                          <dt className="text-[#14233C]/65">Exact Order Total ({orderCurrency})</dt>
                           <dd className="flex items-center gap-2">
                             <span className="font-extrabold text-base tabular-nums text-[#E05A40]">
-                              {formatRM(order.totalSen)}
+                              {formatCurrencyAmount(order.totalSen, orderCurrency)}
                             </span>
                             <button
                               type="button"
@@ -1399,14 +1820,16 @@ export default function PaymentPage({
 
                     <button
                       type="submit"
-                      disabled={receiptSubmitting}
+                      disabled={receiptSubmitting || requiresReviewConfirmation}
                       className="w-full py-3.5 px-6 rounded-xl bg-[#14233C] text-white font-bold text-sm hover:bg-[#1e3357] disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
                     >
                       {receiptSubmitting
                         ? `Uploading receipt (${receiptUploadProgress}%)…`
-                        : isCorrectionNeeded
-                          ? `Upload Replacement ${activeQrConfig.label} Receipt`
-                          : `Submit ${activeQrConfig.label} Receipt`}
+                        : requiresReviewConfirmation
+                          ? 'Please Review Updated Total Above First'
+                          : isCorrectionNeeded
+                            ? `Upload Replacement ${activeQrConfig.label} Receipt`
+                            : `Submit ${activeQrConfig.label} Receipt`}
                     </button>
                   </form>
                 </div>
@@ -1429,10 +1852,11 @@ export default function PaymentPage({
                     <p className="text-xs text-[#14233C]/75 leading-relaxed">
                       You will be redirected to Stripe’s secure hosted checkout to pay{' '}
                       <strong className="tabular-nums text-[#14233C]">
-                        {formatRM(order.totalSen)}
+                        {formatCurrencyAmount(order.totalSen, orderCurrency)}
                       </strong>{' '}
-                      in Malaysian Ringgit (MYR). Your order is confirmed automatically once Stripe
-                      verifies the payment.
+                      in <strong>{CURRENCY_NAMES[orderCurrency]}</strong> for{' '}
+                      <strong>{formatCountryLabel(orderCountry)}</strong> delivery. Your order is
+                      confirmed automatically once Stripe verifies the payment.
                     </p>
                   </div>
 
@@ -1446,7 +1870,7 @@ export default function PaymentPage({
                     </div>
                   )}
 
-                  {stripeCheckoutUrl ? (
+                  {stripeCheckoutUrl && !requiresReviewConfirmation ? (
                     <div className="space-y-2.5">
                       <a
                         href={stripeCheckoutUrl}
@@ -1455,7 +1879,10 @@ export default function PaymentPage({
                         className="w-full py-3.5 px-6 rounded-xl bg-[#FF8D76] text-[#14233C] font-extrabold text-sm hover:bg-[#ff7b60] transition-colors flex items-center justify-center gap-2"
                       >
                         <CreditCard className="w-4 h-4" />
-                        <span>Continue to Stripe Checkout ({formatRM(order.totalSen)})</span>
+                        <span>
+                          Continue to Stripe Checkout (
+                          {formatCurrencyWithCode(order.totalSen, orderCurrency)})
+                        </span>
                       </a>
                       <p className="text-[11px] text-center text-[#14233C]/70">
                         Your Stripe Checkout session is ready and will open in a secure top-level tab.
@@ -1464,7 +1891,7 @@ export default function PaymentPage({
                   ) : (
                     <button
                       type="button"
-                      disabled={cardLoading}
+                      disabled={cardLoading || requiresReviewConfirmation}
                       onClick={handleStartStripeCheckout}
                       className="w-full py-3.5 px-6 rounded-xl bg-[#FF8D76] text-[#14233C] font-extrabold text-sm hover:bg-[#ff7b60] disabled:opacity-60 disabled:cursor-not-allowed transition-colors flex items-center justify-center gap-2"
                     >
@@ -1472,7 +1899,9 @@ export default function PaymentPage({
                       <span>
                         {cardLoading
                           ? 'Opening Stripe Checkout…'
-                          : `Pay ${formatRM(order.totalSen)} with Card`}
+                          : requiresReviewConfirmation
+                            ? 'Review Updated Total Above to Continue'
+                            : `Pay ${formatCurrencyAmount(order.totalSen, orderCurrency)} (${orderCurrency}) with Card`}
                       </span>
                     </button>
                   )}
@@ -1480,8 +1909,8 @@ export default function PaymentPage({
                   <p className="text-[11px] text-[#14233C]/60 flex items-center justify-center gap-1.5">
                     <Lock className="w-3.5 h-3.5 shrink-0" />
                     <span>
-                      Hosted by Stripe · Charged in MYR · If cancelled, you return directly to this
-                      order
+                      Hosted by Stripe · Fixed charge in {orderCurrency} (no automatic currency
+                      conversion) · If cancelled, you return directly to this order
                     </span>
                   </p>
                 </div>
