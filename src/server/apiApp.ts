@@ -7,6 +7,7 @@ import Stripe from 'stripe';
 import type {
   DeliveryCountry,
   EditableStoreSettings,
+  MetaConnectionCheckResult,
   MetaConversionEventPublic,
   MetaConversionEventStatus,
   MetaTrackingDiagnostic,
@@ -77,7 +78,8 @@ import {
   sanitizeEventSourceUrl,
   sanitizeMetaCookie,
   sanitizeMetaError,
-  sendMetaCapiPurchaseEvent
+  sendMetaCapiPurchaseEvent,
+  verifyMetaCapiConnection
 } from './metaCapi';
 import {
   buildPurchaseEventId,
@@ -332,6 +334,7 @@ const inFlightConfirmationEmails: Set<string> = new Set();
 const inFlightMetaConversions: Set<string> = new Set();
 const inFlightStripeEvents: Set<string> = new Set();
 const orderOperationLocks: Map<string, Promise<void>> = new Map();
+let lastMetaConnectionCheck: (MetaConnectionCheckResult & { pixelId: string | null }) | null = null;
 
 async function withOrderLock<T>(reference: string, fn: () => Promise<T>): Promise<T> {
   const prev = orderOperationLocks.get(reference) || Promise.resolve();
@@ -664,13 +667,56 @@ async function buildMetaTrackingDiagnostic(
     );
   }
 
+  // Only surface cached connection check if it matches the currently active runtime META_PIXEL_ID
+  const activeCheck =
+    lastMetaConnectionCheck &&
+    lastMetaConnectionCheck.pixelId &&
+    lastMetaConnectionCheck.pixelId === metaCfg.pixelId
+      ? {
+          checkedAt: lastMetaConnectionCheck.checkedAt,
+          ok: lastMetaConnectionCheck.ok,
+          status: lastMetaConnectionCheck.status,
+          datasetName: lastMetaConnectionCheck.datasetName ?? null,
+          message: lastMetaConnectionCheck.message
+        }
+      : null;
+
+  const latestEvent = recentEvents[0] || null;
+  let capiConnectionStatus: MetaTrackingDiagnostic['capiConnectionStatus'];
+  let capiConnectionMessage: string;
+
+  if (!metaCfg.capiConfigured) {
+    capiConnectionStatus = 'not_configured';
+    capiConnectionMessage =
+      metaCfg.issues.join(' ') ||
+      'Set META_PIXEL_ID and META_CAPI_ACCESS_TOKEN in server environment variables.';
+  } else if (activeCheck) {
+    capiConnectionStatus = activeCheck.ok ? 'connected' : 'error';
+    capiConnectionMessage = activeCheck.message;
+  } else if (latestEvent && latestEvent.status === 'sent') {
+    capiConnectionStatus = 'connected';
+    capiConnectionMessage = `Server CAPI credentials set for Dataset ID ${metaCfg.pixelId}. Most recent recorded Purchase event delivered cleanly; click Test CAPI Connection to verify active credentials.`;
+  } else if (latestEvent && latestEvent.status === 'failed') {
+    capiConnectionStatus = 'error';
+    capiConnectionMessage =
+      latestEvent.errorMessage ||
+      'Most recent recorded Conversions API event delivery failed. Click Test CAPI Connection to verify active credentials.';
+  } else {
+    capiConnectionStatus = 'configured';
+    capiConnectionMessage = `Server-side CAPI credentials configured for Dataset ID ${metaCfg.pixelId}. Click Test CAPI Connection to verify reachability.`;
+  }
+
   return {
     pixelConfigured: metaCfg.pixelConfigured,
     pixelId: metaCfg.pixelId,
     capiConfigured: metaCfg.capiConfigured,
+    capiConnectionStatus,
+    capiConnectionMessage,
+    testEventConfigured: metaCfg.testEventConfigured,
     testMode: metaCfg.testMode,
     schemaReady,
     lastSuccessAt,
+    lastConnectionCheck: activeCheck,
     summary: {
       sent,
       failed,
@@ -2070,6 +2116,7 @@ export function createApiApp(): express.Express {
   });
 
   app.get('/api/store-config', async (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store, max-age=0');
     const { settings, supabase, merchantConfig, diagnostics } = await evaluateAllPaymentMethods();
     return res.json({
       success: true,
@@ -4832,6 +4879,27 @@ export function createApiApp(): express.Express {
     } catch (err) {
       console.error(`Retry Meta CAPI error for ${reference}:`, sanitizeMetaError(err));
       return res.status(500).json({ error: 'Failed to retry Meta Purchase event.' });
+    }
+  });
+
+  // Protected: Read-only verification of current runtime META_PIXEL_ID & META_CAPI_ACCESS_TOKEN.
+  // Never exposes META_CAPI_ACCESS_TOKEN, never sends synthetic Purchase events, and never resends past purchases.
+  app.post('/api/admin/meta-capi/verify', requireAdminAuth, async (_req, res) => {
+    try {
+      const supabase = await checkSupabaseHealth(false);
+      const checkResult = await verifyMetaCapiConnection();
+      lastMetaConnectionCheck = checkResult;
+      const metaTracking = await buildMetaTrackingDiagnostic(supabase);
+      return res.status(checkResult.ok ? 200 : checkResult.status === 'not_configured' ? 503 : 502).json({
+        success: checkResult.ok,
+        message: checkResult.message,
+        metaTracking
+      });
+    } catch (err) {
+      return res.status(500).json({
+        success: false,
+        error: sanitizeMetaError(err)
+      });
     }
   });
 

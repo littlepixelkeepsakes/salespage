@@ -32,6 +32,7 @@ const FIRED_PURCHASES_STORAGE_KEY = 'lpk_meta_fired_purchases';
 const META_COOKIE_REGEX = /^fb\.\d+\.\d+\.[A-Za-z0-9._-]{1,120}$/;
 
 let initializedPixelId: string | null = null;
+const initializedPixelIds = new Set<string>();
 const firedPurchaseEventIdsInMemory = new Set<string>();
 
 function isBrowserEnv(): boolean {
@@ -174,18 +175,26 @@ export function createMetaEventId(prefix: string): string {
   return `${prefix}_${randomPart}`;
 }
 
+export function getActiveMetaPixelId(): string | null {
+  return initializedPixelId;
+}
+
 /**
- * Loads Meta Pixel (fbevents.js) at most once and initializes it for the given numeric Pixel ID.
- * Prevents duplicate initialisation, respects consent, and strictly skips Staff Admin routes.
+ * Loads Meta Pixel (fbevents.js) at most once and initializes it for the given numeric Dataset/Pixel ID.
+ * Prevents duplicate initialisation, respects consent, strictly skips Staff Admin routes, and
+ * guarantees events are dispatched exclusively to the active runtime META_PIXEL_ID via trackSingle.
  */
 export function initMetaPixel(pixelId: string | null | undefined): boolean {
   if (!isBrowserEnv()) return false;
-  if (!isValidMetaPixelId(pixelId)) return false;
+  if (!isValidMetaPixelId(pixelId)) {
+    initializedPixelId = null;
+    return false;
+  }
   if (isExcludedMarketingRoute()) return false;
   if (getEffectiveMarketingConsent() !== 'granted') return false;
 
   const cleanPixelId = pixelId!.trim();
-  if (initializedPixelId === cleanPixelId) {
+  if (initializedPixelId === cleanPixelId && initializedPixelIds.has(cleanPixelId)) {
     return true;
   }
 
@@ -223,7 +232,10 @@ export function initMetaPixel(pixelId: string | null | undefined): boolean {
     const fbq = window.fbq;
     if (!fbq) return false;
     fbq('consent', 'grant');
-    fbq('init', cleanPixelId);
+    if (!initializedPixelIds.has(cleanPixelId)) {
+      fbq('init', cleanPixelId);
+      initializedPixelIds.add(cleanPixelId);
+    }
     initializedPixelId = cleanPixelId;
     return true;
   } catch {
@@ -246,14 +258,18 @@ function dispatchStandardEvent(
   params?: Record<string, any>,
   eventId?: string
 ): string | null {
-  if (!isMetaPixelReady()) return null;
+  if (!isMetaPixelReady() || !initializedPixelId) return null;
   const resolvedEventId = eventId || createMetaEventId(eventName.toLowerCase());
   try {
-    if (params) {
-      window.fbq!('track', eventName, params, { eventID: resolvedEventId });
-    } else {
-      window.fbq!('track', eventName, {}, { eventID: resolvedEventId });
-    }
+    // Use trackSingle so events are sent ONLY to the currently configured Dataset/Pixel ID
+    // and never broadcast to any previously loaded or third-party Pixel ID.
+    window.fbq!(
+      'trackSingle',
+      initializedPixelId,
+      eventName,
+      params || {},
+      { eventID: resolvedEventId }
+    );
     return resolvedEventId;
   } catch {
     return null;

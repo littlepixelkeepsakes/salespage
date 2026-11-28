@@ -111,6 +111,7 @@ export default function AdminPage({
   const [actionBusyRef, setActionBusyRef] = useState<string | null>(null);
   const [retryingEmailRef, setRetryingEmailRef] = useState<string | null>(null);
   const [retryingMetaRef, setRetryingMetaRef] = useState<string | null>(null);
+  const [testingMetaConnection, setTestingMetaConnection] = useState<boolean>(false);
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
   const [copiedLinkRef, setCopiedLinkRef] = useState<string | null>(null);
 
@@ -520,6 +521,41 @@ export default function AdminPage({
       );
     } finally {
       setRetryingMetaRef(null);
+    }
+  };
+
+  const handleVerifyMetaConnection = async () => {
+    if (!authToken) return;
+    setTestingMetaConnection(true);
+    setDashboardError(null);
+    setActionFeedback(null);
+    try {
+      const res = await fetch('/api/admin/meta-capi/verify', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${authToken}`
+        }
+      });
+      const data = await res.json();
+      if (res.status === 401) {
+        setAuthToken(null);
+        setAuthError('Session expired. Please sign in again.');
+        return;
+      }
+      if (data.metaTracking) {
+        setDiagnostics(prev => (prev ? { ...prev, metaTracking: data.metaTracking } : prev));
+      }
+      if (res.ok && data.success) {
+        setActionFeedback(data.message || 'Meta Conversions API connection verified.');
+      } else {
+        setDashboardError(
+          data.message || data.error || 'Could not verify Meta Conversions API connection.'
+        );
+      }
+    } catch {
+      setDashboardError('Network error while checking Meta Conversions API connection.');
+    } finally {
+      setTestingMetaConnection(false);
     }
   };
 
@@ -1096,41 +1132,42 @@ export default function AdminPage({
                   <span className="font-bold text-[#14233C]">Meta Pixel &amp; CAPI</span>
                   <span
                     className={`font-bold ${
-                      diagnostics.metaTracking.pixelConfigured &&
-                      diagnostics.metaTracking.capiConfigured
+                      diagnostics.metaTracking.capiConnectionStatus === 'connected'
                         ? 'text-emerald-800'
-                        : diagnostics.metaTracking.pixelConfigured
-                          ? 'text-amber-800'
-                          : 'text-[#14233C]/65'
+                        : diagnostics.metaTracking.capiConnectionStatus === 'error'
+                          ? 'text-red-700'
+                          : diagnostics.metaTracking.pixelConfigured
+                            ? 'text-amber-800'
+                            : 'text-[#14233C]/65'
                     }`}
                   >
-                    {diagnostics.metaTracking.pixelConfigured &&
-                    diagnostics.metaTracking.capiConfigured
+                    {diagnostics.metaTracking.capiConnectionStatus === 'connected'
                       ? diagnostics.metaTracking.testMode
-                        ? 'Active (Test Mode)'
-                        : 'Active (Prod)'
-                      : diagnostics.metaTracking.pixelConfigured
-                        ? 'Pixel Only'
-                        : 'Not Set'}
+                        ? 'Connected (Test)'
+                        : 'Connected'
+                      : diagnostics.metaTracking.capiConnectionStatus === 'configured'
+                        ? diagnostics.metaTracking.testMode
+                          ? 'Configured (Test)'
+                          : 'Configured'
+                        : diagnostics.metaTracking.capiConnectionStatus === 'error'
+                          ? 'CAPI Error'
+                          : diagnostics.metaTracking.pixelConfigured
+                            ? 'Pixel Only'
+                            : 'Not Set'}
                   </span>
                 </div>
                 <p className="text-[#14233C]/70 break-words">
-                  Pixel:{' '}
-                  <strong className="text-[#14233C]">
-                    {diagnostics.metaTracking.pixelConfigured
-                      ? `ID ${diagnostics.metaTracking.pixelId}`
-                      : 'Not configured'}
-                  </strong>
-                  {' · '}CAPI:{' '}
-                  <strong className="text-[#14233C]">
-                    {diagnostics.metaTracking.capiConfigured ? 'Configured' : 'Not set'}
+                  Dataset / Pixel ID:{' '}
+                  <strong className="font-mono text-[#14233C]">
+                    {diagnostics.metaTracking.pixelId || 'Not set'}
                   </strong>
                 </p>
-                {diagnostics.metaTracking.lastSuccessAt && (
-                  <p className="text-[11px] text-emerald-800 font-medium">
-                    Last CAPI Purchase: {new Date(diagnostics.metaTracking.lastSuccessAt).toLocaleString()}
-                  </p>
-                )}
+                <p className="text-[11px] text-[#14233C]/70 break-words">
+                  Test Event Code:{' '}
+                  <strong className="text-[#14233C]">
+                    {diagnostics.metaTracking.testEventConfigured ? 'Enabled (Test Mode)' : 'Off (Production)'}
+                  </strong>
+                </p>
                 {!diagnostics.metaTracking.schemaReady && (
                   <p className="text-[11px] text-amber-900 font-semibold">
                     Run supabase/migrations/003_meta_conversions.sql to persist CAPI delivery logs.
@@ -1147,31 +1184,97 @@ export default function AdminPage({
                 <div className="flex items-center gap-2">
                   <Activity className="w-4 h-4 text-[#14233C]" />
                   <h3 className="text-xs font-extrabold uppercase tracking-wider text-[#14233C]">
-                    Meta Conversions API (Purchase Events &amp; Deduplication)
+                    Meta Tracking Diagnostics (Pixel &amp; Conversions API)
                   </h3>
                 </div>
-                <div className="flex flex-wrap items-center gap-3 text-[11px] font-semibold text-[#14233C]/75">
-                  <span>
-                    Mode:{' '}
-                    <strong className="text-[#14233C]">
-                      {diagnostics.metaTracking.testMode ? 'Test Event Code Active' : 'Production'}
-                    </strong>
-                  </span>
-                  <span aria-hidden="true">·</span>
-                  <span>
-                    Sent: <strong className="text-emerald-800">{diagnostics.metaTracking.summary.sent}</strong>
-                  </span>
-                  <span>
-                    Failed: <strong className="text-red-700">{diagnostics.metaTracking.summary.failed}</strong>
-                  </span>
-                  <span>
-                    Last Success:{' '}
+                <button
+                  type="button"
+                  disabled={testingMetaConnection || !diagnostics.metaTracking.capiConfigured}
+                  onClick={handleVerifyMetaConnection}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-[#14233C]/15 bg-white text-[11px] font-bold text-[#14233C] hover:bg-[#FAF6EE] disabled:opacity-50 transition-colors"
+                >
+                  <RefreshCw className={`w-3 h-3 ${testingMetaConnection ? 'animate-spin' : ''}`} />
+                  <span>{testingMetaConnection ? 'Testing…' : 'Test CAPI Connection'}</span>
+                </button>
+              </div>
+
+              {/* Explicit 4-Field Diagnostics Summary (NEVER displays CAPI access token) */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
+                <div className="p-3 rounded-xl bg-[#FAF6EE]/70 border border-[#14233C]/10 space-y-1">
+                  <p className="text-[11px] font-semibold text-[#14233C]/60">Current Pixel / Dataset ID</p>
+                  <p className="font-mono font-extrabold text-[#14233C] break-all">
+                    {diagnostics.metaTracking.pixelId || 'Not configured'}
+                  </p>
+                  <p className="text-[11px] text-[#14233C]/65">
+                    {diagnostics.metaTracking.pixelConfigured
+                      ? 'Shared by browser Pixel & server CAPI (runtime env).'
+                      : 'Set META_PIXEL_ID in server environment variables.'}
+                  </p>
+                </div>
+
+                <div className="p-3 rounded-xl bg-[#FAF6EE]/70 border border-[#14233C]/10 space-y-1">
+                  <p className="text-[11px] font-semibold text-[#14233C]/60">CAPI Connection Status</p>
+                  <p
+                    className={`font-extrabold ${
+                      diagnostics.metaTracking.capiConnectionStatus === 'connected'
+                        ? 'text-emerald-800'
+                        : diagnostics.metaTracking.capiConnectionStatus === 'error'
+                          ? 'text-red-700'
+                          : diagnostics.metaTracking.capiConnectionStatus === 'configured'
+                            ? 'text-[#14233C]'
+                            : 'text-amber-800'
+                    }`}
+                  >
+                    {diagnostics.metaTracking.capiConnectionStatus === 'connected'
+                      ? 'Connected'
+                      : diagnostics.metaTracking.capiConnectionStatus === 'configured'
+                        ? 'Configured (Server Token Set)'
+                        : diagnostics.metaTracking.capiConnectionStatus === 'error'
+                          ? 'Connection Error'
+                          : 'Not Configured'}
+                  </p>
+                  <p className="text-[11px] text-[#14233C]/65 break-words">
+                    {diagnostics.metaTracking.capiConnectionMessage}
+                  </p>
+                </div>
+
+                <div className="p-3 rounded-xl bg-[#FAF6EE]/70 border border-[#14233C]/10 space-y-1">
+                  <p className="text-[11px] font-semibold text-[#14233C]/60">Test Event Configuration</p>
+                  <p
+                    className={`font-extrabold ${
+                      diagnostics.metaTracking.testEventConfigured
+                        ? 'text-amber-800'
+                        : 'text-emerald-800'
+                    }`}
+                  >
+                    {diagnostics.metaTracking.testEventConfigured
+                      ? 'Test Mode Enabled'
+                      : 'Production Mode (Off)'}
+                  </p>
+                  <p className="text-[11px] text-[#14233C]/65">
+                    {diagnostics.metaTracking.testEventConfigured
+                      ? 'META_TEST_EVENT_CODE is active for Events Manager testing.'
+                      : 'META_TEST_EVENT_CODE is unset; live events route to production.'}
+                  </p>
+                </div>
+
+                <div className="p-3 rounded-xl bg-[#FAF6EE]/70 border border-[#14233C]/10 space-y-1">
+                  <p className="text-[11px] font-semibold text-[#14233C]/60">Recent Event Delivery</p>
+                  <p className="font-extrabold text-[#14233C] tabular-nums">
+                    <span className="text-emerald-800">{diagnostics.metaTracking.summary.sent} sent</span>
+                    {' · '}
+                    <span className={diagnostics.metaTracking.summary.failed > 0 ? 'text-red-700' : 'text-[#14233C]/65'}>
+                      {diagnostics.metaTracking.summary.failed} failed
+                    </span>
+                  </p>
+                  <p className="text-[11px] text-[#14233C]/65">
+                    Last success:{' '}
                     <strong className="text-[#14233C]">
                       {diagnostics.metaTracking.lastSuccessAt
                         ? new Date(diagnostics.metaTracking.lastSuccessAt).toLocaleString()
                         : 'None yet'}
                     </strong>
-                  </span>
+                  </p>
                 </div>
               </div>
 

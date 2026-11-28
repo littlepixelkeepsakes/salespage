@@ -137,13 +137,25 @@ export interface MetaConversionEventPublic {
   lastAttemptAt: string;
 }
 
+export interface MetaConnectionCheckResult {
+  checkedAt: string;
+  ok: boolean;
+  status: 'connected' | 'error' | 'not_configured';
+  datasetName?: string | null;
+  message: string;
+}
+
 export interface MetaTrackingDiagnostic {
   pixelConfigured: boolean;
   pixelId: string | null;
   capiConfigured: boolean;
+  capiConnectionStatus: 'connected' | 'configured' | 'error' | 'not_configured';
+  capiConnectionMessage: string;
+  testEventConfigured: boolean;
   testMode: boolean;
   schemaReady: boolean;
   lastSuccessAt: string | null;
+  lastConnectionCheck?: MetaConnectionCheckResult | null;
   summary: {
     sent: number;
     failed: number;

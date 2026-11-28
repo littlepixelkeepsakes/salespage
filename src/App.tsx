@@ -533,8 +533,8 @@ export default function App() {
       }
     }
 
-    // Fetch editable storefront settings, Supabase readiness & merchant payment options
-    fetch('/api/store-config')
+    // Fetch editable storefront settings, Supabase readiness, merchant payment options & live runtime Meta Pixel ID
+    fetch('/api/store-config', { cache: 'no-store' })
       .then(res =>
         parseApiJsonResponse<{
           success?: boolean;
@@ -2579,6 +2579,7 @@ export default function App() {
             whatsappUrl={storefront.whatsappUrl}
             returnNotice={paymentReturnNotice}
             excludeTracking={staffPreviewOrder}
+            metaPixelId={metaPixelId}
             onOrderUpdated={updated => {
               setCurrentOrder(updated);
               setPaymentReturnNotice(null);

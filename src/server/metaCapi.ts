@@ -1,5 +1,9 @@
 import crypto from 'crypto';
-import type { DeliveryCountry, SupportedCurrency } from '../types/order';
+import type {
+  DeliveryCountry,
+  MetaConnectionCheckResult,
+  SupportedCurrency
+} from '../types/order';
 import {
   buildMetaEcommerceParams,
   buildPurchaseEventId,
@@ -9,6 +13,7 @@ import {
 
 const META_GRAPH_API_VERSION = 'v21.0';
 const META_COOKIE_REGEX = /^fb\.\d+\.\d+\.[A-Za-z0-9._-]{1,120}$/;
+const DISABLED_TEST_CODE_SENTINELS = new Set(['false', 'off', 'none', 'disabled', '0', 'null']);
 
 export interface MetaEnvConfig {
   pixelId: string | null;
@@ -16,6 +21,7 @@ export interface MetaEnvConfig {
   capiAccessToken: string | null;
   capiConfigured: boolean;
   testEventCode: string | null;
+  testEventConfigured: boolean;
   testMode: boolean;
   issues: string[];
 }
@@ -72,9 +78,25 @@ export function getMetaEnvConfig(): MetaEnvConfig {
     issues.push('META_CAPI_ACCESS_TOKEN appears too short to be a valid Meta Conversions API token.');
   }
 
-  // Test event code is strictly optional and used only during testing/staging
-  const testEventCode =
-    rawTestCode && /^[A-Za-z0-9_-]{3,64}$/.test(rawTestCode) ? rawTestCode : null;
+  // Test event code is strictly optional and used ONLY when testing is enabled.
+  // Empty values, off-sentinels ("false", "off", "none", "disabled"), or META_TEST_MODE=false keep production mode active.
+  const rawTestModeFlag = stripQuotes(process.env.META_TEST_MODE || '').toLowerCase();
+  const testModeExplicitlyDisabled =
+    rawTestModeFlag !== '' && DISABLED_TEST_CODE_SENTINELS.has(rawTestModeFlag);
+  let testEventCode: string | null = null;
+  if (
+    !testModeExplicitlyDisabled &&
+    rawTestCode &&
+    !DISABLED_TEST_CODE_SENTINELS.has(rawTestCode.toLowerCase())
+  ) {
+    if (/^[A-Za-z0-9_-]{3,64}$/.test(rawTestCode)) {
+      testEventCode = rawTestCode;
+    } else {
+      issues.push(
+        'META_TEST_EVENT_CODE contains unsupported characters and is currently ignored (production mode active).'
+      );
+    }
+  }
 
   return {
     pixelId,
@@ -82,9 +104,129 @@ export function getMetaEnvConfig(): MetaEnvConfig {
     capiAccessToken,
     capiConfigured: Boolean(pixelId && capiAccessToken),
     testEventCode,
+    testEventConfigured: Boolean(testEventCode),
     testMode: Boolean(testEventCode),
     issues
   };
+}
+
+/**
+ * Performs a safe, read-only connection check against the currently configured Meta Dataset ID
+ * using the server-side META_CAPI_ACCESS_TOKEN in an Authorization header (never in URL).
+ * Does NOT send any synthetic Purchase event and NEVER resends previously recorded purchases.
+ */
+export async function verifyMetaCapiConnection(): Promise<
+  MetaConnectionCheckResult & { pixelId: string | null }
+> {
+  const cfg = getMetaEnvConfig();
+  const checkedAt = new Date().toISOString();
+
+  if (!cfg.capiConfigured || !cfg.pixelId || !cfg.capiAccessToken) {
+    return {
+      pixelId: cfg.pixelId,
+      checkedAt,
+      ok: false,
+      status: 'not_configured',
+      datasetName: null,
+      message:
+        cfg.issues.join(' ') ||
+        'Set META_PIXEL_ID and META_CAPI_ACCESS_TOKEN in server environment variables to connect Conversions API.'
+    };
+  }
+
+  const endpoint = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${encodeURIComponent(cfg.pixelId)}?fields=id,name`;
+  try {
+    const response = await fetch(endpoint, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${cfg.capiAccessToken}`,
+        Accept: 'application/json'
+      },
+      signal: AbortSignal.timeout(12_000)
+    });
+
+    const rawText = await response.text().catch(() => '');
+    let parsed: any = null;
+    try {
+      parsed = rawText ? JSON.parse(rawText) : null;
+    } catch {
+      parsed = null;
+    }
+
+    if (response.ok && parsed?.id) {
+      const name = typeof parsed.name === 'string' && parsed.name.trim() ? parsed.name.trim() : null;
+      return {
+        pixelId: cfg.pixelId,
+        checkedAt,
+        ok: true,
+        status: 'connected',
+        datasetName: name,
+        message: name
+          ? `Connected to Meta Dataset "${name}" (ID ${cfg.pixelId}).`
+          : `Connected to Meta Dataset ID ${cfg.pixelId}.`
+      };
+    }
+
+    const errCode = typeof parsed?.error?.code === 'number' ? parsed.error.code : null;
+    const apiMsg =
+      parsed?.error?.error_user_msg ||
+      parsed?.error?.message ||
+      rawText ||
+      response.statusText ||
+      'Meta Graph API request failed';
+
+    // Some Conversions API tokens are scoped strictly for POST /events writes and disallow GET metadata reads.
+    if (errCode === 10 || errCode === 200) {
+      return {
+        pixelId: cfg.pixelId,
+        checkedAt,
+        ok: true,
+        status: 'connected',
+        datasetName: null,
+        message: `Meta Graph API accepted credentials for Dataset ID ${cfg.pixelId} (events-only token scope; metadata read restricted).`
+      };
+    }
+
+    if (errCode === 190) {
+      return {
+        pixelId: cfg.pixelId,
+        checkedAt,
+        ok: false,
+        status: 'error',
+        datasetName: null,
+        message: 'META_CAPI_ACCESS_TOKEN was rejected by Meta (invalid or expired token).'
+      };
+    }
+
+    if (errCode === 100 || errCode === 803) {
+      return {
+        pixelId: cfg.pixelId,
+        checkedAt,
+        ok: false,
+        status: 'error',
+        datasetName: null,
+        message: `META_PIXEL_ID (${cfg.pixelId}) was not found or is not accessible by the configured CAPI token.`
+      };
+    }
+
+    return {
+      pixelId: cfg.pixelId,
+      checkedAt,
+      ok: false,
+      status: 'error',
+      datasetName: null,
+      message: sanitizeMetaError(`Meta Graph HTTP ${response.status}: ${apiMsg}`)
+    };
+  } catch (err) {
+    return {
+      pixelId: cfg.pixelId,
+      checkedAt,
+      ok: false,
+      status: 'error',
+      datasetName: null,
+      message: sanitizeMetaError(err)
+    };
+  }
 }
 
 function sha256Hex(normalized: string): string {

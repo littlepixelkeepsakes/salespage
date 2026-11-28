@@ -41,7 +41,11 @@ import {
   validateCustomerDeliveryAddress
 } from '../shared/pricing';
 import { buildMetaEcommerceParams } from '../shared/metaTracking';
-import { trackMetaAddPaymentInfo, trackMetaPurchaseOnce } from '../lib/metaPixel';
+import {
+  initMetaPixel,
+  trackMetaAddPaymentInfo,
+  trackMetaPurchaseOnce
+} from '../lib/metaPixel';
 
 interface PaymentPageProps {
   order: OrderPublic;
@@ -51,6 +55,7 @@ interface PaymentPageProps {
   whatsappUrl: string | null;
   returnNotice: 'success_pending' | 'cancelled' | 'failed' | null;
   excludeTracking?: boolean;
+  metaPixelId?: string | null;
   onOrderUpdated: (updated: OrderPublic) => void;
   onRefreshOrder: () => Promise<OrderPublic | null>;
   onReturnHome: () => void;
@@ -185,6 +190,7 @@ export default function PaymentPage({
   whatsappUrl,
   returnNotice,
   excludeTracking = false,
+  metaPixelId = null,
   onOrderUpdated,
   onRefreshOrder,
   onReturnHome
@@ -362,6 +368,9 @@ export default function PaymentPage({
   useEffect(() => {
     if (excludeTracking) return;
     if (order.paymentStatus !== 'Paid') return;
+    if (metaPixelId) {
+      initMetaPixel(metaPixelId);
+    }
     trackMetaPurchaseOnce(
       order.reference,
       buildMetaEcommerceParams({
@@ -377,6 +386,7 @@ export default function PaymentPage({
     );
   }, [
     excludeTracking,
+    metaPixelId,
     order.paymentStatus,
     order.reference,
     order.productId,
